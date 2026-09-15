@@ -293,22 +293,16 @@ describe("sidebar", () => {
     })
   })
 
-  it("compose and settings entries drive the uiStore", async () => {
+  it("compose entry drives the uiStore", async () => {
     await seedActiveAccount()
     await initAccountStore()
 
     renderSidebar()
 
+    // The Settings entry lives in the shell's pane header now
+    // (mail-shell.test.tsx covers the navigation it triggers).
     fireEvent.click(await screen.findByRole("button", { name: "Compose" }))
     expect(useUiStore.getState().composerOpen).toBe(true)
-
-    fireEvent.click(screen.getByRole("button", { name: "Settings" }))
-    expect(useUiStore.getState().view).toEqual({ kind: "settings" })
-    expect(
-      screen
-        .getByRole("button", { name: "Settings" })
-        .getAttribute("aria-current")
-    ).toBe("true")
   })
 
   it("collapse renders an icon rail: aria-labelled icons, no badges, no labels section", async () => {
