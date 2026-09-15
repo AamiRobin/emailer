@@ -4,6 +4,7 @@ import {
   CirclePlus,
   PanelLeftClose,
   PanelLeftOpen,
+  Settings,
   SquarePen,
 } from "lucide-react"
 
@@ -318,15 +319,50 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
         )}
       </ScrollArea>
       <Separator />
-      {/* Footer: just the collapse toggle (slim row). Settings moved to
-          the pane header's gear (mail-shell.tsx), and the sync/queue
-          indicators to the shell's bottom status bar. */}
+      {/* Footer: settings + collapse only. The sync/queue indicators live
+          in the shell's bottom status bar (status-bar.tsx). */}
       <div
         className={cn(
-          "flex items-center gap-0.5 px-2 py-1",
+          "flex items-center gap-0.5 p-2",
           isCollapsed && "flex-col px-0"
         )}
       >
+        {isCollapsed ? (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  aria-label="Settings"
+                  aria-current={view.kind === "settings" ? "true" : undefined}
+                  className={cn(
+                    buttonVariants({ variant: "ghost", size: "icon-lg" }),
+                    "mx-auto",
+                    view.kind === "settings" && "bg-muted text-foreground"
+                  )}
+                  onClick={() => setView({ kind: "settings" })}
+                >
+                  <Settings />
+                </button>
+              }
+            />
+            <TooltipContent side="right">Settings</TooltipContent>
+          </Tooltip>
+        ) : (
+          <button
+            type="button"
+            aria-current={view.kind === "settings" ? "true" : undefined}
+            className={cn(
+              buttonVariants({ variant: "ghost", size: "sm" }),
+              "shrink-0 justify-start",
+              view.kind === "settings" && "bg-muted text-foreground"
+            )}
+            onClick={() => setView({ kind: "settings" })}
+          >
+            <Settings />
+            Settings
+          </button>
+        )}
         <Tooltip>
           <TooltipTrigger
             render={

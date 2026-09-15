@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useState } from "react"
 import { DndContext, PointerSensor, useSensor, useSensors } from "@dnd-kit/core"
 import type { DragEndEvent } from "@dnd-kit/core"
-import { Settings } from "lucide-react"
 import { usePanelRef } from "react-resizable-panels"
 
 import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
 import {
   ResizableHandle,
   ResizablePanel,
@@ -53,7 +51,6 @@ interface MailShellProps {
  */
 function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
   const view = useUiStore((state) => state.view)
-  const setView = useUiStore((state) => state.setView)
   const readingPane = useUiStore((state) => state.readingPane)
   const activeThread = useUiStore((state) => state.activeThread)
   const setActiveThread = useUiStore((state) => state.setActiveThread)
@@ -68,24 +65,12 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
   return (
     <div className="flex h-full min-h-0 flex-col">
       {/* Pane header, matching the tweakcn mail reference: title + filter
-          toggle on one row, the search field on its own full-width row.
-          The gear opens settings (6.5/11.1) — it lives here, like the
-          reference, instead of a dedicated sidebar footer row. */}
+          toggle on one row, the search field on its own full-width row. */}
       <div className="flex items-center justify-between gap-2 px-4 py-1.5">
         <h1 className="truncate text-xl font-bold text-foreground">
           {viewDisplayName(view)}
         </h1>
-        <div className="flex shrink-0 items-center gap-2">
-          <UnreadFilterToggle />
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Settings"
-            onClick={() => setView({ kind: "settings" })}
-          >
-            <Settings />
-          </Button>
-        </div>
+        <UnreadFilterToggle />
       </div>
       <div className="px-4 pb-2">
         <SearchField className="w-full" />
