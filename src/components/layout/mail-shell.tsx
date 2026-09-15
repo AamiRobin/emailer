@@ -75,7 +75,6 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
       <div className="px-4 pb-2">
         <SearchField className="w-full" />
       </div>
-      <Separator />
       <div className="min-h-0 flex-1">
         {accountsEmpty ? (
           <WelcomePanel onAddAccount={onAddAccount} />
