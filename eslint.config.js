@@ -6,7 +6,7 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  globalIgnores(['dist', 'examples', 'openspec']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [
@@ -17,6 +17,15 @@ export default defineConfig([
     ],
     languageOptions: {
       globals: globals.browser,
+    },
+  },
+  {
+    files: ['src/components/ui/**/*.{ts,tsx}'],
+    rules: {
+      // shadcn registry primitives legitimately export variant helpers
+      // (buttonVariants, toggleVariants, …) next to components; D12 forbids
+      // modifying them, so relax the fast-refresh rule for this directory.
+      'react-refresh/only-export-components': 'off',
     },
   },
 ])

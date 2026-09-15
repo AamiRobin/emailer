@@ -22,7 +22,15 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self' 'unsafe-inline'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob: https:",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost https://accounts.google.com https://oauth2.googleapis.com https://gmail.googleapis.com https://www.googleapis.com",
+        "frame-src": "'self'"
+      }
     }
   },
   "bundle": {

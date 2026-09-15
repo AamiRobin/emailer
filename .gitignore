@@ -26,3 +26,6 @@ examples
 *.njsproj
 *.sln
 *.sw?
+
+# playwright-cli session artifacts
+.playwright-cli

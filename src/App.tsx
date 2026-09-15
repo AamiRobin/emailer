@@ -1,47 +1,60 @@
-import type { CSSProperties } from "react"
-import { AppSidebar } from "@/components/app-sidebar"
-import { ChartAreaInteractive } from "@/components/chart-area-interactive"
-import { DataTable } from "@/components/data-table"
-import { SectionCards } from "@/components/section-cards"
-import { SiteHeader } from "@/components/site-header"
-import {
-  SidebarInset,
-  SidebarProvider,
-} from "@/components/ui/sidebar"
-import { TooltipProvider } from "@/components/ui/tooltip"
-import { Greet } from "@/components/greet"
-import data from "@/app/dashboard/data.json"
+import { useEffect, useState } from "react"
+
+import { MailShell } from "@/components/layout/mail-shell"
+import { ShortcutsOverlay } from "@/components/layout/shortcuts-overlay"
+import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts"
+import { bootstrap } from "@/services/bootstrap"
 
 export default function App() {
+  const [ready, setReady] = useState(false)
+  const [initError, setInitError] = useState<string | null>(null)
+  // Shortcuts help overlay state (task 6.6): owned here so the global
+  // hook (`?` opens, Esc dismisses) and the overlay share it without a
+  // dedicated store — design D13 keeps shortcut UI state minimal.
+  const [helpOpen, setHelpOpen] = useState(false)
+
+  // Global keyboard shortcuts: ONE hook, ONE window listener (D13).
+  useKeyboardShortcuts({ helpOpen, setHelpOpen })
+
+  // Initialize the database (migrations included) before rendering the
+  // shell — features and stores read from it as soon as they mount.
+  useEffect(() => {
+    let cancelled = false
+    bootstrap()
+      .then(() => {
+        if (!cancelled) setReady(true)
+      })
+      .catch((error) => {
+        console.error("App initialization failed", error)
+        if (!cancelled) setInitError(String(error))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  if (initError) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-background text-foreground">
+        <p className="max-w-md text-center text-sm text-muted-foreground">
+          Failed to initialize the local database. {initError}
+        </p>
+      </div>
+    )
+  }
+
+  if (!ready) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-background text-foreground">
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      </div>
+    )
+  }
+
   return (
-    <TooltipProvider>
-      <SidebarProvider
-        style={
-          {
-            "--sidebar-width": "calc(var(--spacing) * 72)",
-            "--header-height": "calc(var(--spacing) * 12)",
-          } as CSSProperties
-        }
-      >
-        <AppSidebar variant="inset" />
-        <SidebarInset>
-          <SiteHeader />
-          <div className="flex flex-1 flex-col">
-            <div className="@container/main flex flex-1 flex-col gap-2">
-              <div className="flex flex-col gap-4 py-4 md:gap-6 md:py-6">
-                <SectionCards />
-                <div className="px-4 lg:px-6">
-                  <Greet />
-                </div>
-                <div className="px-4 lg:px-6">
-                  <ChartAreaInteractive />
-                </div>
-                <DataTable data={data} />
-              </div>
-            </div>
-          </div>
-        </SidebarInset>
-      </SidebarProvider>
-    </TooltipProvider>
+    <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
+      <MailShell />
+      <ShortcutsOverlay open={helpOpen} onOpenChange={setHelpOpen} />
+    </div>
   )
 }
