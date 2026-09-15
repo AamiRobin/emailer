@@ -23,8 +23,6 @@ import {
   type LabelDialogState,
 } from "@/components/labels/label-dialog"
 import { LabelRowMenu } from "@/components/labels/label-row-menu"
-import { PendingOpsBadge } from "@/components/layout/pending-ops-badge"
-import { SyncIndicator } from "@/components/layout/sync-indicator"
 import type { LabelRow } from "@/services/db/labels"
 import { useAccountStore } from "@/stores/account-store"
 import { useFolderCountsStore } from "@/stores/folder-counts-store"
@@ -321,22 +319,14 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
         )}
       </ScrollArea>
       <Separator />
-      {/* Footer (expanded): the sync/queue indicators moved here from the
-          pane header (tweakcn reference keeps that header to title +
-          filter), leaving room for the full-width search row. */}
+      {/* Footer: settings + collapse only. The sync/queue indicators live
+          in the shell's bottom status bar (status-bar.tsx). */}
       <div
         className={cn(
           "flex items-center gap-0.5 p-2",
           isCollapsed && "flex-col px-0"
         )}
       >
-        {!isCollapsed && activeAccount && (
-          <SyncIndicator
-            accountId={activeAccount.id}
-            className="min-w-0 flex-1"
-          />
-        )}
-        {!isCollapsed && <PendingOpsBadge />}
         {isCollapsed ? (
           <Tooltip>
             <TooltipTrigger
@@ -380,6 +370,7 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
                 size={isCollapsed ? "icon-lg" : "icon"}
                 variant="ghost"
                 aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                className={cn(!isCollapsed && "ml-auto")}
                 onClick={toggleSidebar}
               >
                 {isCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}

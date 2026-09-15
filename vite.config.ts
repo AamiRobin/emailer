@@ -1,8 +1,17 @@
 /// <reference types="vitest/config" />
+import { readFileSync } from "node:fs"
 import path from "path"
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
 import { defineConfig } from "vite"
+
+// App version for the status bar: src-tauri/tauri.conf.json is the
+// authoritative version for a Tauri desktop build (it is what the
+// packaged binary reports), so it is injected at build time instead of
+// duplicated in a component.
+const APP_VERSION = JSON.parse(
+  readFileSync(path.resolve(import.meta.dirname, "./src-tauri/tauri.conf.json"), "utf-8")
+).version as string
 
 // Dev-only mock harness (bun run dev:mock): in "mock" mode the Tauri
 // modules are redirected to in-browser fakes under src/mocks/ so the UI
@@ -43,6 +52,9 @@ const MOCK_ALIASES: Record<string, string> = {
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => ({
   plugins: [react(), tailwindcss()],
+  define: {
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
+  },
   resolve: {
     alias: {
       "@": path.resolve(import.meta.dirname, "./src"),

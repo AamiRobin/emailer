@@ -13,6 +13,7 @@ import { Separator } from "@/components/ui/separator"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { AccountSwitcher } from "@/components/layout/account-switcher"
 import { Sidebar } from "@/components/layout/sidebar"
+import { StatusBar } from "@/components/layout/status-bar"
 import { OfflineBanner } from "@/components/layout/offline-banner"
 import { SearchField } from "@/components/search/search-field"
 import { CommandPalette } from "@/components/search/command-palette"
@@ -258,13 +259,18 @@ export function MailShell({
       <TooltipProvider delay={0}>
         {/* Offline indicator (6.8): fixed top overlay, non-blocking. */}
         <OfflineBanner />
+        {/* Every layout shares one column: the active panel group fills
+            the shell above the bottom status bar (sync state + version).
+            flex-1: the root is a row flex container, so an unsized child
+            would shrink to content width. */}
+        <div className="flex min-h-0 flex-1 flex-col">
         {/* Settings view (11.1): the settings page replaces the mailbox
             panes; the sidebar stays so the user can navigate elsewhere. */}
         {settingsOpen && (
           <ResizablePanelGroup
             key="settings"
             orientation="horizontal"
-            className="h-full items-stretch"
+            className="min-h-0 flex-1 items-stretch"
             onLayoutChanged={syncSidebarFromPanel}
           >
             {sidebarPane}
@@ -278,7 +284,7 @@ export function MailShell({
           <ResizablePanelGroup
             key="right"
             orientation="horizontal"
-            className="h-full items-stretch"
+            className="min-h-0 flex-1 items-stretch"
             onLayoutChanged={syncSidebarFromPanel}
           >
             {sidebarPane}
@@ -296,7 +302,7 @@ export function MailShell({
           <ResizablePanelGroup
             key="bottom"
             orientation="horizontal"
-            className="h-full items-stretch"
+            className="min-h-0 flex-1 items-stretch"
             onLayoutChanged={syncSidebarFromPanel}
           >
             {sidebarPane}
@@ -318,7 +324,7 @@ export function MailShell({
           <ResizablePanelGroup
             key="hidden"
             orientation="horizontal"
-            className="h-full items-stretch"
+            className="min-h-0 flex-1 items-stretch"
             onLayoutChanged={syncSidebarFromPanel}
           >
             {sidebarPane}
@@ -328,6 +334,8 @@ export function MailShell({
             </ResizablePanel>
           </ResizablePanelGroup>
         )}
+        <StatusBar />
+        </div>
         {/* Add-account flows (5.3/5.4); hosted here so it overlays the shell.
           The welcome panel (6.9) opens this same chooser. */}
         <AddAccountDialog
