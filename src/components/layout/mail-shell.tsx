@@ -72,7 +72,8 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
         </h1>
         <UnreadFilterToggle />
       </div>
-      <div className="px-4 pb-2">
+      <Separator />
+      <div className="px-2 py-2">
         <SearchField className="w-full" />
       </div>
       <div className="min-h-0 flex-1">
