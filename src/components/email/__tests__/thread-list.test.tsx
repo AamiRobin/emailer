@@ -366,19 +366,17 @@ describe("thread list rows", () => {
 })
 
 describe("thread list date groups", () => {
-  it("renders sticky group headers in Today → Earlier order", async () => {
+  it("renders rows newest-first with no date group headers", async () => {
     await setupAccount()
     const { container } = render(<ThreadList />)
     await waitFor(() =>
       expect(container.querySelector("[data-thread-row]")).not.toBeNull()
     )
 
-    const headers = Array.from(
-      container.querySelectorAll("[data-group-header]")
-    ).map((header) => header.getAttribute("data-group-header"))
-    expect(headers).toEqual(["Today", "Yesterday", "This week", "Earlier"])
+    // Date group headers are gone — each card carries its own timestamp.
+    expect(container.querySelectorAll("[data-group-header]").length).toBe(0)
 
-    // Rows stay newest-first across group boundaries.
+    // Rows stay newest-first across what used to be group boundaries.
     const rowIds = Array.from(
       container.querySelectorAll("[data-thread-row]")
     ).map((row) => row.getAttribute("data-thread-row"))
@@ -473,9 +471,6 @@ describe("thread list virtualization with 10k threads", () => {
     const renderedRows = container.querySelectorAll("[data-thread-row]").length
     expect(renderedRows).toBeGreaterThan(0)
     expect(renderedRows).toBeLessThan(200)
-    expect(
-      container.querySelectorAll("[data-group-header]").length
-    ).toBeLessThan(20)
     // Reasonable render budget for the first paint of the list.
     expect(elapsedMs).toBeLessThan(5000)
 

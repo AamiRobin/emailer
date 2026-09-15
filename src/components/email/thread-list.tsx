@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react"
+import { useCallback, useMemo, useRef } from "react"
 import { useDraggable } from "@dnd-kit/core"
 import { useVirtualizer } from "@tanstack/react-virtual"
 import { formatDistanceToNow } from "date-fns"
@@ -38,10 +38,8 @@ import {
   refreshThreadList,
   useThreadList,
   useThreadListStore,
-  dateGroupLabel,
   formatThreadParticipants,
   parseThreadParticipants,
-  type DateGroup,
 } from "@/stores/thread-list-store"
 import { useAccountStore } from "@/stores/account-store"
 import { useFolderCountsStore } from "@/stores/folder-counts-store"
@@ -110,48 +108,27 @@ import { dragPayloadFor } from "./label-dnd"
 
 interface FlatRow {
   key: string
-  label?: DateGroup
   threadIndex?: number
   draftIndex?: number
 }
 
-interface ThreadListModel {
-  rows: FlatRow[]
-  /**
-   * For each row index, the row index of its group header (-1 for the
-   * draft rows, which belong to no date group).
-   */
-  headerIndexAt: number[]
-}
-
+/**
+ * Flat row model: local drafts first (task 8.6 — composer snapshots, not
+ * received mail), then the threads newest-first. The list renders no date
+ * group headers; each card carries its own relative timestamp.
+ */
 function buildThreadListModel(
   drafts: { id: string }[],
-  threads: { id: string; last_message_at: number | null }[],
-  now: Date
-): ThreadListModel {
+  threads: { id: string }[]
+): FlatRow[] {
   const rows: FlatRow[] = []
-  const headerIndexAt: number[] = []
-  // Local drafts (task 8.6) sit ABOVE the thread rows, outside the date
-  // groups — they are composer snapshots, not received mail.
   for (let index = 0; index < drafts.length; index += 1) {
-    const draft = drafts[index]
-    rows.push({ key: `draft:${draft.id}`, draftIndex: index })
-    headerIndexAt.push(-1)
+    rows.push({ key: `draft:${drafts[index].id}`, draftIndex: index })
   }
-  let currentGroup: DateGroup | null = null
   for (let index = 0; index < threads.length; index += 1) {
-    const thread = threads[index]
-    const group = dateGroupLabel(thread.last_message_at, now)
-    if (group !== currentGroup) {
-      currentGroup = group
-      rows.push({ key: `header:${group}`, label: group })
-    }
-    const headerIndex = rows.length - 1
-    headerIndexAt.push(headerIndex)
-    rows.push({ key: `thread:${thread.id}`, threadIndex: index })
-    headerIndexAt.push(headerIndex)
+    rows.push({ key: `thread:${threads[index].id}`, threadIndex: index })
   }
-  return { rows, headerIndexAt }
+  return rows
 }
 
 /** Label chips visible per row before collapsing the rest into "+N". */
@@ -279,8 +256,6 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
     [threads, selectedIds]
   )
 
-  // Frozen per mount so date groups stay stable while the list is open.
-  const [now] = useState(() => new Date())
   // "All mail | Unread" header filter — the toggle itself renders in the
   // shell's pane header; the state lives in the shared store (see
   // thread-list-store).
@@ -293,8 +268,8 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
     [threads, unreadOnly]
   )
   const model = useMemo(
-    () => buildThreadListModel(drafts, visibleThreads, now),
-    [drafts, visibleThreads, now]
+    () => buildThreadListModel(drafts, visibleThreads),
+    [drafts, visibleThreads]
   )
 
   const scrollerRef = useRef<HTMLDivElement>(null)
@@ -302,27 +277,13 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
   // memoize; nothing it returns crosses into other memoized components.
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
-    count: model.rows.length,
+    count: model.length,
     getScrollElement: () => scrollerRef.current,
     estimateSize: () => ESTIMATED_ROW_HEIGHT,
     overscan: 8,
-    getItemKey: (index) => model.rows[index]?.key ?? String(index),
+    getItemKey: (index) => model[index]?.key ?? String(index),
   })
   const virtualItems = virtualizer.getVirtualItems()
-
-  // Sticky header label: the group of the first visible row, shown only
-  // once that group's own header row has scrolled past the top edge.
-  let stickyLabel: DateGroup | null = null
-  const first = virtualItems[0]
-  if (first && model.rows.length) {
-    const offset = virtualizer.scrollOffset ?? 0
-    const headerIndex = model.headerIndexAt[first.index] ?? first.index
-    const headerItem = virtualItems.find((item) => item.index === headerIndex)
-    if (!headerItem || headerItem.start < offset - 1) {
-      const header = model.rows[headerIndex]
-      if (header?.label) stickyLabel = header.label
-    }
-  }
 
   // ---- Actions (tasks 10.2/10.3): the ONLY place the list mutates mail ----
 
@@ -599,34 +560,13 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
           data-testid="thread-list-scroll"
           className="min-h-0 flex-1 overflow-y-auto"
         >
-          {stickyLabel && (
-            <div className="pointer-events-none sticky top-0 z-10 h-0 overflow-visible">
-              <div className="border-b bg-background/95 px-4 py-1 text-xs font-medium tracking-wide text-muted-foreground uppercase backdrop-blur">
-                {stickyLabel}
-              </div>
-            </div>
-          )}
           <div
             className="relative w-full"
             style={{ height: virtualizer.getTotalSize() }}
           >
             {virtualItems.map((virtualItem) => {
-              const row = model.rows[virtualItem.index]
+              const row = model[virtualItem.index]
               if (!row) return null
-              if (row.label) {
-                return (
-                  <div
-                    key={virtualItem.key}
-                    data-index={virtualItem.index}
-                    ref={virtualizer.measureElement}
-                    data-group-header={row.label}
-                    className="absolute inset-x-0 top-0 border-b bg-background px-4 py-1 text-xs font-medium tracking-wide text-muted-foreground uppercase"
-                    style={{ transform: `translateY(${virtualItem.start}px)` }}
-                  >
-                    {row.label}
-                  </div>
-                )
-              }
               if (row.draftIndex !== undefined) {
                 const draft = drafts[row.draftIndex]
                 if (!draft) return null
