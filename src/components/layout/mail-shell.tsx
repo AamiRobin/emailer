@@ -1,24 +1,16 @@
 import { useCallback, useEffect, useState } from "react"
 import { DndContext, PointerSensor, useSensor, useSensors } from "@dnd-kit/core"
 import type { DragEndEvent } from "@dnd-kit/core"
-import { PanelBottom, PanelRight, PanelRightClose } from "lucide-react"
-import type { LucideIcon } from "lucide-react"
 import { usePanelRef } from "react-resizable-panels"
 
 import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
 import {
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable"
 import { Separator } from "@/components/ui/separator"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
+import { TooltipProvider } from "@/components/ui/tooltip"
 import { AccountSwitcher } from "@/components/layout/account-switcher"
 import { Sidebar } from "@/components/layout/sidebar"
 import { OfflineBanner } from "@/components/layout/offline-banner"
@@ -38,11 +30,7 @@ import { useThreadListStore } from "@/stores/thread-list-store"
 import { initOnlineTracking, onOnlineChange } from "@/services/online"
 import { useOnlineStore } from "@/stores/online-store"
 import { getExecutor } from "@/services/db/executor"
-import {
-  applyBootPreferences,
-  setReadingPanePreference,
-} from "@/services/settings/preferences"
-import type { ReadingPanePosition } from "@/stores/ui-store"
+import { applyBootPreferences } from "@/services/settings/preferences"
 import { useUiStore, viewDisplayName } from "@/stores/ui-store"
 
 interface MailShellProps {
@@ -51,24 +39,14 @@ interface MailShellProps {
   navCollapsedSize: number
 }
 
-/** The reading-pane position switcher entries (task 6.5). */
-const PANE_POSITIONS: {
-  value: ReadingPanePosition
-  label: string
-  icon: LucideIcon
-}[] = [
-  { value: "right", label: "Reading pane: right", icon: PanelRight },
-  { value: "bottom", label: "Reading pane: bottom", icon: PanelBottom },
-  { value: "hidden", label: "Reading pane: hidden", icon: PanelRightClose },
-]
-
 /**
- * Center pane: the active view's header — title, the search field (9.2),
- * sync/pending-ops indicators (6.8) and the reading-pane position
- * switcher — over the thread list (6.4). In the "hidden" reading-pane
- * position an open thread replaces the list with the full-width reading
- * view and a back control (6.5). With no account connected the list area
- * becomes the first-run welcome panel (6.9).
+ * Center pane: the active view's header — title and the All/Unread filter
+ * toggle over a full-width search row (9.2) — above the thread list
+ * (6.4), matching the tweakcn mail reference. The reading-pane position
+ * is a settings preference (Settings → Reading); in the "hidden" position
+ * an open thread replaces the list with the full-width reading view and a
+ * back control (6.5). With no account connected the list area becomes the
+ * first-run welcome panel (6.9).
  */
 function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
   const view = useUiStore((state) => state.view)
@@ -83,21 +61,6 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
 
   const readingViewOpen = readingPane === "hidden" && activeThread !== null
 
-  // Pane switch (task 6.5) + preference persistence (11.3): the store
-  // update re-lays out the shell instantly; the settings-table write is
-  // best-effort background (applyBootPreferences restores it on restart).
-  const switchPane = (position: ReadingPanePosition) => {
-    try {
-      void setReadingPanePreference(getExecutor(), position).catch((error) => {
-        console.warn("[mail-shell] failed to persist pane position", error)
-      })
-    } catch (error) {
-      // No database binding (plain vite before bootstrap) — the in-memory
-      // switch still applies.
-      console.warn("[mail-shell] pane persistence unavailable", error)
-    }
-  }
-
   return (
     <div className="flex h-full min-h-0 flex-col">
       {/* Pane header, matching the tweakcn mail reference: title + filter
@@ -106,36 +69,7 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
         <h1 className="truncate text-xl font-bold text-foreground">
           {viewDisplayName(view)}
         </h1>
-        <div className="flex shrink-0 items-center gap-2">
-          <UnreadFilterToggle />
-          <div
-            className="flex items-center gap-0.5"
-            role="group"
-            aria-label="Reading pane position"
-          >
-            {PANE_POSITIONS.map(({ value, label, icon: Icon }) => (
-              <Tooltip key={value}>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={label}
-                      aria-pressed={readingPane === value}
-                      className={cn(
-                        readingPane === value && "bg-muted text-foreground"
-                      )}
-                      onClick={() => switchPane(value)}
-                    >
-                      <Icon />
-                    </Button>
-                  }
-                />
-                <TooltipContent>{label}</TooltipContent>
-              </Tooltip>
-            ))}
-          </div>
-        </div>
+        <UnreadFilterToggle />
       </div>
       <div className="px-4 pb-2">
         <SearchField className="w-full" />

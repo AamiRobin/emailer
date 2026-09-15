@@ -8,6 +8,7 @@ import {
   vi,
 } from "vitest"
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -53,7 +54,6 @@ import {
   setMockViewportHeight,
   uninstallResizeObserverMock,
 } from "@/components/email/__tests__/resize-observer-mock"
-import { getReadingPanePreference } from "@/services/settings/preferences"
 import {
   setAccountStoreExecutor,
   useAccountStore,
@@ -179,10 +179,13 @@ function panelCount(container: HTMLElement): number {
   return container.querySelectorAll('[data-slot="resizable-panel"]').length
 }
 
-function switchTo(position: string): void {
-  fireEvent.click(
-    screen.getByRole("button", { name: `Reading pane: ${position}` })
-  )
+// The header no longer carries pane-position buttons (the tweakcn
+// reference keeps them in settings); tests drive the ui-store directly,
+// the same entry point Settings → Reading uses after persisting.
+function switchTo(position: "right" | "bottom" | "hidden"): void {
+  act(() => {
+    useUiStore.getState().setReadingPane(position)
+  })
 }
 
 describe("reading pane positions", () => {
@@ -197,11 +200,6 @@ describe("reading pane positions", () => {
     expect(useUiStore.getState().readingPane).toBe("right")
     expect(panelCount(container)).toBe(3)
     expect(screen.getByText("No message selected")).not.toBeNull()
-    expect(
-      screen
-        .getByRole("button", { name: "Reading pane: right" })
-        .getAttribute("aria-pressed")
-    ).toBe("true")
 
     // Bottom: sidebar | list-over-display — the nested vertical group's
     // separators run horizontally (the library inverts the aria value).
@@ -216,11 +214,6 @@ describe("reading pane positions", () => {
       container.querySelector('[data-testid="thread-list-scroll"]')
     ).not.toBeNull()
     expect(screen.getByText("No message selected")).not.toBeNull()
-    // Preference persistence (task 11.3): the pane switcher writes the
-    // settings table (the shell's boot hook restores it on restart).
-    await waitFor(async () => {
-      expect(await getReadingPanePreference(executor)).toBe("bottom")
-    })
 
     // Hidden: two panes; the display pane is gone until a thread opens.
     switchTo("hidden")
