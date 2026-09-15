@@ -1,11 +1,12 @@
 import { useState } from "react"
-import { CirclePlus, KeyRound, Trash2, TriangleAlert } from "lucide-react"
+import { CirclePlus, KeyRound, TriangleAlert } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue,
@@ -18,7 +19,6 @@ import {
 import type { AccountInfo } from "@/stores/account-store"
 import { selectActiveAccount, useAccountStore } from "@/stores/account-store"
 import { ReauthDialog } from "@/components/accounts/reauth-dialog"
-import { RemoveAccountDialog } from "@/components/accounts/remove-account-dialog"
 
 interface AccountSwitcherProps {
   isCollapsed: boolean
@@ -30,13 +30,13 @@ interface AccountSwitcherProps {
 const ADD_ACCOUNT_VALUE = "add-account"
 
 /**
- * Sentinel value prefixes for the per-account action entries (task
- * 5.5/5.6). Choosing one never switches the account — onValueChange
- * routes the parsed id to the matching dialog instead, exactly like the
- * "Add account" sentinel.
+ * Sentinel value prefix for the per-account "Re-authenticate…" entry
+ * (task 5.5). Choosing it never switches the account — onValueChange
+ * routes the parsed id to the re-auth dialog instead, exactly like the
+ * "Add account" sentinel. Removal is not offered here; it lives in
+ * Settings → Accounts.
  */
 const REAUTH_ACTION_PREFIX = "action:reauth:"
-const REMOVE_ACTION_PREFIX = "action:remove:"
 
 /** Two-letter initials from the display name (or email local part). */
 function initialsOf(account: AccountInfo): string {
@@ -68,12 +68,12 @@ function AccountAvatar({
  * from the tweakcn mail example (components/examples/mail), on base-nova
  * primitives.
  *
- * Per-account management entries (tasks 5.5/5.6) follow each account in
- * the dropdown as sentinel-valued items: "Re-authenticate…" for accounts
- * paused as auth-error (opens the re-auth dialog; the warning glyph is
- * the indicator, the entry is its action) and "Remove account…" for
- * every account (opens the removal confirmation). Both dialogs live in
- * components/accounts and are hosted here.
+ * The per-account "Re-authenticate…" entry (task 5.5) follows paused
+ * accounts in the dropdown as a sentinel-valued item: it opens the
+ * re-auth dialog; the warning glyph is the indicator, the entry is its
+ * action. Account removal is intentionally not offered here — it lives
+ * in Settings → Accounts. The dialog lives in components/accounts and
+ * is hosted here.
  */
 export function AccountSwitcher({
   isCollapsed,
@@ -84,7 +84,6 @@ export function AccountSwitcher({
   const setActive = useAccountStore((state) => state.setActive)
   const activeAccount = useAccountStore(selectActiveAccount)
   const [reauthTarget, setReauthTarget] = useState<AccountInfo | null>(null)
-  const [removeTarget, setRemoveTarget] = useState<AccountInfo | null>(null)
 
   function findAccount(value: string): AccountInfo | null {
     return accounts.find((account) => account.id === value) ?? null
@@ -103,12 +102,6 @@ export function AccountSwitcher({
           if (nextId.startsWith(REAUTH_ACTION_PREFIX)) {
             setReauthTarget(
               findAccount(nextId.slice(REAUTH_ACTION_PREFIX.length))
-            )
-            return
-          }
-          if (nextId.startsWith(REMOVE_ACTION_PREFIX)) {
-            setRemoveTarget(
-              findAccount(nextId.slice(REMOVE_ACTION_PREFIX.length))
             )
             return
           }
@@ -155,66 +148,58 @@ export function AccountSwitcher({
           </SelectTrigger>
         )}
         <SelectContent>
-          {accounts.length === 0 ? (
-            <SelectItem
-              value="no-accounts"
-              disabled
-              className="text-muted-foreground"
-            >
-              No accounts
-            </SelectItem>
-          ) : (
-            accounts.flatMap((account) => [
-              <SelectItem key={account.id} value={account.id}>
-                <div className="flex w-full items-center gap-2">
-                  <span className="truncate">{account.email}</span>
-                  {account.status === "auth-error" && (
-                    <TriangleAlert
-                      role="img"
-                      aria-label="Account sign-in error"
-                      className="size-3.5 shrink-0 text-destructive"
-                    />
-                  )}
-                  {account.unreadCount > 0 && (
-                    <span className="ml-auto rounded-full bg-muted px-1.5 text-xs font-medium text-muted-foreground tabular-nums">
-                      {account.unreadCount}
-                    </span>
-                  )}
-                </div>
-              </SelectItem>,
-              account.status === "auth-error" && (
-                <SelectItem
-                  key={`reauth-${account.id}`}
-                  value={`${REAUTH_ACTION_PREFIX}${account.id}`}
-                  className="text-muted-foreground"
-                >
-                  <div className="flex items-center gap-2">
-                    <KeyRound className="size-3.5 shrink-0" aria-hidden />
-                    Re-authenticate…
-                  </div>
-                </SelectItem>
-              ),
+          <SelectGroup>
+            {accounts.length === 0 ? (
               <SelectItem
-                key={`remove-${account.id}`}
-                value={`${REMOVE_ACTION_PREFIX}${account.id}`}
+                value="no-accounts"
+                disabled
                 className="text-muted-foreground"
               >
-                <div className="flex items-center gap-2">
-                  <Trash2 className="size-3.5 shrink-0" aria-hidden />
-                  Remove account…
-                </div>
-              </SelectItem>,
-            ])
-          )}
-          <SelectItem
-            value={ADD_ACCOUNT_VALUE}
-            className="text-muted-foreground"
-          >
-            <div className="flex items-center gap-2">
-              <CirclePlus className="size-3.5 shrink-0" aria-hidden />
-              Add account…
-            </div>
-          </SelectItem>
+                No accounts
+              </SelectItem>
+            ) : (
+              accounts.flatMap((account) => [
+                <SelectItem key={account.id} value={account.id}>
+                  <div className="flex w-full items-center gap-2">
+                    <span className="truncate">{account.email}</span>
+                    {account.status === "auth-error" && (
+                      <TriangleAlert
+                        role="img"
+                        aria-label="Account sign-in error"
+                        className="size-3.5 shrink-0 text-destructive"
+                      />
+                    )}
+                    {account.unreadCount > 0 && (
+                      <span className="ml-auto rounded-full bg-muted px-1.5 text-xs font-medium text-muted-foreground tabular-nums">
+                        {account.unreadCount}
+                      </span>
+                    )}
+                  </div>
+                </SelectItem>,
+                account.status === "auth-error" && (
+                  <SelectItem
+                    key={`reauth-${account.id}`}
+                    value={`${REAUTH_ACTION_PREFIX}${account.id}`}
+                    className="text-muted-foreground"
+                  >
+                    <div className="flex items-center gap-2">
+                      <KeyRound className="size-3.5 shrink-0" aria-hidden />
+                      Re-authenticate…
+                    </div>
+                  </SelectItem>
+                ),
+              ])
+            )}
+            <SelectItem
+              value={ADD_ACCOUNT_VALUE}
+              className="text-muted-foreground"
+            >
+              <div className="flex items-center gap-2">
+                <CirclePlus className="size-3.5 shrink-0" aria-hidden />
+                Add account…
+              </div>
+            </SelectItem>
+          </SelectGroup>
         </SelectContent>
       </Select>
       {/* Keyed by target: every open remounts a fresh dialog (inputs,
@@ -226,16 +211,6 @@ export function AccountSwitcher({
         onOpenChange={(open) => {
           if (!open) {
             setReauthTarget(null)
-          }
-        }}
-      />
-      <RemoveAccountDialog
-        key={removeTarget?.id ?? "remove-closed"}
-        account={removeTarget}
-        open={removeTarget !== null}
-        onOpenChange={(open) => {
-          if (!open) {
-            setRemoveTarget(null)
           }
         }}
       />

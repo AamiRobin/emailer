@@ -27,20 +27,10 @@ import { AccountSwitcher } from "../account-switcher"
  * (injected via setAccountStoreExecutor). jsdom + Base UI Select render the
  * popup in a portal, so options are queried from document.body.
  *
- * The removal/re-auth dialogs are stubbed: the switcher tests assert the
- * per-account wiring (which account opens which dialog), the dialogs'
- * behavior has its own suites in components/accounts/__tests__.
+ * The re-auth dialog is stubbed: the switcher tests assert the per-account
+ * wiring (which account opens which dialog), the dialogs' behavior has its
+ * own suites in components/accounts/__tests__.
  */
-
-vi.mock("@/components/accounts/remove-account-dialog", () => ({
-  RemoveAccountDialog: (props: {
-    account: AccountInfo | null
-    open: boolean
-  }): ReactElement | null =>
-    props.open && props.account ? (
-      <div data-testid="remove-dialog">remove:{props.account.email}</div>
-    ) : null,
-}))
 
 vi.mock("@/components/accounts/reauth-dialog", () => ({
   ReauthDialog: (props: {
@@ -276,32 +266,6 @@ describe("account switcher", () => {
     await waitFor(() => {
       expect(useAccountStore.getState().activeAccountId).not.toBe("add-account")
     })
-  })
-
-  it("offers Remove account… per account and opens the dialog without switching", async () => {
-    await seedAccount({
-      email: "one@example.com",
-      isActive: true,
-    })
-    const secondId = await seedAccount({ email: "two@example.com" })
-    await initAccountStore()
-
-    renderSwitcher()
-
-    await openDropdown()
-    // One remove entry per account, in account order: the second belongs
-    // to two@example.com.
-    const removeOptions = await screen.findAllByRole("option", {
-      name: /Remove account/,
-    })
-    expect(removeOptions).toHaveLength(2)
-    chooseOption(removeOptions[1] as HTMLElement)
-
-    const dialog = screen.getByTestId("remove-dialog")
-    expect(dialog.textContent).toBe("remove:two@example.com")
-    // Choosing to remove is not a switch — the active account is unchanged.
-    const activeId = useAccountStore.getState().activeAccountId
-    expect(activeId).not.toBe(secondId)
   })
 
   it("offers Re-authenticate… for auth-error accounts and opens the re-auth dialog", async () => {
