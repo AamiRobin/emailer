@@ -323,7 +323,7 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
           in the shell's bottom status bar (status-bar.tsx). */}
       <div
         className={cn(
-          "flex items-center gap-0.5 p-2",
+          "flex items-center gap-0.5 px-2 py-1",
           isCollapsed && "flex-col px-0"
         )}
       >
