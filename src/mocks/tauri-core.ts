@@ -141,3 +141,36 @@ export async function invoke<T = unknown>(
 export function convertFileSrc(filePath: string): string {
   return filePath
 }
+
+/**
+ * Inert stand-ins for the api/core IPC plumbing classes the updater
+ * plugin's JS imports (plugins/updater pull `Resource` and `Channel` from
+ * @tauri-apps/api/core, which this module aliases in mock mode). They are
+ * never exercised — the Updates section refuses to check outside the
+ * desktop app — they only need to satisfy the import graph.
+ */
+export class Resource {
+  #rid: number
+  constructor(rid: number) {
+    this.#rid = rid
+  }
+  async close(): Promise<void> {}
+}
+
+export class Channel<T = unknown> {
+  static readonly __CHANNEL_MARKER__ = true
+  #onmessage: ((data: T) => void) | null = null
+  set onmessage(handler: (data: T) => void) {
+    this.#onmessage = handler
+  }
+  get id(): number {
+    return -1
+  }
+  toJSON(): string {
+    return `__CHANNEL__:${this.id}`
+  }
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  invoke(value: unknown): void {
+    this.#onmessage?.(value as T)
+  }
+}

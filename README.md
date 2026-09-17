@@ -1,8 +1,69 @@
-# emailer
+<p align="center">
+  <img src=".github/assets/icon.png" width="88" alt="emailer icon" />
+</p>
 
-A cross-platform desktop email client built with Tauri 2 — Gmail via the REST
-API, IMAP/SMTP for other providers, with local-first storage and background
-sync.
+<h1 align="center">emailer</h1>
+
+<p align="center">
+  A local-first desktop email client for Gmail and IMAP.<br/>
+  Built with Tauri 2 — fast, native, and your mail stays on your machine.
+</p>
+
+<p align="center">
+  <a href="https://github.com/AamiRobin/emailer/releases"><img src="https://img.shields.io/github/v/release/AamiRobin/emailer?include_prereleases&label=release" alt="Release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="Platforms" />
+</p>
+
+---
+
+## Why emailer
+
+Most email clients either hold your credentials hostage in the cloud or feel
+like a web page in a frame. emailer is a real desktop app: your messages,
+credentials and settings live in a local SQLite database, search and reading
+work offline, and sync runs quietly in the background when you're online.
+
+## Screenshots
+
+**Inbox — light**
+
+<img src="docs/screenshots/inbox-light.png" alt="emailer inbox, light theme" width="900" />
+
+**Inbox — dark**
+
+<img src="docs/screenshots/inbox-dark.png" alt="emailer inbox, dark theme" width="900" />
+
+**Composer** · **Adding an account with provider detection**
+
+<img src="docs/screenshots/composer-dark.png" alt="composer" width="49%" /> <img src="docs/screenshots/add-imap-detect-dark.png" alt="add IMAP account with provider detection" width="49%" />
+
+## Features
+
+- **Gmail and every major IMAP provider** — Gmail over its REST API with
+  OAuth; IMAP/SMTP with server auto-discovery for Outlook, Yahoo, iCloud,
+  Fastmail, GMX, Zoho and AOL — each with its brand icon across the app
+- **Local-first storage** — everything lives on this machine; messages,
+  search and drafts work offline and sync resumes when you're back
+- **Unified inbox** — combine all accounts into one list (with per-account
+  color attribution) or work per folder; priority inbox included
+- **Search that keeps up** — full-text search with operators: `from:`,
+  `to:`, `label:`, `is:starred`, `larger:5m`, `before:2026-01-01` — and
+  negations like `-from:newsletter@` or `-has:attachment`
+- **Reply tracking** — nudges resurface threads you haven't answered;
+  follow-up reminders resurface threads that weren't answered *to you*
+- **Local automation** — rules, junk filter, blocked senders and
+  auto-archive run locally on every sync
+- **A composer that gets out of the way** — rich text, snippets,
+  attachments, per-account signatures, and an undo-send window
+- **Encryption** — per-account OpenPGP keys with encrypt/decrypt in both
+  the composer and the reader
+- **Attachment security** — optional VirusTotal hash lookup before an
+  attachment's first open (only the SHA-256 hash leaves the machine)
+- **Keyboard-first** — command palette, full shortcut coverage and
+  customizable bindings
+- **Yours to theme** — light/dark, seven accent colors, density presets,
+  reading-pane options
 
 ## Downloads & releases
 
