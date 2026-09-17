@@ -1,4 +1,4 @@
-import type { SecurityKind } from "../email/types"
+import type { AccountType, SecurityKind } from "../email/types"
 
 /**
  * Auto-discovery of IMAP/SMTP server settings for well-known email
@@ -22,11 +22,29 @@ export interface DiscoveredSettings {
   smtpSecurity: SecurityKind
 }
 
+/**
+ * Brand identities the UI can render an icon for (see
+ * src/components/providers/provider-icon.tsx). Detection is display-time
+ * only — the database keeps the coarse gmail/imap AccountType, so known
+ * IMAP accounts gain their brand from the email domain with no migration.
+ */
+export type ProviderBrandId =
+  | "gmail"
+  | "outlook"
+  | "yahoo"
+  | "icloud"
+  | "fastmail"
+  | "gmx"
+  | "zoho"
+  | "aol"
+
 interface KnownProvider {
   /** Display name (unused at runtime, documents the row). */
   name: string
   /** Bare registrable domains; subdomains match via suffix rule. */
   domains: string[]
+  /** Brand the UI renders for this provider's accounts. */
+  brand: ProviderBrandId
   settings: DiscoveredSettings
 }
 
@@ -51,6 +69,7 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
   {
     name: "Outlook / Hotmail / Live",
     domains: ["outlook.com", "hotmail.com", "live.com", "msn.com"],
+    brand: "outlook",
     settings: {
       ...imap("outlook.office365.com", 993, "tls"),
       ...smtp("smtp-office365.com", 587, "starttls"),
@@ -59,6 +78,7 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
   {
     name: "Yahoo Mail",
     domains: ["yahoo.com", "ymail.com", "yahoo.co.uk"],
+    brand: "yahoo",
     settings: {
       ...imap("imap.mail.yahoo.com", 993, "tls"),
       ...smtp("smtp.mail.yahoo.com", 465, "tls"),
@@ -67,6 +87,7 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
   {
     name: "iCloud Mail",
     domains: ["icloud.com", "me.com", "mac.com"],
+    brand: "icloud",
     settings: {
       ...imap("imap.mail.me.com", 993, "tls"),
       ...smtp("smtp.mail.me.com", 587, "starttls"),
@@ -75,6 +96,7 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
   {
     name: "Fastmail",
     domains: ["fastmail.com", "fastmail.fm"],
+    brand: "fastmail",
     settings: {
       ...imap("imap.fastmail.com", 993, "tls"),
       ...smtp("smtp.fastmail.com", 465, "tls"),
@@ -83,6 +105,7 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
   {
     name: "GMX (international)",
     domains: ["gmx.com"],
+    brand: "gmx",
     settings: {
       ...imap("imap.gmx.com", 993, "tls"),
       ...smtp("mail.gmx.com", 465, "tls"),
@@ -91,6 +114,7 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
   {
     name: "GMX (Germany)",
     domains: ["gmx.net", "gmx.de"],
+    brand: "gmx",
     settings: {
       ...imap("imap.gmx.net", 993, "tls"),
       ...smtp("mail.gmx.net", 465, "tls"),
@@ -99,6 +123,7 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
   {
     name: "Zoho Mail",
     domains: ["zoho.com", "zohomail.com"],
+    brand: "zoho",
     settings: {
       ...imap("imap.zoho.com", 993, "tls"),
       ...smtp("smtp.zoho.com", 465, "tls"),
@@ -107,6 +132,7 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
   {
     name: "AOL Mail",
     domains: ["aol.com"],
+    brand: "aol",
     settings: {
       ...imap("imap.aol.com", 993, "tls"),
       ...smtp("smtp.aol.com", 465, "tls"),
@@ -124,11 +150,11 @@ export function extractDomain(email: string): string | null {
 }
 
 /**
- * Settings for a bare domain ("user@mail.yahoo.com" → pass
- * "mail.yahoo.com"): exact match first, then the longest registered
- * suffix (".yahoo.com" matches "mail.yahoo.com"). Null when unknown.
+ * The table's shared matcher: exact domain match first, then the longest
+ * registered suffix (".yahoo.com" matches "mail.yahoo.com"). Null when
+ * unknown.
  */
-export function discoverByDomain(domain: string): DiscoveredSettings | null {
+function matchProvider(domain: string): KnownProvider | null {
   const candidate = domain.trim().toLowerCase()
   if (!candidate) return null
   let best: KnownProvider | null = null
@@ -142,7 +168,45 @@ export function discoverByDomain(domain: string): DiscoveredSettings | null {
       }
     }
   }
+  return best
+}
+
+/**
+ * Settings for a bare domain ("user@mail.yahoo.com" → pass
+ * "mail.yahoo.com"): exact match first, then the longest registered
+ * suffix (".yahoo.com" matches "mail.yahoo.com"). Null when unknown.
+ */
+export function discoverByDomain(domain: string): DiscoveredSettings | null {
+  const best = matchProvider(domain)
   return best ? { ...best.settings } : null
+}
+
+/** Brand for a bare domain, matched exactly like discoverByDomain. */
+export function discoverBrandByDomain(
+  domain: string
+): ProviderBrandId | null {
+  return matchProvider(domain)?.brand ?? null
+}
+
+/**
+ * Brand for an email address. Null when the address is invalid or the
+ * domain is not a known provider — the UI falls back to a generic glyph.
+ */
+export function discoverBrandByEmail(email: string): ProviderBrandId | null {
+  const domain = extractDomain(email)
+  return domain ? discoverBrandByDomain(domain) : null
+}
+
+/**
+ * Brand to render for a stored account: gmail accounts are gmail by
+ * type; IMAP accounts are detected from the email domain, so existing
+ * rows gain their brand with no migration.
+ */
+export function brandForAccount(
+  type: AccountType,
+  email: string
+): ProviderBrandId | null {
+  return type === "gmail" ? "gmail" : discoverBrandByEmail(email)
 }
 
 /**

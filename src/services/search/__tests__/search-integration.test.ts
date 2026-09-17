@@ -634,6 +634,53 @@ describe("searchThreadsQuery", () => {
     )
     expect(beforeDay.map((thread) => thread.id)).not.toContain(june)
   })
+
+  it("excludes threads on the wrong side of negated size/date bounds", async () => {
+    const bigOld = await seed({
+      subject: "Big old mail",
+      fromAddress: "files@corp.example",
+      date: at(Date.UTC(2025, 0, 15) / 1000 - BASE_TIME),
+    })
+    const smallNew = await seed({
+      subject: "Small new mail",
+      fromAddress: "files@corp.example",
+      date: at(Date.UTC(2026, 0, 15) / 1000 - BASE_TIME),
+    })
+    // size_estimate directly (createMessage leaves it NULL — and NULL never
+    // trips a size bound, which is also why both threads survive below)
+    const sized = await executor.select<{ id: string; thread_id: string }>(
+      "SELECT id, thread_id FROM messages WHERE thread_id IN ($1, $2)",
+      [bigOld, smallNew]
+    )
+    for (const row of sized) {
+      await executor.execute(
+        "UPDATE messages SET size_estimate = $1 WHERE id = $2",
+        [row.thread_id === bigOld ? 20 * 1024 * 1024 : 500, row.id]
+      )
+    }
+
+    // the negated bound excludes exactly the offending thread
+    const noBig = await searchThreadsQuery(executor, accountId, "-larger:10m")
+    expect(noBig.map((thread) => thread.id)).toEqual([smallNew])
+    const noSmall = await searchThreadsQuery(
+      executor,
+      accountId,
+      "-smaller:1m"
+    )
+    expect(noSmall.map((thread) => thread.id)).toEqual([bigOld])
+    const notOld = await searchThreadsQuery(
+      executor,
+      accountId,
+      "-before:2026-01-01"
+    )
+    expect(notOld.map((thread) => thread.id)).toEqual([smallNew])
+    const notNew = await searchThreadsQuery(
+      executor,
+      accountId,
+      "-after:2026-01-01"
+    )
+    expect(notNew.map((thread) => thread.id)).toEqual([bigOld])
+  })
 })
 
 describe("searchThreadsQuery sort option (task 4.1)", () => {

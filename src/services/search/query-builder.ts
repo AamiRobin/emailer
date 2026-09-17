@@ -52,9 +52,13 @@ import { DEFAULT_THREAD_SORT, threadSortOrderClause } from "../db/thread-sort"
  * 8. `larger:<N>` / `smaller:<N>` → EXISTS over messages whose
  *    size_estimate compares against the parsed byte threshold (NULL never
  *    compares, so unsized messages satisfy neither operator).
+ *    `-larger:` / `-smaller:` → NOT EXISTS over the same comparison — an
+ *    unsized message can never appear inside, so it passes a negated size
+ *    bound.
  * 9. `before:<date>` / `after:<date>` → EXISTS over messages dated
  *    against the UTC-midnight boundary (before: exclusive `<`, after:
- *    inclusive `>=`) — the pair tiles time without gaps.
+ *    inclusive `>=`) — the pair tiles time without gaps. `-before:` /
+ *    `-after:` → NOT EXISTS over the same boundary comparison.
  * 10. Free text → a single EXISTS over messages: positive terms of ≥3 chars go
  *    through the external-content messages_fts trigram index (combined
  *    into one quoted MATCH string, so ONE message must match ALL terms —
@@ -241,6 +245,27 @@ export function buildThreadSearchSql(
       )`
     )
   }
+  // Negated mirrors: NOT EXISTS over the same comparisons — an unsized
+  // message never appears inside, so it passes a negated size bound (there
+  // is no size to exclude it on).
+  for (const bytes of parsed.negatedLarger) {
+    params.push(bytes)
+    conditions.push(
+      `NOT EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.thread_id = threads.id AND m.size_estimate > $${params.length}
+      )`
+    )
+  }
+  for (const bytes of parsed.negatedSmaller) {
+    params.push(bytes)
+    conditions.push(
+      `NOT EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.thread_id = threads.id AND m.size_estimate < $${params.length}
+      )`
+    )
+  }
 
   // 9. before:/after: — some message dated against the UTC-midnight
   // boundary; before: is exclusive, after: inclusive.
@@ -257,6 +282,24 @@ export function buildThreadSearchSql(
     params.push(seconds)
     conditions.push(
       `EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.thread_id = threads.id AND m.date >= $${params.length}
+      )`
+    )
+  }
+  for (const seconds of parsed.negatedBefore) {
+    params.push(seconds)
+    conditions.push(
+      `NOT EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.thread_id = threads.id AND m.date < $${params.length}
+      )`
+    )
+  }
+  for (const seconds of parsed.negatedAfter) {
+    params.push(seconds)
+    conditions.push(
+      `NOT EXISTS (
         SELECT 1 FROM messages m
         WHERE m.thread_id = threads.id AND m.date >= $${params.length}
       )`

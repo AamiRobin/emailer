@@ -64,10 +64,16 @@ export type { ReauthGmailOptions, ReauthResult } from "./reauth"
 
 export {
   KNOWN_PROVIDERS,
+  brandForAccount,
   defaultImapPort,
   defaultSmtpPort,
+  discoverBrandByDomain,
+  discoverBrandByEmail,
   discoverByDomain,
   discoverByEmail,
   extractDomain,
 } from "./provider-discovery"
-export type { DiscoveredSettings } from "./provider-discovery"
+export type {
+  DiscoveredSettings,
+  ProviderBrandId,
+} from "./provider-discovery"

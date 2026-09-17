@@ -7,8 +7,11 @@ import { parseSearchQuery } from "@/services/search/parser"
  * single source of truth — composeCriteriaQuery COMPILES fields into that
  * language, and criteriaFieldsFromQuery maps a stored query back, reporting
  * `unrepresentable` when anything in it has no form field (labels, is:
- * flags, negated operators, multiple bounds) so the dialog can fall back
- * to the raw advanced input.
+ * flags, negated operators, multiple bounds) or when a value would not
+ * survive the form's recompose (quoted phrases — the word lists split on
+ * whitespace — and commas inside from:/to:/subject: values), so the
+ * dialog falls back to the raw advanced input and a stored rule never
+ * changes meaning just by being opened.
  */
 
 export interface CriteriaFields {
@@ -47,6 +50,13 @@ export function emptyCriteriaFields(): CriteriaFields {
   }
 }
 
+/** The parser's tokenizer strips double quotes wherever they appear
+ * (parser.ts), so composing strips them up front: the stored query then
+ * parses back to exactly what the form composed. */
+function stripQuotes(text: string): string {
+  return text.replace(/"/g, "")
+}
+
 /** `from:"Alice Smith"` when the value contains whitespace; a comma list
  * becomes repeated same-operator tokens (OR within the operator). */
 function pushValueTokens(
@@ -54,7 +64,7 @@ function pushValueTokens(
   key: "from" | "to" | "subject",
   raw: string
 ): void {
-  for (const part of raw.split(",").map((value) => value.trim())) {
+  for (const part of raw.split(",").map((value) => stripQuotes(value.trim()))) {
     if (!part) continue
     tokens.push(/\s/.test(part) ? `${key}:"${part}"` : `${key}:${part}`)
   }
@@ -68,8 +78,11 @@ export function composeCriteriaQuery(fields: CriteriaFields): string | null {
   pushValueTokens(tokens, "from", fields.from)
   pushValueTokens(tokens, "to", fields.to)
   pushValueTokens(tokens, "subject", fields.subject)
-  tokens.push(...fields.hasWords.split(/\s+/).filter(Boolean))
-  for (const term of fields.doesntHave.split(/\s+/).filter(Boolean)) {
+  tokens.push(...fields.hasWords.split(/\s+/).map(stripQuotes).filter(Boolean))
+  for (const term of fields.doesntHave
+    .split(/\s+/)
+    .map(stripQuotes)
+    .filter(Boolean)) {
     tokens.push(term.startsWith("-") ? term : `-${term}`)
   }
   const size = Number(fields.sizeValue)
@@ -85,8 +98,10 @@ export function composeCriteriaQuery(fields: CriteriaFields): string | null {
 
 /** Parse an existing query into form fields. `unrepresentable` is true when
  * any parsed predicate has no form field (labels, is:/is-flag negations,
- * negated from/to/subject, more than one size or date bound) — the caller
- * falls back to the raw advanced input with the query verbatim. */
+ * negated operators — including negated size/date bounds — or more than one
+ * size/date bound) or would be altered by recomposition (quoted phrases,
+ * comma-bearing from:/to:/subject: values, a negated literal dash) — the
+ * caller falls back to the raw advanced input with the query verbatim. */
 export function criteriaFieldsFromQuery(query: string): {
   fields: CriteriaFields
   unrepresentable: boolean
@@ -111,7 +126,30 @@ export function criteriaFieldsFromQuery(query: string): {
     parsed.larger.length + parsed.smaller.length > 1 ||
     parsed.before.length + parsed.after.length > 1 ||
     parsed.larger.some((bytes) => !sizeFormable(bytes)) ||
-    parsed.smaller.some((bytes) => !sizeFormable(bytes))
+    parsed.smaller.some((bytes) => !sizeFormable(bytes)) ||
+    // negated size/date bounds have no form row (doesn't-have words are
+    // free text only) — compose would silently drop them
+    parsed.negatedLarger.length ||
+    parsed.negatedSmaller.length ||
+    parsed.negatedBefore.length ||
+    parsed.negatedAfter.length
+  ) {
+    unrepresentable = true
+  }
+
+  // Value-level round-trip hazards: the form recomposes from fields, so a
+  // predicate the compose pass would ALTER marks the query unrepresentable —
+  // whitespace inside a term (a quoted phrase would split into independent
+  // words), a negated literal dash (`--a` would recompose as `-a`), and
+  // commas inside a from:/to:/subject: value (the fields join/split on them).
+  if (
+    parsed.freeText.some((term) => /\s/.test(term)) ||
+    parsed.negatedFreeText.some(
+      (term) => /\s/.test(term) || term.startsWith("-")
+    ) ||
+    [...parsed.from, ...parsed.to, ...parsed.subject].some((value) =>
+      value.includes(",")
+    )
   ) {
     unrepresentable = true
   }

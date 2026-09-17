@@ -1,7 +1,9 @@
 import { useState } from "react"
-import { KeyRound, Mail, Server } from "lucide-react"
+import type { ReactNode } from "react"
+import { KeyRound, Server } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { ProviderIcon } from "@/components/providers/provider-icon"
 import {
   Dialog,
   DialogContent,
@@ -35,21 +37,21 @@ const options: {
   mode: Exclude<AddAccountMode, "choose">
   title: string
   description: string
-  icon: typeof Mail
+  icon: ReactNode
 }[] = [
   {
     mode: "gmail",
     title: "Gmail",
     description:
       "Sign in with your Google account in the browser. Needs a Google Client ID (free).",
-    icon: Mail,
+    icon: <ProviderIcon provider="gmail" className="size-4" />,
   },
   {
     mode: "imap",
     title: "Other email (IMAP/SMTP)",
     description:
       "Outlook, Yahoo, iCloud, Fastmail, GMX, Zoho or any provider — with your email address and password.",
-    icon: Server,
+    icon: <Server className="size-4 text-muted-foreground" />,
   },
 ]
 
@@ -101,7 +103,7 @@ export function AddAccountDialog({
                   onClick={() => setMode(option.mode)}
                 >
                   <span className="flex items-center gap-2 text-sm font-medium">
-                    <option.icon className="size-4 text-muted-foreground" />
+                    {option.icon}
                     {option.title}
                   </span>
                   {/* whitespace-normal: the button base style is nowrap, and

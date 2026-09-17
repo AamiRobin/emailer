@@ -236,6 +236,42 @@ describe("rule criteria negation, size and dates", () => {
     ).toBe(false)
   })
 
+  it("negated size and date bounds rule out messages on the wrong side", () => {
+    expect(matches("-larger:10m", event({ sizeEstimate: 20 * 1024 * 1024 })))
+      .toBe(false)
+    expect(
+      matches("-larger:10m", event({ sizeEstimate: 5 * 1024 * 1024 }))
+    ).toBe(true)
+    expect(matches("-smaller:1m", event({ sizeEstimate: 500 }))).toBe(false)
+    expect(
+      matches("-smaller:1m", event({ sizeEstimate: 2 * 1024 * 1024 }))
+    ).toBe(true)
+    // an unsized message can never hit a size comparison — it passes a
+    // negated size bound (the mirror of the search SQL's NOT EXISTS)
+    expect(matches("-larger:1m", event({ sizeEstimate: null }))).toBe(true)
+    expect(matches("-smaller:1m", event({ sizeEstimate: null }))).toBe(true)
+
+    const beforeDay = Date.UTC(2023, 10, 13) / 1000
+    const afterDay = Date.UTC(2023, 10, 15) / 1000
+    expect(matches("-before:2023-11-14", event({ date: beforeDay }))).toBe(
+      false
+    )
+    expect(matches("-before:2023-11-14", event({ date: afterDay }))).toBe(true)
+    expect(matches("-after:2023-11-14", event({ date: afterDay }))).toBe(false)
+    expect(matches("-after:2023-11-14", event({ date: beforeDay }))).toBe(true)
+
+    // negated bounds compose with the positive conjunction
+    expect(
+      matches("from:example.com -larger:1m", event({ sizeEstimate: 4096 }))
+    ).toBe(true)
+    expect(
+      matches(
+        "from:example.com -larger:1m",
+        event({ sizeEstimate: 2 * 1024 * 1024 })
+      )
+    ).toBe(false)
+  })
+
   it("a negation-only criteria matches everything except the excluded set", () => {
     expect(matches("-from:other@x.com", event())).toBe(true)
     expect(matches("-from:sender@example.com", event())).toBe(false)

@@ -35,9 +35,12 @@ import type { IngestionEvent } from "./ingestion"
  * - `larger:` / `smaller:` — the INSERTED message's own size estimate
  *   against the parsed byte threshold (k/m suffixes, bare = bytes). A
  *   message without a size estimate satisfies neither operator — a
- *   size-only rule is a no-op on such mail.
+ *   size-only rule is a no-op on such mail. Negated bounds run on the
+ *   exclusion side (any hit rules the message out), and an unsized
+ *   message can never hit, so it passes `-larger:` / `-smaller:`.
  * - `before:` / `after:` — the inserted message's date against the
- *   UTC-midnight boundary (before: exclusive, after: inclusive).
+ *   UTC-midnight boundary (before: exclusive, after: inclusive); negated
+ *   bounds exclude messages on their side of the boundary.
  * - free text — each term is a substring of the subject OR the snippet.
  * - NEGATION — a leading `-` flips any of the above into an exclusion
  *   (the same parser produces the negated fields): the message is ruled
@@ -167,6 +170,23 @@ export function messageMatchesCriteria(
     return false
   }
   if (!dateWithinBounds(event.date, parsed.before, parsed.after)) {
+    return false
+  }
+  // Negated size/date — any hit excludes. A null estimate can never hit a
+  // size comparison, so unsized mail passes a negated size bound (the JS
+  // mirror of the search SQL's NOT EXISTS: NULL never appears inside).
+  const size = event.sizeEstimate
+  if (
+    size !== null &&
+    (parsed.negatedLarger.some((threshold) => size > threshold) ||
+      parsed.negatedSmaller.some((threshold) => size < threshold))
+  ) {
+    return false
+  }
+  if (
+    parsed.negatedBefore.some((boundary) => event.date < boundary) ||
+    parsed.negatedAfter.some((boundary) => event.date >= boundary)
+  ) {
     return false
   }
   // Free-text terms are separate predicates: every term (AND) must appear

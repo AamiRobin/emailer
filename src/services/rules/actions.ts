@@ -79,7 +79,7 @@ export const RULE_ACTION_TYPES: readonly RuleActionType[] = [
 
 export interface RuleAction {
   type: RuleActionType
-  /** add_labels: label names (or gmail label ids) resolved at apply time. */
+  /** add_labels / remove_labels: names (or gmail label ids) resolved at apply time. */
   labels?: string[]
   /** move: full destination folder path (imap accounts). */
   folder?: string

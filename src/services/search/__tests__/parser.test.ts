@@ -19,6 +19,10 @@ describe("parseSearchQuery", () => {
         smaller: [],
         before: [],
         after: [],
+        negatedLarger: [],
+        negatedSmaller: [],
+        negatedBefore: [],
+        negatedAfter: [],
         negatedFrom: [],
         negatedTo: [],
         negatedSubject: [],
@@ -156,6 +160,10 @@ describe("parseSearchQuery", () => {
       smaller: [],
       before: [],
       after: [],
+      negatedLarger: [],
+      negatedSmaller: [],
+      negatedBefore: [],
+      negatedAfter: [],
       negatedFrom: [],
       negatedTo: [],
       negatedSubject: [],
@@ -252,6 +260,30 @@ describe("parseSearchQuery", () => {
     })
   })
 
+  it("parses negated size and date operators", () => {
+    expect(
+      parseSearchQuery(
+        "-larger:10m -smaller:500k -before:2026-01-01 -after:2025/06/15"
+      )
+    ).toMatchObject({
+      negatedLarger: [10 * 1024 * 1024],
+      negatedSmaller: [500 * 1024],
+      negatedBefore: [Date.UTC(2026, 0, 1) / 1000],
+      negatedAfter: [Date.UTC(2025, 5, 15) / 1000],
+      negatedFreeText: [],
+    })
+    // unparseable negated values degrade to negated literal text, like
+    // every other operator
+    expect(parseSearchQuery("-larger:abc -before:junk")).toMatchObject({
+      negatedLarger: [],
+      negatedBefore: [],
+      negatedFreeText: ["larger:abc", "before:junk"],
+    })
+    // negation-only size/date queries are NOT empty
+    expect(isEmptyQuery(parseSearchQuery("-larger:5m"))).toBe(false)
+    expect(isEmptyQuery(parseSearchQuery("-before:2026-01-01"))).toBe(false)
+  })
+
   it("treats negation-only queries as non-empty predicates", () => {
     expect(isEmptyQuery(parseSearchQuery("-from:a@x"))).toBe(false)
     expect(isEmptyQuery(parseSearchQuery("-is:unread"))).toBe(false)
@@ -295,6 +327,10 @@ describe("parseSearchQuery", () => {
       smaller: [],
       before: [],
       after: [],
+      negatedLarger: [],
+      negatedSmaller: [],
+      negatedBefore: [],
+      negatedAfter: [],
       negatedFrom: [],
       negatedTo: [],
       negatedSubject: [],

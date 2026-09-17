@@ -22,6 +22,7 @@ import {
   defaultImapPort,
   defaultSmtpPort,
   discoverByEmail,
+  discoverBrandByEmail,
   ImapTestFailedError,
   SmtpTestFailedError,
   testImapSettings,
@@ -29,6 +30,8 @@ import {
 } from "@/services/account-flows"
 import type { ImapAccountConfig } from "@/services/account-flows"
 import type { SecurityKind } from "@/services/email/types"
+import { ProviderIcon } from "@/components/providers/provider-icon"
+import { providerBrandName } from "@/components/providers/provider-brands"
 
 /**
  * Add-IMAP/SMTP flow UI (task 5.4): email + password first, then server
@@ -108,6 +111,11 @@ export function AddImapFlow({ onBack, onSuccess }: AddImapFlowProps) {
   const [tests, setTests] = useState<Record<Side, SideTestState>>(IDLE_BOTH)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+
+  // Live brand detection while the address is typed: pure derivation from
+  // the email state, feeding the identity-stage hint and the servers-stage
+  // description. Cheap suffix match, safe on partial input.
+  const detectedBrand = discoverBrandByEmail(email.trim())
 
   function handleIdentitySubmit(event: React.FormEvent) {
     event.preventDefault()
@@ -297,6 +305,13 @@ export function AddImapFlow({ onBack, onSuccess }: AddImapFlowProps) {
                 setIdentityError(null)
               }}
             />
+            {detectedBrand && (
+              <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                <ProviderIcon provider={detectedBrand} className="size-3.5" />
+                {providerBrandName(detectedBrand)} detected — server settings
+                will be prefilled.
+              </p>
+            )}
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor="imap-password">Password</Label>
@@ -346,7 +361,9 @@ export function AddImapFlow({ onBack, onSuccess }: AddImapFlowProps) {
         <DialogTitle>Server settings</DialogTitle>
         <DialogDescription>
           {discovered
-            ? "Auto-filled from this provider's known settings — edit if they differ."
+            ? detectedBrand
+              ? `Auto-filled from ${providerBrandName(detectedBrand)}'s known settings — edit if they differ.`
+              : "Auto-filled from this provider's known settings — edit if they differ."
             : "This provider is not in the known list — enter the server details from your provider."}
         </DialogDescription>
       </DialogHeader>

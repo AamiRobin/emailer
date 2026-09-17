@@ -213,6 +213,27 @@ describe("buildThreadSearchSql", () => {
     ])
   })
 
+  it("builds negated size and date bounds as NOT EXISTS mirrors", () => {
+    const { sql, params } = build(
+      "-larger:10m -smaller:500k -before:2026-01-01 -after:2025/06/15"
+    )
+    expect(sql.split("NOT EXISTS").length - 1).toBe(4)
+    expect(sql).toContain(
+      "NOT EXISTS ( SELECT 1 FROM messages m WHERE m.thread_id = threads.id " +
+        "AND m.size_estimate > $2"
+    )
+    expect(sql).toContain("AND m.size_estimate < $3")
+    expect(sql).toContain("AND m.date < $4")
+    expect(sql).toContain("AND m.date >= $5")
+    expect(params).toEqual([
+      "acc-1",
+      10 * 1024 * 1024,
+      500 * 1024,
+      Date.UTC(2026, 0, 1) / 1000,
+      Date.UTC(2025, 5, 15) / 1000,
+    ])
+  })
+
   it("builds a negation-only query against every in-scope thread", () => {
     const { sql, params } = build("-from:newsletter@x.com")
     expect(sql).toContain("NOT EXISTS")

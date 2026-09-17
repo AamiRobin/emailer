@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
+import type { ReactNode } from "react"
 import type { LucideIcon } from "lucide-react"
 import { Search, Settings, SquarePen, Tag, UserRound } from "lucide-react"
 
@@ -12,7 +13,9 @@ import {
   CommandList,
 } from "@/components/ui/command"
 import { FOLDER_ITEMS } from "@/components/layout/folders"
+import { ProviderIcon } from "@/components/providers/provider-icon"
 import { filterByFuzzy } from "@/lib/fuzzy-match"
+import { brandForAccount } from "@/services/account-flows"
 import { useAccountStore } from "@/stores/account-store"
 import { usePaletteStore } from "@/stores/palette-store"
 import { useUiStore } from "@/stores/ui-store"
@@ -52,7 +55,8 @@ interface PaletteItem {
   group: PaletteGroup
   label: string
   keywords: string[]
-  icon: LucideIcon
+  /** Lucide icon, or a brand-glyph component for account entries. */
+  icon: LucideIcon | ((props: { className?: string }) => ReactNode)
   /** Side effect when selected; closing the palette happens after run. */
   run: () => void
 }
@@ -134,16 +138,25 @@ export function CommandPalette() {
           .getState()
           .setView({ kind: "label", labelId: label.id, name: label.name }),
     }))
-    const accountItems: PaletteItem[] = accounts.map((account) => ({
-      id: `account-${account.id}`,
-      group: "accounts",
-      label: `Switch to ${account.email}`,
-      keywords: ["switch", "account", account.email],
-      icon: UserRound,
-      run: () => {
-        void useAccountStore.getState().setActive(account.id)
-      },
-    }))
+    const accountItems: PaletteItem[] = accounts.map((account) => {
+      const brand = brandForAccount(account.type, account.email)
+      return {
+        id: `account-${account.id}`,
+        group: "accounts",
+        label: `Switch to ${account.email}`,
+        keywords: ["switch", "account", account.email],
+        // Brand glyph when the provider is known; generic user icon
+        // otherwise (unchanged behavior for custom domains).
+        icon: brand
+          ? ({ className }) => (
+              <ProviderIcon provider={brand} className={className} />
+            )
+          : UserRound,
+        run: () => {
+          void useAccountStore.getState().setActive(account.id)
+        },
+      }
+    })
     return [...actionItems, ...folderItems, ...labelItems, ...accountItems]
   }, [accounts, labels, query])
 

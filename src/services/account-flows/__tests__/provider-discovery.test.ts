@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest"
 
 import {
   KNOWN_PROVIDERS,
+  brandForAccount,
   defaultImapPort,
   defaultSmtpPort,
+  discoverBrandByDomain,
+  discoverBrandByEmail,
   discoverByDomain,
   discoverByEmail,
   extractDomain,
@@ -191,5 +194,49 @@ describe("manual-entry default ports", () => {
     expect(defaultSmtpPort("tls")).toBe(465)
     expect(defaultSmtpPort("starttls")).toBe(587)
     expect(defaultSmtpPort("none")).toBe(25)
+  })
+})
+
+describe("brand discovery", () => {
+  it("resolves brands for the known providers", () => {
+    expect(discoverBrandByEmail("user@outlook.com")).toBe("outlook")
+    expect(discoverBrandByEmail("user@hotmail.com")).toBe("outlook")
+    expect(discoverBrandByEmail("user@yahoo.co.uk")).toBe("yahoo")
+    expect(discoverBrandByEmail("user@me.com")).toBe("icloud")
+    expect(discoverBrandByEmail("user@fastmail.fm")).toBe("fastmail")
+    expect(discoverBrandByEmail("user@zohomail.com")).toBe("zoho")
+    expect(discoverBrandByEmail("user@aol.com")).toBe("aol")
+  })
+
+  it("follows the same suffix rule as settings discovery", () => {
+    expect(discoverBrandByDomain("mail.yahoo.com")).toBe("yahoo")
+    expect(discoverBrandByDomain("notyahoo.com")).toBeNull()
+  })
+
+  it("maps both GMX rows to the single gmx brand", () => {
+    expect(discoverBrandByDomain("gmx.com")).toBe("gmx")
+    expect(discoverBrandByDomain("gmx.net")).toBe("gmx")
+    expect(discoverBrandByDomain("gmx.de")).toBe("gmx")
+  })
+
+  it("returns null for unknown domains and invalid input", () => {
+    expect(discoverBrandByDomain("example.com")).toBeNull()
+    expect(discoverBrandByEmail("user@")).toBeNull()
+    expect(discoverBrandByEmail("not-an-address")).toBeNull()
+    expect(discoverBrandByEmail("user@example.com")).toBeNull()
+  })
+
+  it("detects the brand from the account type and email domain", () => {
+    // Gmail accounts are gmail by type, whatever the address says.
+    expect(brandForAccount("gmail", "user@weird.example")).toBe("gmail")
+    expect(brandForAccount("imap", "user@outlook.com")).toBe("outlook")
+    // Unknown IMAP domains have no brand — the UI shows the generic glyph.
+    expect(brandForAccount("imap", "me@mydomain.com")).toBeNull()
+  })
+
+  it("gives every table row a brand", () => {
+    for (const provider of KNOWN_PROVIDERS) {
+      expect(provider.brand).toBeTruthy()
+    }
   })
 })

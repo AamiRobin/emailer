@@ -19,6 +19,8 @@ import {
 import type { AccountInfo } from "@/stores/account-store"
 import { selectActiveAccount, useAccountStore } from "@/stores/account-store"
 import { ReauthDialog } from "@/components/accounts/reauth-dialog"
+import { ProviderIcon } from "@/components/providers/provider-icon"
+import { brandForAccount } from "@/services/account-flows"
 
 interface AccountSwitcherProps {
   isCollapsed: boolean
@@ -53,11 +55,30 @@ function AccountAvatar({
   account: AccountInfo
   size?: "default" | "sm"
 }) {
+  // Known provider → brand glyph in the circle; unknown/custom domains
+  // keep the initials (or "?") fallback.
+  const brand = brandForAccount(account.type, account.email)
   return (
     <Avatar size={size} className="shrink-0">
-      <AvatarFallback className="text-xs">{initialsOf(account)}</AvatarFallback>
+      <AvatarFallback className="text-xs">
+        {brand ? (
+          <ProviderIcon
+            provider={brand}
+            className={size === "sm" ? "size-3.5" : "size-4"}
+          />
+        ) : (
+          initialsOf(account)
+        )}
+      </AvatarFallback>
     </Avatar>
   )
+}
+
+/** Provider glyph before the email in dropdown rows; none when unknown. */
+function AccountRowIcon({ account }: { account: AccountInfo }) {
+  const brand = brandForAccount(account.type, account.email)
+  if (!brand) return null
+  return <ProviderIcon provider={brand} className="size-3.5 shrink-0" />
 }
 
 /**
@@ -161,6 +182,7 @@ export function AccountSwitcher({
               accounts.flatMap((account) => [
                 <SelectItem key={account.id} value={account.id}>
                   <div className="flex w-full items-center gap-2">
+                    <AccountRowIcon account={account} />
                     <span className="truncate">{account.email}</span>
                     {account.status === "auth-error" && (
                       <TriangleAlert

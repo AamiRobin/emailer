@@ -45,9 +45,10 @@ import {
  * single source of truth — the form is a compiler on top of it), stored
  * unchanged in criteria_json. The raw query input remains behind the
  * "Advanced query" checkbox, and a query the form can't represent
- * (labels, is: flags, negated operators, multiple bounds) opens in
- * advanced mode with it verbatim. See the rules-section module comment
- * for the row semantics.
+ * (labels, is: flags, negated operators, multiple bounds, or values the
+ * form would rewrite — see rule-criteria.ts) opens in advanced mode
+ * with it verbatim. See the rules-section module comment for the row
+ * semantics.
  */
 
 /** "Newsletters, Receipts" → ["Newsletters", "Receipts"] — trimmed,

@@ -7,6 +7,9 @@ import { RemoveAccountDialog } from "@/components/accounts/remove-account-dialog
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
+import { ProviderIcon } from "@/components/providers/provider-icon"
+import { providerBrandName } from "@/components/providers/provider-brands"
+import { brandForAccount } from "@/services/account-flows"
 import type { AccountInfo } from "@/stores/account-store"
 import { useAccountStore } from "@/stores/account-store"
 
@@ -29,14 +32,16 @@ function AccountRow({
   onRemove: (account: AccountInfo) => void
   onReauth: (account: AccountInfo) => void
 }) {
+  const brand = brandForAccount(account.type, account.email)
   return (
     <div
       data-testid="settings-account-row"
       className="flex items-center gap-3 py-2.5"
     >
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium text-foreground">
-          {account.email}
+        <p className="flex items-center gap-2 text-sm font-medium text-foreground">
+          <ProviderIcon provider={brand} className="size-4" />
+          <span className="truncate">{account.email}</span>
         </p>
         <p className="text-xs text-muted-foreground">
           {account.displayName ?? "No display name"}
@@ -57,9 +62,9 @@ function AccountRow({
           </Badge>
         )
       )}
-      <Badge variant="outline">
-        {account.type === "gmail" ? "Gmail" : "IMAP"}
-      </Badge>
+      {/* Brand name when the provider is known ("Outlook"), else the
+          generic IMAP label. Gmail accounts always resolve to "Gmail". */}
+      <Badge variant="outline">{providerBrandName(brand) ?? "IMAP"}</Badge>
       {account.status === "auth-error" && (
         <Button variant="ghost" size="sm" onClick={() => onReauth(account)}>
           <KeyRound />

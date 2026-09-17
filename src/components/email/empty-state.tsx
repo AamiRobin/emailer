@@ -16,6 +16,8 @@ interface EmptyStateProps {
   title: string
   hint?: string
   actions?: ReactNode
+  /** Optional content below the actions (e.g. the welcome provider strip). */
+  footer?: ReactNode
   className?: string
   testId?: string
 }
@@ -25,6 +27,7 @@ export function EmptyState({
   title,
   hint,
   actions,
+  footer,
   className,
   testId = "empty-state",
 }: EmptyStateProps) {
@@ -45,6 +48,7 @@ export function EmptyState({
       <p className="text-sm font-medium text-foreground">{title}</p>
       {hint && <p className="max-w-sm text-xs text-muted-foreground">{hint}</p>}
       {actions && <div className="mt-3 flex items-center gap-2">{actions}</div>}
+      {footer}
     </div>
   )
 }

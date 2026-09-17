@@ -8,9 +8,10 @@
  *   escape character — an unmatched quote simply runs to the end of input.
  * - A token may carry ONE leading `-` to negate it: the rest of the token is
  *   parsed exactly as below, and the result EXCLUDES instead of includes
- *   (`-term`, `-"exact phrase"`, `-from:x`, `-has:attachment`). A bare `-`
- *   (nothing after the minus) stays literal free text, and `--a` negates the
- *   literal text `-a` — there is no double negation and no escape character.
+ *   (`-term`, `-"exact phrase"`, `-from:x`, `-has:attachment`, `-larger:5m`,
+ *   `-before:2026-01-01`). A bare `-` (nothing after the minus) is dropped,
+ *   and `--a` negates the literal text `-a` — there is no double negation
+ *   and no escape character.
  * - A token shaped `key:value` (first colon splits; the key is matched
  *   case-insensitively) is an operator:
  *   - `from:` / `to:` / `subject:` / `label:` — value operators; the token's
@@ -71,6 +72,14 @@ export interface ParsedQuery {
   before: number[]
   /** `after:<date>` boundaries (unix seconds); each must hold inclusively. */
   after: number[]
+  /** `-larger:<N>` thresholds in bytes — a message past ANY excludes. */
+  negatedLarger: number[]
+  /** `-smaller:<N>` thresholds in bytes — a message under ANY excludes. */
+  negatedSmaller: number[]
+  /** `-before:<date>` boundaries (unix seconds) — a message dated before ANY excludes. */
+  negatedBefore: number[]
+  /** `-after:<date>` boundaries (unix seconds) — a message dated on/after ANY excludes. */
+  negatedAfter: number[]
   /** `-from:<value>` values — a match on ANY of these excludes. */
   negatedFrom: string[]
   /** `-to:<value>` values — a match on ANY of these excludes. */
@@ -101,6 +110,10 @@ export function isEmptyQuery(parsed: ParsedQuery): boolean {
     !parsed.smaller.length &&
     !parsed.before.length &&
     !parsed.after.length &&
+    !parsed.negatedLarger.length &&
+    !parsed.negatedSmaller.length &&
+    !parsed.negatedBefore.length &&
+    !parsed.negatedAfter.length &&
     !parsed.negatedFrom.length &&
     !parsed.negatedTo.length &&
     !parsed.negatedSubject.length &&
@@ -127,6 +140,10 @@ export function parseSearchQuery(input: string): ParsedQuery {
     smaller: [],
     before: [],
     after: [],
+    negatedLarger: [],
+    negatedSmaller: [],
+    negatedBefore: [],
+    negatedAfter: [],
     negatedFrom: [],
     negatedTo: [],
     negatedSubject: [],
@@ -176,6 +193,30 @@ export function parseSearchQuery(input: string): ParsedQuery {
             parsed.negatedFlags.isStarred = true
           } else parsed.negatedFreeText.push(body)
           break
+        case "larger": {
+          const bytes = parseByteSize(value)
+          if (bytes === null) parsed.negatedFreeText.push(body)
+          else parsed.negatedLarger.push(bytes)
+          break
+        }
+        case "smaller": {
+          const bytes = parseByteSize(value)
+          if (bytes === null) parsed.negatedFreeText.push(body)
+          else parsed.negatedSmaller.push(bytes)
+          break
+        }
+        case "before": {
+          const seconds = parseUtcDate(value)
+          if (seconds === null) parsed.negatedFreeText.push(body)
+          else parsed.negatedBefore.push(seconds)
+          break
+        }
+        case "after": {
+          const seconds = parseUtcDate(value)
+          if (seconds === null) parsed.negatedFreeText.push(body)
+          else parsed.negatedAfter.push(seconds)
+          break
+        }
         default:
           parsed.negatedFreeText.push(body)
       }

@@ -141,6 +141,37 @@ describe("criteriaFieldsFromQuery", () => {
     }
   })
 
+  it("flags value-level round-trip hazards as unrepresentable", () => {
+    for (const query of [
+      // a quoted phrase: the word lists split on whitespace, so recompose
+      // would turn it into two independent terms
+      '"annual report"',
+      'subject:"annual report" -"WIP draft"',
+      // a comma inside a value: the from/to/subject fields join and split
+      // on commas, so the value would fork into two
+      'from:"Doe, John"',
+      // a negated literal dash: stripping + re-adding the dash would
+      // change "exclude the text -a" into "exclude the text a"
+      "--a",
+      // negated size/date bounds have no form row at all — compose would
+      // silently drop them
+      "-larger:5m",
+      "-before:2026-01-01",
+    ]) {
+      expect(criteriaFieldsFromQuery(query).unrepresentable).toBe(true)
+    }
+  })
+
+  it("strips double quotes from composed values, like the parser does", () => {
+    expect(composeCriteriaQuery(fields({ from: 'a"b' }))).toBe("from:ab")
+    expect(composeCriteriaQuery(fields({ hasWords: 'he"llo' }))).toBe("hello")
+    expect(composeCriteriaQuery(fields({ doesntHave: 'sp"am' }))).toBe("-spam")
+    // a quoted pair still composes as one quoted token
+    expect(composeCriteriaQuery(fields({ from: 'A"B C' }))).toBe(
+      'from:"AB C"'
+    )
+  })
+
   it("round-trips a whole-KB size bound exactly", () => {
     const { fields: mapped, unrepresentable } =
       criteriaFieldsFromQuery("smaller:1024")
