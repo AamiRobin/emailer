@@ -348,9 +348,6 @@ export function MailShell({
       collapsible={true}
       minSize={SIDEBAR_RAIL_SIZE}
       maxSize="20%"
-      className={cn(
-        sidebarCollapsed && "transition-all duration-300 ease-in-out"
-      )}
     >
       {/* Height-constrained column: without it the sidebar's h-full adds to
           the switcher + separator heights and pushes the settings footer
