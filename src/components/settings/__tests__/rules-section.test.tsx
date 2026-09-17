@@ -177,10 +177,38 @@ describe("RulesSection", () => {
     ).toHaveProperty("disabled", true)
   })
 
-  it("documents the criteria operators in the add dialog", async () => {
+  it("shows the Gmail-style criteria rows in the add dialog", async () => {
     render(<RulesSection />)
 
     fireEvent.click(screen.getByRole("button", { name: "Add Rule" }))
+
+    await screen.findByRole("dialog")
+    for (const label of [
+      "From",
+      "To",
+      "Subject",
+      "Has the words",
+      "Doesn't have",
+      "Size",
+      "Arrived",
+    ]) {
+      expect(screen.getByLabelText(label)).toBeTruthy()
+    }
+    // the size row keeps Gmail's comparison/unit dropdowns
+    expect(screen.getByLabelText("Size comparison")).toBeTruthy()
+    expect(screen.getByLabelText("Size unit")).toBeTruthy()
+    expect(screen.getByLabelText("Date direction")).toBeTruthy()
+    expect(
+      screen.getByRole("checkbox", { name: "Has attachment" })
+    ).toBeTruthy()
+  })
+
+  it("documents the advanced query syntax after toggling advanced", async () => {
+    render(<RulesSection />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Rule" }))
+    await screen.findByRole("dialog")
+    fireEvent.click(screen.getByRole("checkbox", { name: "Advanced query" }))
 
     const dialog = await screen.findByRole("dialog")
     for (const operator of [
@@ -191,18 +219,23 @@ describe("RulesSection", () => {
       "has:attachment",
       "is:unread",
       "is:starred",
+      "larger:",
+      "smaller:",
+      "before:",
+      "after:",
+      "-from:boss@x.com",
     ]) {
       expect(dialog.textContent).toContain(operator)
     }
   })
 
-  it("adds a rule with the default archive action via the CRUD layer", async () => {
+  it("adds a rule from the From row, storing the composed query", async () => {
     render(<RulesSection />)
 
     fireEvent.click(screen.getByRole("button", { name: "Add Rule" }))
     await screen.findByRole("dialog")
 
-    // Invalid until name + criteria are filled.
+    // Invalid until name + a criterion are filled.
     expect(screen.getByRole("button", { name: "Create Rule" })).toHaveProperty(
       "disabled",
       true
@@ -211,8 +244,8 @@ describe("RulesSection", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "Newsletters" },
     })
-    fireEvent.change(screen.getByLabelText("When a message matches"), {
-      target: { value: "from:news@x.com" },
+    fireEvent.change(screen.getByLabelText("From"), {
+      target: { value: "news@x.com" },
     })
     fireEvent.click(screen.getByRole("button", { name: "Create Rule" }))
 
@@ -229,6 +262,31 @@ describe("RulesSection", () => {
     expect(toastMock.success).toHaveBeenCalledTimes(1)
   })
 
+  it("composes the size, date and attachment rows into the stored query", async () => {
+    render(<RulesSection />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Rule" }))
+    await screen.findByRole("dialog")
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "Big old receipts" },
+    })
+    fireEvent.change(screen.getByLabelText("Size value"), {
+      target: { value: "25" },
+    })
+    fireEvent.change(screen.getByLabelText("Date"), {
+      target: { value: "2026-01-31" },
+    })
+    fireEvent.click(screen.getByRole("checkbox", { name: "Has attachment" }))
+    fireEvent.click(screen.getByRole("button", { name: "Create Rule" }))
+
+    expect(await screen.findByTestId("settings-rule-row")).toBeTruthy()
+    const rows = await listRules(executor, accountId)
+    expect(rows).toHaveLength(1)
+    expect(JSON.parse(rows[0]!.criteria_json)).toEqual({
+      query: "larger:25mb before:2026-01-31 has:attachment",
+    })
+  })
+
   it("builds add_labels and move actions through the action builder", async () => {
     render(<RulesSection />)
 
@@ -238,8 +296,8 @@ describe("RulesSection", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "File newsletters" },
     })
-    fireEvent.change(screen.getByLabelText("When a message matches"), {
-      target: { value: "from:news@x.com" },
+    fireEvent.change(screen.getByLabelText("From"), {
+      target: { value: "news@x.com" },
     })
     // Action 1: the archive default becomes an add_labels action.
     fireEvent.click(screen.getByRole("combobox", { name: "Action 1 type" }))
@@ -272,6 +330,43 @@ describe("RulesSection", () => {
     ])
     expect(screen.getByText("Label: Newsletters, Receipts")).toBeTruthy()
     expect(screen.getByText("Mark as spam")).toBeTruthy()
+  })
+
+  it("builds a remove_labels action through the action builder", async () => {
+    render(<RulesSection />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Rule" }))
+    await screen.findByRole("dialog")
+
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "Unfile boss mail" },
+    })
+    fireEvent.change(screen.getByLabelText("From"), {
+      target: { value: "boss@work.com" },
+    })
+    fireEvent.change(screen.getByLabelText("Doesn't have"), {
+      target: { value: "fyi" },
+    })
+    fireEvent.click(screen.getByRole("combobox", { name: "Action 1 type" }))
+    chooseOption(await screen.findByRole("option", { name: "Remove labels" }))
+    fireEvent.change(screen.getByLabelText("Action 1 labels"), {
+      target: { value: "Newsletters" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Create Rule" }))
+
+    await screen.findByText("Remove: Newsletters")
+    const rows = await listRules(executor, accountId)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      name: "Unfile boss mail",
+      criteria_json: JSON.stringify({
+        query: "from:boss@work.com -fyi",
+      }),
+      actions_json: JSON.stringify([
+        { type: "remove_labels", labels: ["Newsletters"] },
+      ]),
+    })
+    expect(toastMock.success).toHaveBeenCalledTimes(1)
   })
 
   it("toggles enabled on the row and persists immediately", async () => {
@@ -370,27 +465,59 @@ describe("RulesSection", () => {
     const dialog = await screen.findByRole("dialog")
     expect(dialog.textContent).toContain("Edit Rule")
     expect(screen.getByLabelText("Name")).toHaveProperty("value", "Newsletters")
-    expect(screen.getByLabelText("When a message matches")).toHaveProperty(
-      "value",
-      "from:news@x.com"
-    )
+    // a representable query opens in FORM mode with the From row prefilled
+    expect(screen.getByLabelText("From")).toHaveProperty("value", "news@x.com")
     expect(screen.getByLabelText("Action 1 labels")).toHaveProperty(
       "value",
       "Newsletters"
     )
+    expect(
+      screen
+        .getByRole("checkbox", { name: "Advanced query" })
+        .getAttribute("aria-checked")
+    ).toBe("false")
 
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "Newsletters v2" },
+    fireEvent.change(screen.getByLabelText("From"), {
+      target: { value: "newsletter@x.com" },
     })
     fireEvent.click(screen.getByRole("button", { name: "Save Changes" }))
 
-    expect(await screen.findByText("Newsletters v2")).toBeTruthy()
+    expect(await screen.findByText("Newsletters")).toBeTruthy()
     const rows = await listRules(executor, accountId)
     expect(rows).toHaveLength(1)
-    expect(rows[0]).toMatchObject({ name: "Newsletters v2", position: 0 })
+    expect(rows[0]).toMatchObject({ name: "Newsletters", position: 0 })
+    expect(JSON.parse(rows[0]!.criteria_json)).toEqual({
+      query: "from:newsletter@x.com",
+    })
     expect(JSON.parse(rows[0]!.actions_json)).toEqual([
       { type: "add_labels", labels: ["Newsletters"] },
     ])
+  })
+
+  it("opens an unrepresentable rule in advanced mode with the query verbatim", async () => {
+    await createRule(executor, {
+      accountId,
+      name: "Flagged news",
+      criteriaQuery: "label:news is:unread -from:boss@x.com",
+      actions: [{ type: "star" }],
+    })
+
+    render(<RulesSection />)
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Edit Flagged news" })
+    )
+
+    await screen.findByRole("dialog")
+    expect(
+      screen
+        .getByRole("checkbox", { name: "Advanced query" })
+        .getAttribute("aria-checked")
+    ).toBe("true")
+    expect(screen.getByLabelText("When a message matches")).toHaveProperty(
+      "value",
+      "label:news is:unread -from:boss@x.com"
+    )
+    expect(screen.queryByLabelText("From")).toBeNull()
   })
 
   it("mounts an apply-now trigger per row and opens the confirm dialog", async () => {

@@ -32,16 +32,30 @@ import type { IngestionEvent } from "./ingestion"
  * - `has:attachment` — the inserted message has attachment parts.
  * - `is:unread` — the inserted message is unread; `is:starred` — it is
  *   flagged.
+ * - `larger:` / `smaller:` — the INSERTED message's own size estimate
+ *   against the parsed byte threshold (k/m suffixes, bare = bytes). A
+ *   message without a size estimate satisfies neither operator — a
+ *   size-only rule is a no-op on such mail.
+ * - `before:` / `after:` — the inserted message's date against the
+ *   UTC-midnight boundary (before: exclusive, after: inclusive).
  * - free text — each term is a substring of the subject OR the snippet.
+ * - NEGATION — a leading `-` flips any of the above into an exclusion
+ *   (the same parser produces the negated fields): the message is ruled
+ *   OUT when a negated predicate matches. Negation-only criteria are
+ *   valid — they match every arrival except the excluded set (unlike a
+ *   criteria-less rule, which parseRuleCriteria nulls out).
  *
  * Combination semantics — the ONE deliberate divergence from search-box
  * behavior, kept rule-friendly and documented here: multiple values of the
  * SAME operator are OR-ed ("from:a@x from:b@x" = mail from either sender —
  * under search AND-semantics a single From can never satisfy both, which
  * would silently make such a rule dead), while DIFFERENT operators (and
- * each free-text term) are AND-ed. Criteria that parse to no predicate at
- * all (empty/bare `key:` tokens) match NOTHING — parseRuleCriteria returns
- * null so a criteria-less rule can never fire on every message.
+ * each free-text term) are AND-ed. The same rule runs WITHIN each
+ * polarity: positive values of an operator OR together, negated values OR
+ * together (any hit excludes), and every polarity boundary is AND-ed.
+ * Criteria that parse to no predicate at all (empty/bare `key:` tokens)
+ * match NOTHING — parseRuleCriteria returns null so a criteria-less rule
+ * can never fire on every message.
  *
  * Criteria are evaluated against the message AS IT ARRIVED, before any
  * rule action runs — deterministic and order-independent (a mark_read rule
@@ -111,8 +125,9 @@ function anyOf(
 
 /**
  * Evaluate one arrival event against parsed criteria. Same-operator values
- * OR, different operators AND (see the module comment). Pure — the hook
- * calls it per message × rule with no I/O.
+ * OR, different operators AND (see the module comment), and every negated
+ * predicate must NOT match. Pure — the hook calls it per message × rule
+ * with no I/O.
  */
 export function messageMatchesCriteria(
   event: IngestionEvent,
@@ -148,11 +163,91 @@ export function messageMatchesCriteria(
   if (parsed.hasAttachment && !event.hasAttachments) return false
   if (parsed.isUnread && event.isRead) return false
   if (parsed.isStarred && !event.isStarred) return false
+  if (!sizeWithinBounds(event.sizeEstimate, parsed.larger, parsed.smaller)) {
+    return false
+  }
+  if (!dateWithinBounds(event.date, parsed.before, parsed.after)) {
+    return false
+  }
   // Free-text terms are separate predicates: every term (AND) must appear
   // in the subject or the snippet.
-  return parsed.freeText.every(
+  if (
+    !parsed.freeText.every(
+      (term) =>
+        containsIgnoreCase(event.subject, term) ||
+        containsIgnoreCase(event.snippet, term)
+    )
+  ) {
+    return false
+  }
+  // Negations — the De Morgan mirror of the checks above: any hit rules
+  // the message out.
+  if (
+    parsed.negatedFrom.some(
+      (value) =>
+        containsIgnoreCase(event.fromAddress, value) ||
+        containsIgnoreCase(event.fromName, value)
+    )
+  ) {
+    return false
+  }
+  if (
+    parsed.negatedTo.some(
+      (value) =>
+        containsIgnoreCase(event.toJson, value) ||
+        containsIgnoreCase(event.ccJson, value) ||
+        containsIgnoreCase(event.bccJson, value)
+    )
+  ) {
+    return false
+  }
+  if (
+    parsed.negatedSubject.some((value) =>
+      containsIgnoreCase(event.subject, value)
+    )
+  ) {
+    return false
+  }
+  if (
+    parsed.negatedLabels.some((value) =>
+      event.labelNames.some((name) => matchesLabelName(value, name))
+    )
+  ) {
+    return false
+  }
+  if (parsed.negatedFlags.hasAttachment && event.hasAttachments) return false
+  if (parsed.negatedFlags.isUnread && !event.isRead) return false
+  if (parsed.negatedFlags.isStarred && event.isStarred) return false
+  return parsed.negatedFreeText.every(
     (term) =>
-      containsIgnoreCase(event.subject, term) ||
-      containsIgnoreCase(event.snippet, term)
+      !containsIgnoreCase(event.subject, term) &&
+      !containsIgnoreCase(event.snippet, term)
+  )
+}
+
+/** Every larger: threshold exceeded and every smaller: threshold held by
+ * the ONE message; a null estimate satisfies neither operator. */
+function sizeWithinBounds(
+  sizeEstimate: number | null,
+  larger: readonly number[],
+  smaller: readonly number[]
+): boolean {
+  if (sizeEstimate === null) return larger.length === 0 && smaller.length === 0
+  return (
+    larger.every((threshold) => sizeEstimate > threshold) &&
+    smaller.every((threshold) => sizeEstimate < threshold)
+  )
+}
+
+/** before: holds exclusively, after: inclusively (the UTC-midnight
+ * convention the parser anchors to). */
+function dateWithinBounds(
+  date: number,
+  before: readonly number[],
+  after: readonly number[]
+): boolean {
+  return (
+    before.every((boundary) => date < boundary) &&
+    after.every((boundary) => date >= boundary)
   )
 }

@@ -100,6 +100,7 @@ describe("junk filter consumer", () => {
       hasAttachments: false,
       threadHasUserMessage: false,
       isMailingList: false,
+      sizeEstimate: null,
     }
     return { threadId, messageRowId, event }
   }

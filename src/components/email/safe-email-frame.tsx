@@ -39,6 +39,14 @@ export const EMAILER_RESIZE_MESSAGE_TYPE = "emailer-resize"
 /** Height floor so empty/loading bodies never collapse to zero. */
 export const MIN_EMAIL_FRAME_HEIGHT = 120
 
+/**
+ * Upper clamp for the frame's reported height: the value comes from the
+ * (sanitized, sandboxed) mail document, but a hostile message can still
+ * declare a huge layout. Beyond this the frame itself scrolls, so the
+ * reading pane can never be pushed off-screen.
+ */
+export const MAX_EMAIL_FRAME_HEIGHT = 20_000
+
 const SANDBOX = "allow-scripts allow-popups allow-popups-to-escape-sandbox"
 
 /**
@@ -200,7 +208,12 @@ function FrameContent({ html, className }: SafeEmailFrameProps) {
       const frame = frameRef.current
       if (!frame || event.source !== frame.contentWindow) return
       if (!isResizeMessage(event.data)) return
-      setHeight(Math.max(Math.ceil(event.data.height), MIN_EMAIL_FRAME_HEIGHT))
+      setHeight(
+        Math.min(
+          Math.max(Math.ceil(event.data.height), MIN_EMAIL_FRAME_HEIGHT),
+          MAX_EMAIL_FRAME_HEIGHT
+        )
+      )
     }
     window.addEventListener("message", onMessage)
     return () => window.removeEventListener("message", onMessage)

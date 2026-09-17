@@ -15,6 +15,20 @@ describe("parseSearchQuery", () => {
         isUnread: false,
         isStarred: false,
         freeText: [],
+        larger: [],
+        smaller: [],
+        before: [],
+        after: [],
+        negatedFrom: [],
+        negatedTo: [],
+        negatedSubject: [],
+        negatedLabels: [],
+        negatedFreeText: [],
+        negatedFlags: {
+          hasAttachment: false,
+          isUnread: false,
+          isStarred: false,
+        },
       })
       expect(isEmptyQuery(parsed)).toBe(true)
     }
@@ -138,7 +152,110 @@ describe("parseSearchQuery", () => {
       isUnread: false,
       isStarred: false,
       freeText: [],
+      larger: [],
+      smaller: [],
+      before: [],
+      after: [],
+      negatedFrom: [],
+      negatedTo: [],
+      negatedSubject: [],
+      negatedLabels: [],
+      negatedFreeText: [],
+      negatedFlags: { hasAttachment: false, isUnread: false, isStarred: false },
     })
+  })
+
+  it("parses negated value operators and flags", () => {
+    expect(parseSearchQuery("-from:a@x -to:b@y -subject:z -label:l")).toEqual(
+      expect.objectContaining({
+        negatedFrom: ["a@x"],
+        negatedTo: ["b@y"],
+        negatedSubject: ["z"],
+        negatedLabels: ["l"],
+        from: [],
+      })
+    )
+    expect(parseSearchQuery("-has:attachment -is:unread -IS:Starred")).toEqual(
+      expect.objectContaining({
+        negatedFlags: { hasAttachment: true, isUnread: true, isStarred: true },
+      })
+    )
+    // the minus is syntax, not content: values keep their own text
+    expect(parseSearchQuery("-from:Alice")).toMatchObject({
+      negatedFrom: ["Alice"],
+    })
+  })
+
+  it("parses negated free text, including quoted phrases", () => {
+    expect(parseSearchQuery('-term -"annual report" word')).toMatchObject({
+      negatedFreeText: ["term", "annual report"],
+      freeText: ["word"],
+    })
+  })
+
+  it("keeps degenerate negation tokens as literal positive text", () => {
+    // a bare `-` carries no literal text to keep
+    expect(parseSearchQuery("- word")).toMatchObject({ freeText: ["word"] })
+    expect(parseSearchQuery("-")).toMatchObject({ freeText: [] })
+    // no double negation: `--a` excludes the literal text `-a`
+    expect(parseSearchQuery("--a")).toMatchObject({
+      negatedFreeText: ["-a"],
+    })
+  })
+
+  it("degrades unknown negated operators to negated literal text", () => {
+    expect(parseSearchQuery("-is:read -foo:bar")).toMatchObject({
+      negatedFreeText: ["is:read", "foo:bar"],
+    })
+  })
+
+  it("parses size operators with k/m suffixes, bytes bare", () => {
+    expect(parseSearchQuery("larger:10m smaller:500k larger:42")).toEqual(
+      expect.objectContaining({
+        larger: [10 * 1024 * 1024, 42],
+        smaller: [500 * 1024],
+      })
+    )
+    // the -b spellings the rules form composes parse the same way
+    expect(parseSearchQuery("larger:10mb smaller:500kb")).toEqual(
+      expect.objectContaining({
+        larger: [10 * 1024 * 1024],
+        smaller: [500 * 1024],
+      })
+    )
+    // case-insensitive suffix, fractional counts allowed
+    expect(parseSearchQuery("smaller:1.5M")).toMatchObject({
+      smaller: [Math.round(1.5 * 1024 * 1024)],
+    })
+    // unparseable values degrade to free text
+    expect(parseSearchQuery("larger:abc smaller:")).toMatchObject({
+      larger: [],
+      smaller: [],
+      freeText: ["larger:abc"],
+    })
+  })
+
+  it("parses date operators in both calendar formats, UTC-anchored", () => {
+    expect(parseSearchQuery("before:2026-01-01 after:2025/06/15")).toEqual(
+      expect.objectContaining({
+        before: [Date.UTC(2026, 0, 1) / 1000],
+        after: [Date.UTC(2025, 5, 15) / 1000],
+      })
+    )
+    // unparseable or impossible dates degrade to free text (no rollover)
+    expect(
+      parseSearchQuery("before:2026-02-31 before:junk after:")
+    ).toMatchObject({
+      before: [],
+      after: [],
+      freeText: ["before:2026-02-31", "before:junk"],
+    })
+  })
+
+  it("treats negation-only queries as non-empty predicates", () => {
+    expect(isEmptyQuery(parseSearchQuery("-from:a@x"))).toBe(false)
+    expect(isEmptyQuery(parseSearchQuery("-is:unread"))).toBe(false)
+    expect(isEmptyQuery(parseSearchQuery("-zz"))).toBe(false)
   })
 
   it("parses the spec's combined-operators scenario", () => {
@@ -174,6 +291,16 @@ describe("parseSearchQuery", () => {
       isUnread: false,
       isStarred: true,
       freeText: ["pizzazz"],
+      larger: [],
+      smaller: [],
+      before: [],
+      after: [],
+      negatedFrom: [],
+      negatedTo: [],
+      negatedSubject: [],
+      negatedLabels: [],
+      negatedFreeText: [],
+      negatedFlags: { hasAttachment: false, isUnread: false, isStarred: false },
     })
   })
 

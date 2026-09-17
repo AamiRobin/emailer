@@ -67,6 +67,26 @@ export default defineConfig(({ mode }) => ({
   optimizeDeps: {
     exclude: ["@sqlite.org/sqlite-wasm"],
   },
+  build: {
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            // React must be a single chunk shared by the entry and every
+            // lazy chunk (Composer, SettingsPage): left to default chunking,
+            // rolldown duplicated react/react-dom across the entry and the
+            // async chunks, so the lazy components called hooks against a
+            // second React instance ("Invalid hook call" in the packaged
+            // app — invisible to vitest, which bundles one module graph).
+            {
+              name: "react-vendor",
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+            },
+          ],
+        },
+      },
+    },
+  },
   server: {
     port: 3000,
     strictPort: true,

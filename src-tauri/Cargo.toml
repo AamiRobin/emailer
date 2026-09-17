@@ -49,9 +49,17 @@ lettre = { version = "0.11", default-features = false, features = [
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# opt-level "s": optimize for size (the app is I/O-bound — IMAP/SMTP/DB —
+# so the "3"→"s" binary-size win costs nothing noticeable in practice).
 [profile.release]
 codegen-units = 1
 lto = true
-opt-level = 3
+opt-level = "s"
 panic = "abort"
 strip = true
+# The macOS toolchain currently corrupts STRIPPED proc-macro dylibs
+# ("mis-aligned LINKEDIT string pool" dlopen failure, e.g. sqlx-macros —
+# the release build fails to compile), so host artifacts (proc-macros,
+# build scripts) opt out of stripping; the shipped binary still gets it.
+[profile.release.build-override]
+strip = false

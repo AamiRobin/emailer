@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { useUiStore } from "@/stores/ui-store"
+import { CreateFilterButton } from "./create-filter-button"
 import { SaveAsSplitButton } from "./save-as-split-button"
 import { SaveSearchButton } from "./save-search-button"
 
@@ -85,6 +86,7 @@ export function SearchField({ className }: { className?: string }) {
       {activeQuery !== null && (
         <>
           <SaveSearchButton query={activeQuery} />
+          <CreateFilterButton query={activeQuery} />
           <SaveAsSplitButton query={activeQuery} />
           <Badge
             variant="secondary"

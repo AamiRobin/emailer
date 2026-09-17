@@ -104,7 +104,10 @@ export function AddAccountDialog({
                     <option.icon className="size-4 text-muted-foreground" />
                     {option.title}
                   </span>
-                  <span className="text-xs font-normal text-muted-foreground">
+                  {/* whitespace-normal: the button base style is nowrap, and
+                      the long provider line's min-content width would blow
+                      the grid track past the dialog's max-width */}
+                  <span className="whitespace-normal text-xs font-normal text-muted-foreground">
                     {option.description}
                   </span>
                 </Button>

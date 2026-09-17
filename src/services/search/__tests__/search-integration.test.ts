@@ -9,6 +9,7 @@ import {
 import { pinThread } from "../../email-actions/thread-states"
 import {
   at,
+  BASE_TIME,
   createAccount,
   createGmailLabel,
   createMessage,
@@ -545,6 +546,93 @@ describe("searchThreadsQuery", () => {
     expect(await searchThreadsQuery(executor, accountId, "")).toEqual([])
     expect(await searchThreadsQuery(executor, accountId, "   ")).toEqual([])
     expect(await searchThreadsQuery(executor, accountId, "from:")).toEqual([])
+  })
+
+  it("runs a negation-only query against everything in scope", async () => {
+    const kept = await seed({
+      subject: "Real mail",
+      fromAddress: "biz@corp.example",
+      bodyText: "content",
+      date: at(100),
+    })
+    await seed({
+      subject: "Newsletter",
+      fromAddress: "news@letters.example",
+      bodyText: "content",
+      date: at(101),
+    })
+    // a negation-only query is NOT empty: it must run, not short-circuit
+    const hits = await searchThreadsQuery(executor, accountId, "-from:news@")
+    expect(hits.map((thread) => thread.id)).toEqual([kept])
+    // and it composes with positive terms as usual
+    const none = await searchThreadsQuery(
+      executor,
+      accountId,
+      "-from:biz@ real"
+    )
+    expect(none).toEqual([])
+  })
+
+  it("matches larger:/smaller: against message sizes", async () => {
+    const big = await seed({
+      subject: "Big attachment",
+      fromAddress: "files@corp.example",
+      date: at(100),
+      hasAttachments: true,
+    })
+    const tiny = await seed({
+      subject: "Tiny note",
+      fromAddress: "files@corp.example",
+      date: at(101),
+    })
+    // give both messages a size_estimate directly (createMessage leaves
+    // it NULL, and NULL satisfies neither size operator)
+    const sized = await executor.select<{ id: string; thread_id: string }>(
+      "SELECT id, thread_id FROM messages WHERE thread_id IN ($1, $2)",
+      [big, tiny]
+    )
+    for (const row of sized) {
+      await executor.execute(
+        "UPDATE messages SET size_estimate = $1 WHERE id = $2",
+        [row.thread_id === big ? 20 * 1024 * 1024 : 500, row.id]
+      )
+    }
+    const large = await searchThreadsQuery(executor, accountId, "larger:10m")
+    expect(large.map((thread) => thread.id)).toEqual([big])
+    const small = await searchThreadsQuery(executor, accountId, "smaller:1m")
+    expect(small.map((thread) => thread.id)).toEqual([tiny])
+  })
+
+  it("matches before:/after: date windows around UTC midnight", async () => {
+    const june = await seed({
+      subject: "June report",
+      fromAddress: "reports@corp.example",
+      date: at(Date.UTC(2025, 5, 15) / 1000 - BASE_TIME),
+    })
+    await seed({
+      subject: "March report",
+      fromAddress: "reports@corp.example",
+      date: at(Date.UTC(2025, 2, 1) / 1000 - BASE_TIME),
+    })
+    const window = await searchThreadsQuery(
+      executor,
+      accountId,
+      "after:2025-04-01 before:2025-07-01"
+    )
+    expect(window.map((thread) => thread.id)).toEqual([june])
+    // the boundary day itself: after: includes it, before: does not
+    const onDay = await searchThreadsQuery(
+      executor,
+      accountId,
+      "after:2025-06-15"
+    )
+    expect(onDay.map((thread) => thread.id)).toEqual([june])
+    const beforeDay = await searchThreadsQuery(
+      executor,
+      accountId,
+      "before:2025-06-15"
+    )
+    expect(beforeDay.map((thread) => thread.id)).not.toContain(june)
   })
 })
 

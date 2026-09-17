@@ -2,6 +2,7 @@ import { SHORTCUTS, type ShortcutId } from "@/constants/shortcuts"
 import { ACCENTS, applyAccent, DEFAULT_ACCENT_ID } from "@/lib/accent"
 import type { SqlExecutor } from "@/services/db/executor"
 import { getSetting, setSetting } from "@/services/db/settings"
+import { decryptCredentials, encryptCredentials } from "@/services/crypto/credentials"
 import type { ThreadSortOption } from "@/services/db/thread-sort"
 import { isThreadSortOption } from "@/services/db/thread-sort"
 import type { ReadingPanePosition } from "@/stores/ui-store"
@@ -692,6 +693,13 @@ export async function setMalwareLookupEnabledPreference(
  * unset/blank/corrupt ("" = effectively keyless — the lookup short-
  * circuits and D17 alone gates, per the spec's no-key path). A corrupt
  * non-string row reads as "" rather than throwing.
+ *
+ * The key is a third-party credential (VirusTotal), so it is stored in
+ * the AES-256-GCM credentials envelope — the same at-rest treatment as
+ * OAuth refresh tokens — never as plaintext in the SQLite file. Rows
+ * written by older versions (plaintext) still read: they fail envelope
+ * decryption and fall through to the raw value, and are re-encrypted on
+ * the next save.
  */
 export async function getMalwareLookupApiKey(
   executor: SqlExecutor
@@ -702,7 +710,16 @@ export async function getMalwareLookupApiKey(
     ""
   )
   if (typeof stored !== "string") return ""
-  return stored.trim()
+  const trimmed = stored.trim()
+  if (trimmed === "") return ""
+  try {
+    const key = await decryptCredentials<string>(trimmed)
+    return typeof key === "string" ? key.trim() : ""
+  } catch {
+    // Not a valid envelope: a legacy plaintext row (or an unreadable key
+    // store) — the value itself is still the key.
+    return trimmed
+  }
 }
 
 /** Persist the lookup-service API key (trimmed; blank clears it). */
@@ -710,7 +727,9 @@ export async function setMalwareLookupApiKeyPreference(
   executor: SqlExecutor,
   key: string
 ): Promise<void> {
-  await setSetting(executor, PREFERENCE_KEYS.malwareLookupApiKey, key.trim())
+  const trimmed = key.trim()
+  const value = trimmed === "" ? "" : await encryptCredentials(trimmed)
+  await setSetting(executor, PREFERENCE_KEYS.malwareLookupApiKey, value)
 }
 
 // ---------------------------------------------------------------------------

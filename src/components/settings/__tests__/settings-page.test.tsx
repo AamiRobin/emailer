@@ -121,6 +121,8 @@ import {
   createTestExecutor,
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
+import { setDefaultKeyStore } from "@/services/crypto/key-management"
+import { createInMemoryKeyStore } from "@/services/crypto/__tests__/in-memory-key-store"
 import type { AccountInfo } from "@/stores/account-store"
 import { useAccountStore } from "@/stores/account-store"
 import { DEFAULT_VIEW, useUiStore } from "@/stores/ui-store"
@@ -205,6 +207,9 @@ beforeEach(() => {
   notifierHolder.setNotificationsEnabled.mockClear()
   resetDocument()
   resetStores()
+  // The VirusTotal API key persists through the AES-GCM credentials
+  // envelope; the in-memory key store keeps that path testable in jsdom.
+  setDefaultKeyStore(createInMemoryKeyStore())
 })
 
 afterEach(() => {
@@ -212,6 +217,7 @@ afterEach(() => {
   resetDocument()
   resetStores()
   executorHolder.current = null
+  setDefaultKeyStore(null)
   executor.close()
 })
 

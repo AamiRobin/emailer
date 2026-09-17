@@ -37,6 +37,10 @@ import { enqueueMove } from "../queue/operation"
  *   rest of the rule still applies). Like the labels UI, this is a gmail
  *   action: applyLabelsToThread is a no-op on imap (labels are folders
  *   there — a rule that wants to file imap mail uses move).
+ * - remove_labels — the same name resolution and gmail-only surface as
+ *   add_labels, applied through applyLabelsToThread's removal path (local
+ *   membership rewrite + queued `remove_labels` op). It never suppresses
+ *   the announcement — unlabeled mail is still new mail.
  * - move — `folder` is the full IMAP folder path. Gmail accounts have no
  *   folders, so move on gmail is skipped with a warning (spec scopes the
  *   action to IMAP). The local move goes through thread-actions'
@@ -57,6 +61,7 @@ export type RuleActionType =
   | "mark_read"
   | "star"
   | "add_labels"
+  | "remove_labels"
   | "move"
   | "mark_as_spam"
 
@@ -67,6 +72,7 @@ export const RULE_ACTION_TYPES: readonly RuleActionType[] = [
   "mark_read",
   "star",
   "add_labels",
+  "remove_labels",
   "move",
   "mark_as_spam",
 ]
@@ -130,13 +136,13 @@ export function parseActionsJson(actionsJson: string): RuleAction[] {
       console.warn(`[rules] unknown rule action type "${type}"; skipped`)
       continue
     }
-    if (type === "add_labels") {
+    if (type === "add_labels" || type === "remove_labels") {
       const labels = (entry as { labels?: unknown }).labels
       if (
         !Array.isArray(labels) ||
         !labels.every((name) => typeof name === "string")
       ) {
-        console.warn("[rules] add_labels action without string labels; skipped")
+        console.warn(`[rules] ${type} action without string labels; skipped`)
         continue
       }
       actions.push({ type, labels: labels as string[] })
@@ -197,11 +203,30 @@ export async function applyRuleActions(
         const labelIds = await resolveLabelIds(
           executor,
           accountId,
-          action.labels ?? []
+          action.labels ?? [],
+          "add_labels"
         )
         if (labelIds.length === 0) break
         await applyLabelsToThread(executor, accountId, threadId, labelIds, true)
         applied.push("add_labels")
+        break
+      }
+      case "remove_labels": {
+        const labelIds = await resolveLabelIds(
+          executor,
+          accountId,
+          action.labels ?? [],
+          "remove_labels"
+        )
+        if (labelIds.length === 0) break
+        await applyLabelsToThread(
+          executor,
+          accountId,
+          threadId,
+          labelIds,
+          false
+        )
+        applied.push("remove_labels")
         break
       }
       case "move":
@@ -223,7 +248,8 @@ export async function applyRuleActions(
 async function resolveLabelIds(
   executor: SqlExecutor,
   accountId: string,
-  names: readonly string[]
+  names: readonly string[],
+  actionType: "add_labels" | "remove_labels"
 ): Promise<string[]> {
   if (names.length === 0) return []
   const rows = await executor.select<LabelRow>(
@@ -242,7 +268,7 @@ async function resolveLabelIds(
       ids.add(hit.id)
     } else {
       console.warn(
-        `[rules] add_labels: no label named "${name}" on account ${accountId}; skipped`
+        `[rules] ${actionType}: no label named "${name}" on account ${accountId}; skipped`
       )
     }
   }

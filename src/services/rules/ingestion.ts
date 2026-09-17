@@ -155,6 +155,12 @@ export interface IngestionEvent {
   isStarred: boolean
   hasAttachments: boolean
   /**
+   * The inserted message's size estimate in bytes (`larger:`/`smaller:`
+   * criteria); null when the provider did not report one — a null
+   * satisfies neither size operator.
+   */
+  sizeEstimate: number | null
+  /**
    * Sender-stats flags (task 13.1, design D7) that only the engine can
    * know — both default false here and are stamped engine-side:
    * - threadHasUserMessage: the thread already carries a message from the
@@ -200,6 +206,7 @@ export function ingestionEventFromInput(
     isRead: input.isRead === true,
     isStarred: input.isFlagged === true,
     hasAttachments: input.hasAttachments === true,
+    sizeEstimate: input.sizeEstimate ?? null,
     threadHasUserMessage: false,
     isMailingList: false,
   }

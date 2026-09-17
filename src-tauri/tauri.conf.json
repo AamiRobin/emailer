@@ -11,7 +11,7 @@
     "removeUnusedCommands": true
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "emailer",
@@ -24,7 +24,7 @@
     "security": {
       "csp": {
         "default-src": "'self'",
-        "script-src": "'self' 'unsafe-inline'",
+        "script-src": "'self' 'sha256-ka5fJDC6WqCeQtMKBl4z4MfkyFZlddmyWHvmhJNseFk=' 'sha256-Z3Du8nrfS1AJZuAiBe6/aDaV04rs2gNm+ZcmXD51VfY='",
         "style-src": "'self' 'unsafe-inline'",
         "img-src": "'self' data: blob: https:",
         "font-src": "'self' data:",

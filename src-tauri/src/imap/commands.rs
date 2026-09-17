@@ -79,6 +79,11 @@ pub async fn imap_fetch_messages(
     uid_set: String,
     last: Option<u32>,
 ) -> Result<FetchResult, String> {
+    // An empty set is legal here (resolve_uid_set then derives it from
+    // `last`), but a supplied set is interpolated verbatim into UID FETCH.
+    if !uid_set.trim().is_empty() {
+        require_uid_set(&uid_set)?;
+    }
     let mut session = client::connect(&params).await?;
     let result = client::fetch_messages(&mut session, &folder, &uid_set, last).await;
     client::logout(session).await;
@@ -92,6 +97,9 @@ pub async fn imap_fetch_flags(
     uid_set: String,
     last: Option<u32>,
 ) -> Result<Vec<UidFlags>, String> {
+    if !uid_set.trim().is_empty() {
+        require_uid_set(&uid_set)?;
+    }
     let mut session = client::connect(&params).await?;
     let result = client::fetch_flags(&mut session, &folder, &uid_set, last).await;
     client::logout(session).await;

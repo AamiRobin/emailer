@@ -234,8 +234,16 @@ export async function postOneClickUnsubscribe(
 }
 
 /** The plugin-http patched fetch (see the module comment for why plain
- * fetch here dodges the webview's CORS). */
-const defaultPost: UnsubscribePostFn = (url, init) => fetch(url, init)
+ * fetch here dodges the webview's CORS). `maxRedirections: 0` is
+ * plugin-http's redirect kill-switch: the target is sender-controlled
+ * header data, and a followed 301/302 chain could otherwise bounce the
+ * request (post→get) anywhere on https while riding the plugin's shared
+ * cookie jar. RFC 8058 endpoints answer 2xx directly. */
+const defaultPost: UnsubscribePostFn = (url, init) =>
+  fetch(url, {
+    ...init,
+    maxRedirections: 0,
+  } as RequestInit & { maxRedirections?: number })
 
 // ---------------------------------------------------------------------------
 // Orchestration (what the mail view's Unsubscribe click runs)

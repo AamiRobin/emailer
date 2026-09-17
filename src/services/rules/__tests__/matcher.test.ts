@@ -27,6 +27,7 @@ function event(overrides: Partial<IngestionEvent> = {}): IngestionEvent {
     isRead: false,
     isStarred: false,
     hasAttachments: false,
+    sizeEstimate: null,
     date: 1_700_000_000,
     threadHasUserMessage: false,
     isMailingList: false,
@@ -148,5 +149,95 @@ describe("rule criteria matching", () => {
     expect(matches('"numbers are in"', event())).toBe(true)
     expect(matches("quarterly numbers", event())).toBe(true)
     expect(matches("quarterly unicorns", event())).toBe(false)
+  })
+})
+
+describe("rule criteria negation, size and dates", () => {
+  it("a negated operator excludes matching messages", () => {
+    expect(matches("-from:other@x.com", event())).toBe(true)
+    expect(matches("-from:sender@example.com", event())).toBe(false)
+    // negation composes inside a positive conjunction
+    expect(matches("from:example.com -subject:invoice", event())).toBe(true)
+    expect(matches("from:example.com -subject:report", event())).toBe(false)
+  })
+
+  it("negated values of one operator OR together", () => {
+    expect(matches("-from:a@x.com -from:b@x.com", event())).toBe(true)
+    expect(matches("-from:a@x.com -from:sender@example.com", event())).toBe(
+      false
+    )
+  })
+
+  it("negated flags and labels exclude like their positive forms", () => {
+    expect(matches("-has:attachment", event())).toBe(true)
+    expect(matches("-has:attachment", event({ hasAttachments: true }))).toBe(
+      false
+    )
+    expect(matches("-is:starred", event())).toBe(true)
+    expect(matches("-is:starred", event({ isStarred: true }))).toBe(false)
+    expect(matches("-is:unread", event())).toBe(false)
+    expect(matches("-label:receipts", event())).toBe(false)
+    expect(matches("-label:newsletters", event())).toBe(true)
+    // the leaf convention carries over: -label:receipts excludes
+    // Finance/Receipts too
+    expect(matches("-label:finance/receipts", event())).toBe(false)
+  })
+
+  it("negated free text excludes subject and snippet hits", () => {
+    expect(matches("-unicorns", event())).toBe(true)
+    expect(matches("-numbers", event())).toBe(false)
+    expect(matches('-"numbers are in"', event())).toBe(false)
+    expect(matches("-unicorns quarterly", event())).toBe(true)
+    expect(matches("-numbers quarterly", event())).toBe(false)
+  })
+
+  it("larger:/smaller: compare the message's own size estimate", () => {
+    expect(matches("larger:10m", event())).toBe(false)
+    expect(
+      matches("larger:10m", event({ sizeEstimate: 20 * 1024 * 1024 }))
+    ).toBe(true)
+    expect(matches("smaller:1m", event({ sizeEstimate: 500 }))).toBe(true)
+    expect(
+      matches("smaller:1m", event({ sizeEstimate: 20 * 1024 * 1024 }))
+    ).toBe(false)
+    // both bounds must hold
+    expect(
+      matches(
+        "larger:1m smaller:100m",
+        event({ sizeEstimate: 5 * 1024 * 1024 })
+      )
+    ).toBe(true)
+    expect(
+      matches("larger:1m smaller:2m", event({ sizeEstimate: 5 * 1024 * 1024 }))
+    ).toBe(false)
+    // an unsized message satisfies neither size operator
+    expect(matches("smaller:1m", event({ sizeEstimate: null }))).toBe(false)
+    // size composes with the rest of the conjunction
+    expect(
+      matches("from:example.com smaller:1m", event({ sizeEstimate: 4096 }))
+    ).toBe(true)
+  })
+
+  it("before:/after: compare the message's date around UTC midnight", () => {
+    expect(matches("before:2100-01-01", event())).toBe(true)
+    expect(matches("after:2023-11-14", event())).toBe(true)
+    expect(matches("before:2000-01-01", event())).toBe(false)
+    // a message late on the boundary day is inside after: and inside
+    // before:'s next-day boundary — the pair tiles time without gaps
+    const lateOnDay = Date.UTC(2023, 10, 14, 23, 59) / 1000
+    expect(matches("after:2023-11-14", event({ date: lateOnDay }))).toBe(true)
+    expect(matches("before:2023-11-15", event({ date: lateOnDay }))).toBe(true)
+    expect(matches("after:2023-11-15", event({ date: lateOnDay }))).toBe(false)
+    expect(
+      matches(
+        "before:2023-11-15",
+        event({ date: Date.UTC(2023, 10, 15) / 1000 })
+      )
+    ).toBe(false)
+  })
+
+  it("a negation-only criteria matches everything except the excluded set", () => {
+    expect(matches("-from:other@x.com", event())).toBe(true)
+    expect(matches("-from:sender@example.com", event())).toBe(false)
   })
 })

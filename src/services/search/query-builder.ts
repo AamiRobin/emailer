@@ -20,41 +20,56 @@ import { DEFAULT_THREAD_SORT, threadSortOrderClause } from "../db/thread-sort"
  *   by their own folders (threads.ts presets), not search results.
  *
  * Predicates, all AND-ed, appended in this fixed order (which fixes the
- * ascending `$N` parameter order — see executor.ts):
+ * ascending `$N` parameter order — see executor.ts). Every positive
+ * operator is followed by its negated counterpart in the same shape — the
+ * De Morgan mirror: "some message in the thread matches" becomes "NO
+ * message in the thread matches" (and a negated flag compares the cache
+ * column to 0):
  * 1. `from:` → EXISTS over the thread's messages matching from_address OR
  *    from_name (COLLATE NOCASE LIKE). Operators accept "any message in the
  *    thread" as evidence; free text (below) keeps the stricter
- *    single-message semantics of the original search.ts.
+ *    single-message semantics of the original search.ts. `-from:` → NOT
+ *    EXISTS over the same shape.
  * 2. `to:` → EXISTS matching to_json / cc_json / bcc_json — addresses are
  *    stored as JSON arrays of `{name?, email}`, so a plain substring LIKE
- *    over the serialized arrays covers both names and addresses.
- * 3. `subject:` → EXISTS matching messages.subject.
- *    All operator values use LIKE (case-insensitive for ASCII in SQLite,
- *    made explicit with COLLATE NOCASE on the left operand) — predictable
- *    substring semantics; only free text uses the FTS index, whose trigram
- *    tokenizer needs ≥3-char terms anyway.
- * 4. `has:attachment` → `threads.has_attachments = 1`, the cache column
- *    recomputeThreadCaches() keeps at MAX(messages.has_attachments) on
- *    every sync, so it is true exactly when some message has attachments.
- * 5. `is:unread` → `threads.unread_count > 0`.
- * 6. `is:starred` → `threads.is_starred = 1`.
+ *    over the serialized arrays covers both names and addresses. `-to:` →
+ *    NOT EXISTS.
+ * 3. `subject:` → EXISTS matching messages.subject; `-subject:` → NOT
+ *    EXISTS. All operator values use LIKE (case-insensitive for ASCII in
+ *    SQLite, made explicit with COLLATE NOCASE on the left operand) —
+ *    predictable substring semantics; only free text uses the FTS index,
+ *    whose trigram tokenizer needs ≥3-char terms anyway.
+ * 4. `has:attachment` → `threads.has_attachments = 1`; `-has:attachment`
+ *    → `= 0`.
+ * 5. `is:unread` → `threads.unread_count > 0`; `-is:unread` → `= 0`.
+ * 6. `is:starred` → `threads.is_starred = 1`; `-is:starred` → `= 0`.
  * 7. `label:<name>` → EXISTS through thread_labels JOIN labels, scoped to
  *    the account via thread_labels.account_id. A label matches when its
  *    full name equals the value case-insensitively OR ends with
  *    "/<value>" (case-insensitive): `label:receipts` matches a label named
  *    "receipts" (the spec scenario) and addresses the leaf of
- *    "Finance/receipts" without the full path.
- * 8. Free text → a single EXISTS over messages: terms of ≥3 chars go
+ *    "Finance/receipts" without the full path. `-label:` → NOT EXISTS.
+ * 8. `larger:<N>` / `smaller:<N>` → EXISTS over messages whose
+ *    size_estimate compares against the parsed byte threshold (NULL never
+ *    compares, so unsized messages satisfy neither operator).
+ * 9. `before:<date>` / `after:<date>` → EXISTS over messages dated
+ *    against the UTC-midnight boundary (before: exclusive `<`, after:
+ *    inclusive `>=`) — the pair tiles time without gaps.
+ * 10. Free text → a single EXISTS over messages: positive terms of ≥3 chars go
  *    through the external-content messages_fts trigram index (combined
  *    into one quoted MATCH string, so ONE message must match ALL terms —
  *    same semantics as the original search.ts); terms shorter than 3 chars
  *    can never produce a trigram token, so each falls back to a LIKE scan
  *    over the same columns the FTS index covers (subject, from_name,
- *    from_address, to_json, body_text, snippet).
+ *    from_address, to_json, body_text, snippet). Each NEGATED term gets
+ *    its own NOT EXISTS (FTS or LIKE by the same length split) — negated
+ *    terms never enter the positive MATCH string, so mixed polarity keeps
+ *    clean semantics: some message carries every positive term, and no
+ *    message carries any negated one.
  *
- * An empty ParsedQuery yields the bare mailbox query (all non-trash,
- * non-spam threads of the account); searchThreadsQuery (index.ts)
- * short-circuits that case to an empty result instead.
+ * A query of only negations yields a query matching every in-scope thread
+ * except the excluded set — callers' empty-query short-circuits key off
+ * isEmptyQuery, which counts negations as predicates.
  *
  * Ordering: `(pinned_at IS NOT NULL) DESC` leads every sort, then the
  * requested ThreadSortOption's fixed fragment (task 4.1 — search results
@@ -121,72 +136,136 @@ export function buildThreadSearchSql(
     "threads.is_spam = 0",
   ]
 
-  // 1. from: — address OR display name of some message in the thread.
-  for (const value of parsed.from) {
+  // 1. from: — address OR display name of some message in the thread
+  //    (positive: some message matches; negated: no message matches).
+  const fromCondition = (value: string, negate: boolean): string => {
     params.push(`%${escapeLikePattern(value)}%`)
     const addressParam = `$${params.length}`
     params.push(`%${escapeLikePattern(value)}%`)
     const nameParam = `$${params.length}`
-    conditions.push(
-      `EXISTS (
-        SELECT 1 FROM messages m
-        WHERE m.thread_id = threads.id
-          AND (m.from_address COLLATE NOCASE LIKE ${addressParam} ESCAPE '\\'
-            OR m.from_name COLLATE NOCASE LIKE ${nameParam} ESCAPE '\\')
-      )`
-    )
+    const exists = `EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.thread_id = threads.id
+        AND (m.from_address COLLATE NOCASE LIKE ${addressParam} ESCAPE '\\'
+          OR m.from_name COLLATE NOCASE LIKE ${nameParam} ESCAPE '\\')
+    )`
+    return negate ? `NOT ${exists}` : exists
+  }
+  for (const value of parsed.from) conditions.push(fromCondition(value, false))
+  for (const value of parsed.negatedFrom) {
+    conditions.push(fromCondition(value, true))
   }
 
   // 2. to: — substring over the serialized recipient arrays.
-  for (const value of parsed.to) {
+  const toCondition = (value: string, negate: boolean): string => {
     const likes = ["m.to_json", "m.cc_json", "m.bcc_json"].map((column) => {
       params.push(`%${escapeLikePattern(value)}%`)
       return `${column} COLLATE NOCASE LIKE $${params.length} ESCAPE '\\'`
     })
-    conditions.push(
-      `EXISTS (
-        SELECT 1 FROM messages m
-        WHERE m.thread_id = threads.id AND (${likes.join(" OR ")})
-      )`
-    )
+    const exists = `EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.thread_id = threads.id AND (${likes.join(" OR ")})
+    )`
+    return negate ? `NOT ${exists}` : exists
   }
+  for (const value of parsed.to) conditions.push(toCondition(value, false))
+  for (const value of parsed.negatedTo)
+    conditions.push(toCondition(value, true))
 
   // 3. subject:
-  for (const value of parsed.subject) {
+  const subjectCondition = (value: string, negate: boolean): string => {
     params.push(`%${escapeLikePattern(value)}%`)
-    conditions.push(
-      `EXISTS (
-        SELECT 1 FROM messages m
-        WHERE m.thread_id = threads.id
-          AND m.subject COLLATE NOCASE LIKE $${params.length} ESCAPE '\\'
-      )`
-    )
+    const exists = `EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.thread_id = threads.id
+        AND m.subject COLLATE NOCASE LIKE $${params.length} ESCAPE '\\'
+    )`
+    return negate ? `NOT ${exists}` : exists
+  }
+  for (const value of parsed.subject) {
+    conditions.push(subjectCondition(value, false))
+  }
+  for (const value of parsed.negatedSubject) {
+    conditions.push(subjectCondition(value, true))
   }
 
-  // 4–6. Flag operators over the thread cache columns.
+  // 4–6. Flag operators over the thread cache columns (negated: the column
+  // at 0 — "no message in the thread carries the flag").
   if (parsed.hasAttachment) conditions.push("threads.has_attachments = 1")
+  if (parsed.negatedFlags.hasAttachment) {
+    conditions.push("threads.has_attachments = 0")
+  }
   if (parsed.isUnread) conditions.push("threads.unread_count > 0")
+  if (parsed.negatedFlags.isUnread) conditions.push("threads.unread_count = 0")
   if (parsed.isStarred) conditions.push("threads.is_starred = 1")
+  if (parsed.negatedFlags.isStarred) conditions.push("threads.is_starred = 0")
 
   // 7. label: — exact name or trailing "/segment", account-scoped.
-  for (const name of parsed.labels) {
+  const labelCondition = (name: string, negate: boolean): string => {
     params.push(name)
     const exactParam = `$${params.length}`
     params.push(`%/${escapeLikePattern(name)}`)
     const suffixParam = `$${params.length}`
+    const exists = `EXISTS (
+      SELECT 1 FROM thread_labels tl
+      JOIN labels l ON l.id = tl.label_id
+      WHERE tl.thread_id = threads.id
+        AND tl.account_id = threads.account_id
+        AND (l.name = ${exactParam} COLLATE NOCASE
+          OR l.name COLLATE NOCASE LIKE ${suffixParam} ESCAPE '\\')
+    )`
+    return negate ? `NOT ${exists}` : exists
+  }
+  for (const name of parsed.labels) conditions.push(labelCondition(name, false))
+  for (const name of parsed.negatedLabels) {
+    conditions.push(labelCondition(name, true))
+  }
+
+  // 8. larger:/smaller: — some message sized past the threshold; NULL
+  // size_estimate never compares, so unsized messages satisfy neither.
+  for (const bytes of parsed.larger) {
+    params.push(bytes)
     conditions.push(
       `EXISTS (
-        SELECT 1 FROM thread_labels tl
-        JOIN labels l ON l.id = tl.label_id
-        WHERE tl.thread_id = threads.id
-          AND tl.account_id = threads.account_id
-          AND (l.name = ${exactParam} COLLATE NOCASE
-            OR l.name COLLATE NOCASE LIKE ${suffixParam} ESCAPE '\\')
+        SELECT 1 FROM messages m
+        WHERE m.thread_id = threads.id AND m.size_estimate > $${params.length}
+      )`
+    )
+  }
+  for (const bytes of parsed.smaller) {
+    params.push(bytes)
+    conditions.push(
+      `EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.thread_id = threads.id AND m.size_estimate < $${params.length}
       )`
     )
   }
 
-  // 8. Free text — one EXISTS; a single message must match every term.
+  // 9. before:/after: — some message dated against the UTC-midnight
+  // boundary; before: is exclusive, after: inclusive.
+  for (const seconds of parsed.before) {
+    params.push(seconds)
+    conditions.push(
+      `EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.thread_id = threads.id AND m.date < $${params.length}
+      )`
+    )
+  }
+  for (const seconds of parsed.after) {
+    params.push(seconds)
+    conditions.push(
+      `EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.thread_id = threads.id AND m.date >= $${params.length}
+      )`
+    )
+  }
+
+  // 10. Free text — positive terms in ONE EXISTS (a single message must
+  // match every term); each negated term gets its own NOT EXISTS so a
+  // mixed-polarity query never forces one message to carry both.
   const longTerms = parsed.freeText.filter((term) => term.length >= 3)
   const shortTerms = parsed.freeText.filter((term) => term.length < 3)
   if (longTerms.length || shortTerms.length) {
@@ -215,6 +294,30 @@ export function buildThreadSearchSql(
         WHERE m.thread_id = threads.id AND ${termConditions.join(" AND ")}
       )`
     )
+  }
+  for (const term of parsed.negatedFreeText) {
+    if (term.length >= 3) {
+      params.push(toFtsMatch([term]))
+      conditions.push(
+        `NOT EXISTS (
+          SELECT 1 FROM messages m
+          WHERE m.thread_id = threads.id AND m.rowid IN (
+            SELECT rowid FROM messages_fts WHERE messages_fts MATCH $${params.length}
+          )
+        )`
+      )
+    } else {
+      const likes = SHORT_TERM_LIKE_COLUMNS.map((column) => {
+        params.push(`%${escapeLikePattern(term)}%`)
+        return `${column} LIKE $${params.length} ESCAPE '\\'`
+      })
+      conditions.push(
+        `NOT EXISTS (
+          SELECT 1 FROM messages m
+          WHERE m.thread_id = threads.id AND (${likes.join(" OR ")})
+        )`
+      )
+    }
   }
 
   const counting = options?.countOnly === true

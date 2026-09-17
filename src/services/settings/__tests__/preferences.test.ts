@@ -54,6 +54,8 @@ import {
   createTestExecutor,
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
+import { setDefaultKeyStore } from "@/services/crypto/key-management"
+import { createInMemoryKeyStore } from "@/services/crypto/__tests__/in-memory-key-store"
 import { DEFAULT_VIEW, useUiStore } from "@/stores/ui-store"
 
 /**
@@ -450,13 +452,43 @@ describe("malware hash-lookup preferences (task 18.9)", () => {
   })
 
   it("the API key defaults to empty, trims on write and read", async () => {
-    expect(await getMalwareLookupApiKey(executor)).toBe("")
+    setDefaultKeyStore(createInMemoryKeyStore())
+    try {
+      expect(await getMalwareLookupApiKey(executor)).toBe("")
 
-    await setMalwareLookupApiKeyPreference(executor, "  vt-key-123  ")
-    expect(await getMalwareLookupApiKey(executor)).toBe("vt-key-123")
+      await setMalwareLookupApiKeyPreference(executor, "  vt-key-123  ")
+      expect(await getMalwareLookupApiKey(executor)).toBe("vt-key-123")
 
-    await setMalwareLookupApiKeyPreference(executor, "   ")
-    expect(await getMalwareLookupApiKey(executor)).toBe("")
+      await setMalwareLookupApiKeyPreference(executor, "   ")
+      expect(await getMalwareLookupApiKey(executor)).toBe("")
+    } finally {
+      setDefaultKeyStore(null)
+    }
+  })
+
+  it("stores the API key encrypted, not as plaintext", async () => {
+    setDefaultKeyStore(createInMemoryKeyStore())
+    try {
+      await setMalwareLookupApiKeyPreference(executor, "vt-key-123")
+      const row = await executor
+        .select<{ value: string }>(
+          "SELECT value FROM settings WHERE key = $1",
+          ["mail.malwareLookupApiKey"]
+        )
+        .then((rows) => rows[0]?.value ?? "")
+      expect(row).not.toContain("vt-key-123")
+      expect(await getMalwareLookupApiKey(executor)).toBe("vt-key-123")
+    } finally {
+      setDefaultKeyStore(null)
+    }
+  })
+
+  it("still reads legacy plaintext key rows", async () => {
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["mail.malwareLookupApiKey", JSON.stringify("legacy-key")]
+    )
+    expect(await getMalwareLookupApiKey(executor)).toBe("legacy-key")
   })
 
   it("reads a corrupt non-string key row as empty", async () => {

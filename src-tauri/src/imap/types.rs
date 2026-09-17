@@ -31,7 +31,10 @@ pub struct ImapParams {
     pub security: Security,
     pub username: String,
     pub password: String,
-    /// Accept invalid/self-signed certificates (e.g. local mail bridges). Dev only.
+    /// Reserved for the TS wire contract. Deserialized so old settings rows
+    /// do not break, but IGNORED at runtime: certificate and hostname
+    /// verification stay on unconditionally (see `build_tls_connector`).
+    /// A local mail bridge must present a valid certificate.
     #[serde(default)]
     pub accept_invalid_certs: bool,
 }

@@ -100,6 +100,7 @@ function makeEvent(
     date: 1_700_000_000,
     threadHasUserMessage: false,
     isMailingList: false,
+    sizeEstimate: null,
     ...overrides,
   }
 }

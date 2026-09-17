@@ -175,8 +175,24 @@ export async function openAttachment(
   const absolute = await (deps.resolveAppPath ?? defaultResolveAppPath)(
     localPath
   )
+  // Defense in depth: the opener capability is scoped to $APPDATA/**, and
+  // a well-formed localPath is always `attachment_cache/<sha-256>.bin`.
+  // Reject anything else (a tampered DB row) before it reaches the OS.
+  if (!isCacheRelativePath(localPath)) {
+    throw new Error(`attachment path escapes the cache directory: ${localPath}`)
+  }
   await openWithDefaultApp(absolute)
   return { localPath, scan, opened: true }
+}
+
+/**
+ * True when `relPath` is a cache-module-shaped relative path
+ * (`attachment_cache/<name>.bin`): one path segment under the cache dir,
+ * no separators or parent refs, so it cannot escape AppData even if the
+ * DB row was tampered with.
+ */
+export function isCacheRelativePath(relPath: string): boolean {
+  return /^attachment_cache\/[A-Za-z0-9._-]+\.bin$/.test(relPath)
 }
 
 // ---------------------------------------------------------------------------

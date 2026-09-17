@@ -289,6 +289,42 @@ describe("rule actions", () => {
     expect(await pendingOps()).toEqual([])
   })
 
+  it("remove_labels drops the membership and queues the removal by provider id", async () => {
+    const { threadId } = await seedGmailThread()
+    const newsId = await createGmailLabel(
+      executor,
+      accountId,
+      "Newsletters",
+      "Newsletters",
+      undefined,
+      "user"
+    )
+    await setThreadLabels(executor, threadId, [newsId])
+
+    const applied = await applyRuleActions(executor, accountId, threadId, [
+      { type: "remove_labels", labels: ["newsletters", "missing-label"] },
+    ])
+
+    expect(applied).toEqual(["remove_labels"])
+    expect(await threadLabelIds(threadId)).toEqual([])
+    const ops = await pendingOps()
+    expect(ops.map((op) => op.op_type)).toEqual(["remove_labels"])
+    expect(JSON.parse(ops[0]?.payload_json ?? "{}")).toMatchObject({
+      labelIds: ["Newsletters"],
+    })
+  })
+
+  it("remove_labels with only unknown names applies nothing and queues nothing", async () => {
+    const { threadId } = await seedGmailThread()
+
+    const applied = await applyRuleActions(executor, accountId, threadId, [
+      { type: "remove_labels", labels: ["ghost"] },
+    ])
+
+    expect(applied).toEqual([])
+    expect(await pendingOps()).toEqual([])
+  })
+
   it("mark_read flips the messages and the unread cache, queuing mark_read", async () => {
     const { threadId } = await seedGmailThread()
 
@@ -545,6 +581,7 @@ describe("ingestion hook", () => {
       hasAttachments: false,
       threadHasUserMessage: false,
       isMailingList: false,
+      sizeEstimate: null,
       ...overrides,
     }
   }
@@ -841,6 +878,7 @@ describe("ingestion hook", () => {
       isRead: true,
       isFlagged: true,
       hasAttachments: true,
+      sizeEstimate: 4096,
     }
     expect(ingestionEventFromInput(input, ["INBOX"])).toEqual({
       messageRowId: "m-row",
@@ -857,6 +895,7 @@ describe("ingestion hook", () => {
       isRead: true,
       isStarred: true,
       hasAttachments: true,
+      sizeEstimate: 4096,
       threadHasUserMessage: false,
       isMailingList: false,
     })
@@ -902,6 +941,7 @@ describe("sender stats consumer", () => {
       hasAttachments: false,
       threadHasUserMessage: false,
       isMailingList: false,
+      sizeEstimate: null,
       ...overrides,
     }
   }

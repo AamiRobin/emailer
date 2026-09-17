@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { DndContext, PointerSensor, useSensor, useSensors } from "@dnd-kit/core"
 import type { DragEndEvent } from "@dnd-kit/core"
 import { formatDistanceToNow } from "date-fns"
@@ -20,7 +20,6 @@ import { SearchField } from "@/components/search/search-field"
 import { CommandPalette } from "@/components/search/command-palette"
 import { SplitsTabBar } from "@/components/layout/splits-tab-bar"
 import { AddAccountDialog } from "@/components/accounts/add-account-dialog"
-import { Composer } from "@/components/composer/composer"
 import { UndoSendBanner } from "@/components/composer/undo-send-banner"
 import { ContactsBrowser } from "@/components/contacts/contacts-browser"
 import { WelcomePanel } from "@/components/email/welcome-panel"
@@ -28,7 +27,6 @@ import { accountHue } from "@/components/email/account-hue"
 import { ReadingPane } from "@/components/email/reading-pane"
 import { ThreadList } from "@/components/email/thread-list"
 import { applyDroppedLabels, labelDropDeps } from "@/components/email/label-dnd"
-import { SettingsPage } from "@/components/settings/settings-page"
 import { Toaster } from "@/components/ui/sonner"
 import { initAccountStore, useAccountStore } from "@/stores/account-store"
 import type { AccountInfo } from "@/stores/account-store"
@@ -46,6 +44,21 @@ interface MailShellProps {
   defaultLayout: [number, number, number]
   defaultCollapsed: boolean
 }
+
+// Code-split surfaces: the composer carries the TipTap/ProseMirror editor
+// and the settings page its section tree (incl. the PGP panel). Both mount
+// behind explicit UI state, so they load on first open instead of at
+// startup.
+const Composer = lazy(() =>
+  import("@/components/composer/composer").then((m) => ({
+    default: m.Composer,
+  }))
+)
+const SettingsPage = lazy(() =>
+  import("@/components/settings/settings-page").then((m) => ({
+    default: m.SettingsPage,
+  }))
+)
 
 /** Width of the collapsed icon rail; also the sidebar panel's floor. */
 const SIDEBAR_RAIL_SIZE = "52px"
@@ -398,7 +411,9 @@ export function MailShell({
               {sidebarPane}
               <ResizableHandle withHandle />
               <ResizablePanel defaultSize="80%" minSize="40%">
-                <SettingsPage />
+                <Suspense fallback={null}>
+                  <SettingsPage />
+                </Suspense>
               </ResizablePanel>
             </ResizablePanelGroup>
           )}
@@ -503,7 +518,9 @@ export function MailShell({
             data-testid="composer-overlay"
             className="fixed inset-0 z-40 bg-background"
           >
-            <Composer />
+            <Suspense fallback={null}>
+              <Composer />
+            </Suspense>
           </div>
         )}
         {/* Toast host: theme-aware, bottom-right per the notifications UX. */}

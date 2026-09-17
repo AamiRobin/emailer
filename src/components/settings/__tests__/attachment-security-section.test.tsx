@@ -37,6 +37,8 @@ import {
   getMalwareLookupEnabled,
 } from "@/services/settings/preferences"
 import { setSetting } from "@/services/db/settings"
+import { setDefaultKeyStore } from "@/services/crypto/key-management"
+import { createInMemoryKeyStore } from "@/services/crypto/__tests__/in-memory-key-store"
 import {
   createTestExecutor,
   type TestExecutor,
@@ -48,11 +50,15 @@ let executor: TestExecutor
 beforeEach(() => {
   executor = createTestExecutor()
   executorHolder.current = executor
+  // The API key now persists through the AES-GCM credentials envelope;
+  // the in-memory key store keeps that path testable under jsdom.
+  setDefaultKeyStore(createInMemoryKeyStore())
 })
 
 afterEach(() => {
   cleanup()
   executorHolder.current = null
+  setDefaultKeyStore(null)
   executor.close()
 })
 

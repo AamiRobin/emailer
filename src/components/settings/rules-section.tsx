@@ -1,41 +1,13 @@
 import { useCallback, useEffect, useState } from "react"
-import {
-  ChevronDown,
-  ChevronUp,
-  CirclePlus,
-  Filter,
-  Loader2,
-  Pencil,
-  Trash2,
-} from "lucide-react"
-import { toast } from "sonner"
+import { ChevronDown, ChevronUp, Filter, Pencil, Trash2 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Checkbox } from "@/components/ui/checkbox"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
 import { Switch } from "@/components/ui/switch"
+import { Separator } from "@/components/ui/separator"
 import { getExecutor } from "@/services/db/executor"
-import type { RuleAction, RuleActionType, RuleRow } from "@/services/rules"
+import type { RuleRow } from "@/services/rules"
 import {
-  createRule,
   deleteRule,
   listRules,
   parseActionsJson,
@@ -44,6 +16,14 @@ import {
 import { useActiveAccount } from "@/stores/account-store"
 
 import { ApplyRuleDialog } from "./apply-rule-dialog"
+import {
+  RuleDialog,
+  type RuleDialogTarget,
+} from "@/components/rules/rule-dialog"
+import {
+  actionChipLabel,
+  queryFromCriteriaJson,
+} from "@/components/rules/rule-actions-ui"
 
 /**
  * Settings "Rules" section (task 11.3, design D5): manages the per-account
@@ -56,73 +36,10 @@ import { ApplyRuleDialog } from "./apply-rule-dialog"
  * ASC, and ingestion evaluates in that order), edit and delete (no confirm
  * — a rule is trivially re-created, matching the notifications section).
  *
- * The criteria "builder" is a QUERY INPUT on purpose (11.2's storage
- * comment): the same operator language the search box takes, so the parser
- * stays the single source of truth for the grammar. Helper text lists the
- * supported operators (services/search/parser.ts is the exact set) and the
- * combination semantics documented in rules/criteria.ts — same-operator
- * values OR, different operators AND.
+ * The add/edit form itself lives in components/rules/rule-dialog.tsx —
+ * extracted so the search row's "create filter with this search" affordance
+ * mounts the same dialog.
  */
-
-const CRITERIA_HELP =
-  "Same language as the search box: from: to: subject: label: " +
-  "has:attachment is:unread is:starred, plus plain words that must appear " +
-  "in the subject or the snippet. Values of the same operator match either " +
-  "value; different operators must all match."
-
-const ACTION_TYPE_OPTIONS: { value: RuleActionType; label: string }[] = [
-  { value: "archive", label: "Archive" },
-  { value: "trash", label: "Trash" },
-  { value: "mark_as_spam", label: "Mark as spam" },
-  { value: "mark_read", label: "Mark read" },
-  { value: "star", label: "Star" },
-  { value: "add_labels", label: "Add labels" },
-  { value: "move", label: "Move to folder (imap)" },
-]
-
-function actionChipLabel(action: RuleAction): string {
-  switch (action.type) {
-    case "archive":
-      return "Archive"
-    case "trash":
-      return "Trash"
-    case "mark_as_spam":
-      return "Mark as spam"
-    case "mark_read":
-      return "Mark read"
-    case "star":
-      return "Star"
-    case "add_labels":
-      return `Label: ${(action.labels ?? []).join(", ")}`
-    case "move":
-      return `Move: ${action.folder ?? ""}`
-  }
-}
-
-/** Inverse of db.ts's storage wrapper: the raw query inside criteria_json
- * (a bare JSON string is tolerated, same as parseRuleCriteria). */
-function queryFromCriteriaJson(criteriaJson: string): string {
-  try {
-    const stored: unknown = JSON.parse(criteriaJson)
-    if (typeof stored === "string") return stored
-    if (typeof stored === "object" && stored !== null) {
-      const query = (stored as { query?: unknown }).query
-      if (typeof query === "string") return query
-    }
-  } catch {
-    // Corrupt criteria render as an empty query — edit re-saves it fixed.
-  }
-  return ""
-}
-
-/** "Newsletters, Receipts" → ["Newsletters", "Receipts"] — trimmed,
- * empties dropped. */
-function splitLabels(input: string): string[] {
-  return input
-    .split(",")
-    .map((name) => name.trim())
-    .filter((name) => name !== "")
-}
 
 function RuleRowItem({
   rule,
@@ -217,281 +134,10 @@ function RuleRowItem({
   )
 }
 
-/** One action row in the builder's local draft state — the type-specific
- * payloads (labels, folder) ride along as raw strings, split/trimmed only
- * at save time. */
-interface ActionDraft {
-  key: string
-  type: RuleActionType
-  labels: string
-  folder: string
-}
-
-let draftKeySequence = 0
-
-function nextDraftKey(): string {
-  draftKeySequence += 1
-  return `action-${draftKeySequence}`
-}
-
-function newActionDraft(type: RuleActionType = "archive"): ActionDraft {
-  return { key: nextDraftKey(), type, labels: "", folder: "" }
-}
-
-function draftsFromActions(actions: RuleAction[]): ActionDraft[] {
-  if (actions.length === 0) return [newActionDraft()]
-  return actions.map((action) => ({
-    key: nextDraftKey(),
-    type: action.type,
-    labels: (action.labels ?? []).join(", "),
-    folder: action.folder ?? "",
-  }))
-}
-
-type DialogTarget = { mode: "add" } | { mode: "edit"; rule: RuleRow }
-
-function RuleDialog({
-  accountId,
-  target,
-  onOpenChange,
-  onSaved,
-}: {
-  accountId: string
-  target: DialogTarget
-  onOpenChange: (open: boolean) => void
-  onSaved: () => void
-}) {
-  const editing = target.mode === "edit" ? target.rule : null
-  const [name, setName] = useState(editing?.name ?? "")
-  const [criteria, setCriteria] = useState(
-    editing ? queryFromCriteriaJson(editing.criteria_json) : ""
-  )
-  const [drafts, setDrafts] = useState<ActionDraft[]>(() =>
-    draftsFromActions(editing ? parseActionsJson(editing.actions_json) : [])
-  )
-  const [enabled, setEnabled] = useState(editing ? editing.enabled === 1 : true)
-  const [saving, setSaving] = useState(false)
-  const [errorMessage, setErrorMessage] = useState<string | null>(null)
-
-  const labelActionsFilled = drafts.every(
-    (draft) =>
-      draft.type !== "add_labels" || splitLabels(draft.labels).length > 0
-  )
-  const moveFoldersFilled = drafts.every(
-    (draft) => draft.type !== "move" || draft.folder.trim() !== ""
-  )
-  const canSave =
-    name.trim() !== "" &&
-    criteria.trim() !== "" &&
-    drafts.length > 0 &&
-    labelActionsFilled &&
-    moveFoldersFilled &&
-    !saving
-
-  function updateDraft(key: string, patch: Partial<ActionDraft>): void {
-    setDrafts((current) =>
-      current.map((draft) =>
-        draft.key === key ? { ...draft, ...patch } : draft
-      )
-    )
-  }
-
-  function removeDraft(key: string): void {
-    setDrafts((current) => current.filter((draft) => draft.key !== key))
-  }
-
-  async function handleSave(): Promise<void> {
-    if (!canSave) return
-    setSaving(true)
-    setErrorMessage(null)
-    const actions: RuleAction[] = drafts.map((draft) => {
-      if (draft.type === "add_labels") {
-        return { type: draft.type, labels: splitLabels(draft.labels) }
-      }
-      if (draft.type === "move") {
-        return { type: draft.type, folder: draft.folder.trim() }
-      }
-      return { type: draft.type }
-    })
-    try {
-      const executor = getExecutor()
-      if (editing) {
-        await updateRule(executor, editing.id, {
-          name: name.trim(),
-          criteriaQuery: criteria.trim(),
-          actions,
-          enabled,
-        })
-        toast.success(`Rule “${name.trim()}” updated`)
-      } else {
-        await createRule(executor, {
-          accountId,
-          name: name.trim(),
-          criteriaQuery: criteria.trim(),
-          actions,
-          enabled,
-        })
-        toast.success(`Rule “${name.trim()}” created`)
-      }
-      onSaved()
-      onOpenChange(false)
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : "Could not save the rule."
-      )
-      setSaving(false)
-    }
-  }
-
-  return (
-    <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{editing ? "Edit Rule" : "Add Rule"}</DialogTitle>
-          <DialogDescription>
-            Rules run on each new message this account receives, top to bottom.
-          </DialogDescription>
-        </DialogHeader>
-        <form
-          className="grid gap-4"
-          onSubmit={(event) => {
-            event.preventDefault()
-            void handleSave()
-          }}
-        >
-          <div className="grid gap-2">
-            <Label htmlFor="rule-name">Name</Label>
-            <Input
-              id="rule-name"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="e.g. File newsletters"
-              autoFocus
-            />
-          </div>
-          <div className="grid gap-2">
-            <Label htmlFor="rule-criteria">When a message matches</Label>
-            <Input
-              id="rule-criteria"
-              value={criteria}
-              onChange={(event) => setCriteria(event.target.value)}
-              placeholder="e.g. from:news@x.com subject:digest"
-              className="font-mono"
-            />
-            <p className="text-xs text-muted-foreground">{CRITERIA_HELP}</p>
-          </div>
-          <div className="grid gap-2">
-            <Label>Then</Label>
-            {drafts.map((draft, index) => (
-              <div key={draft.key} className="flex items-start gap-2">
-                <Select
-                  value={draft.type}
-                  onValueChange={(value) =>
-                    updateDraft(draft.key, {
-                      type: String(value) as RuleActionType,
-                    })
-                  }
-                >
-                  <SelectTrigger
-                    aria-label={`Action ${index + 1} type`}
-                    className="w-44 shrink-0"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {ACTION_TYPE_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>
-                        {option.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                {draft.type === "add_labels" && (
-                  <Input
-                    aria-label={`Action ${index + 1} labels`}
-                    value={draft.labels}
-                    onChange={(event) =>
-                      updateDraft(draft.key, { labels: event.target.value })
-                    }
-                    placeholder="Label names, comma-separated"
-                  />
-                )}
-                {draft.type === "move" && (
-                  <Input
-                    aria-label={`Action ${index + 1} folder`}
-                    value={draft.folder}
-                    onChange={(event) =>
-                      updateDraft(draft.key, { folder: event.target.value })
-                    }
-                    placeholder="Folder path, e.g. Archive/2024"
-                  />
-                )}
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={`Remove action ${index + 1}`}
-                  onClick={() => removeDraft(draft.key)}
-                >
-                  <Trash2 />
-                </Button>
-              </div>
-            ))}
-            <div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() =>
-                  setDrafts((current) => [...current, newActionDraft()])
-                }
-              >
-                <CirclePlus />
-                Add Action
-              </Button>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Checkbox
-              id="rule-enabled"
-              checked={enabled}
-              onCheckedChange={(checked) => {
-                setEnabled(checked === true)
-              }}
-            />
-            <Label htmlFor="rule-enabled">Enabled</Label>
-          </div>
-          {errorMessage && (
-            <p role="alert" className="text-sm text-destructive">
-              {errorMessage}
-            </p>
-          )}
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-              disabled={saving}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={!canSave}>
-              {saving && (
-                <Loader2 className="size-3.5 animate-spin" aria-hidden />
-              )}
-              {editing ? "Save Changes" : "Create Rule"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 export function RulesSection() {
   const account = useActiveAccount()
   const [rules, setRules] = useState<RuleRow[]>([])
-  const [dialog, setDialog] = useState<DialogTarget | null>(null)
+  const [dialog, setDialog] = useState<RuleDialogTarget | null>(null)
 
   const reload = useCallback(() => {
     // Without an active account there is nothing to load — the render
@@ -588,7 +234,9 @@ export function RulesSection() {
       <p className="text-xs text-muted-foreground">
         Rules run top to bottom on each new message, before the new-mail
         notification: archive, trash, spam, move, and mark-read rules keep the
-        message out of the announcement. Criteria use the search-box operators.
+        message out of the announcement. Criteria use the search-box operators —
+        including negation (a leading -), sizes (larger:/smaller:) and dates
+        (before:/after:).
       </p>
       <Separator />
       {!account ? (

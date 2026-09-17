@@ -367,23 +367,35 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
 }
 
 /// Percent-decode a query component; '+' decodes to a space and invalid
-/// escapes pass through unchanged.
+/// escapes pass through unchanged. Decodes from raw bytes — slicing `input`
+/// at byte offsets would panic on a `%` followed by a multi-byte UTF-8
+/// char (raw TCP clients can send arbitrary bytes; panic = abort here).
 fn percent_decode(input: &str) -> String {
+    fn hex_val(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 3 <= bytes.len() => match u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                Ok(byte) => {
-                    out.push(byte);
-                    i += 3;
+            b'%' if i + 3 <= bytes.len() => {
+                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push(hi * 16 + lo);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
                 }
-                Err(_) => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
+            }
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -417,6 +429,11 @@ mod tests {
         assert_eq!(percent_decode("%4"), "%4");
         // Truncated at the very end.
         assert_eq!(percent_decode("a%"), "a%");
+        // '%' followed by a multi-byte UTF-8 char must not panic (the
+        // escape digits are read as raw bytes, never str-sliced).
+        assert_eq!(percent_decode("%€"), "%€");
+        assert_eq!(percent_decode("code=%é&state=x"), "code=%é&state=x");
+        assert_eq!(percent_decode("%C3%A9"), "é");
     }
 
     #[test]

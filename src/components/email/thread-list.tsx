@@ -1071,7 +1071,7 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
         <div
           ref={scrollerRef}
           data-testid="thread-list-scroll"
-          className="min-h-0 flex-1 overflow-y-auto"
+          className="min-h-0 flex-1 overflow-y-auto pt-2"
         >
           <div
             className="relative w-full"

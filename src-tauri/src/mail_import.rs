@@ -201,13 +201,48 @@ fn parse_mbox_bytes(raw: &[u8]) -> Vec<MboxEntryResult> {
 // Tauri commands
 // ---------------------------------------------------------------------------
 
+/// Hard ceiling for one imported file. Parsing keeps the raw bytes plus
+/// per-entry decoded bodies and base64 copies in memory (~2.3x the file
+/// size), so an unbounded read is an OOM primitive — even user-picked
+/// files deserve a cap. 1 GiB comfortably covers real archives.
+const MAX_IMPORT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Trust-boundary check for a path handed over from the webview: the
+/// command reads any absolute path with process privileges, so require the
+/// extension the picker advertises and a sane size before touching disk.
+/// (A compromised webview must not turn these commands into arbitrary
+/// file reads of, say, `~/.ssh/id_rsa`.)
+fn validate_import_path(path: &str, expected_ext: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(path);
+    let is_expected = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(expected_ext));
+    if !is_expected {
+        return Err(format!("not a .{expected_ext} file: {}", path.display()));
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("could not stat {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("not a regular file: {}", path.display()));
+    }
+    if metadata.len() > MAX_IMPORT_FILE_BYTES {
+        return Err(format!(
+            "file is {} bytes; the import limit is {MAX_IMPORT_FILE_BYTES} bytes",
+            metadata.len()
+        ));
+    }
+    Ok(path)
+}
+
 /// Parse one `.eml` file. The whole file is the message; any parse failure
 /// is the file's error (the TS importer reports it per file).
 #[tauri::command]
 pub async fn parse_eml_file(path: String) -> Result<ParsedEml, String> {
     // Blocking read + parse run on the async runtime's worker pool (async
     // command) — the main thread and the UI stay free.
-    let raw = std::fs::read(&path).map_err(|error| format!("could not read {path}: {error}"))?;
+    let path = validate_import_path(&path, "eml")?;
+    let raw = std::fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
     parse_eml_bytes(&raw, None)
 }
 
@@ -215,7 +250,8 @@ pub async fn parse_eml_file(path: String) -> Result<ParsedEml, String> {
 /// a command error; unreadable ENTRIES are reported inside the result.
 #[tauri::command]
 pub async fn parse_mbox_file(path: String) -> Result<Vec<MboxEntryResult>, String> {
-    let raw = std::fs::read(&path).map_err(|error| format!("could not read {path}: {error}"))?;
+    let path = validate_import_path(&path, "mbox")?;
+    let raw = std::fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
     Ok(parse_mbox_bytes(&raw))
 }
 
@@ -358,5 +394,33 @@ Body two\n\
     fn parses_empty_and_separatorless_mbox_into_no_entries() {
         assert!(parse_mbox_bytes(b"").is_empty());
         assert!(parse_mbox_bytes(b"preamble without any From line\n").is_empty());
+    }
+
+    #[test]
+    fn import_path_guard_rejects_wrong_extension_and_missing_files() {
+        // Wrong/absent extension: rejected before any disk access, so
+        // arbitrary paths like /etc/passwd never reach std::fs::read.
+        assert!(validate_import_path("/etc/passwd", "eml").is_err());
+        assert!(validate_import_path("/home/u/.ssh/id_rsa", "mbox").is_err());
+        assert!(validate_import_path("no-extension", "eml").is_err());
+        // Correct extension but no such file: the stat step errors.
+        let missing = std::env::temp_dir().join("emailer-import-guard-missing.mbox");
+        let _ = std::fs::remove_file(&missing);
+        assert!(validate_import_path(
+            missing.to_str().unwrap(),
+            "mbox"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn import_path_guard_accepts_matching_extension_case_insensitively() {
+        let file = std::env::temp_dir().join("emailer-import-guard.EML");
+        std::fs::write(&file, b"From: a@example.com\n\nbody\n").expect("write temp file");
+        assert!(validate_import_path(file.to_str().unwrap(), "eml").is_ok());
+        // The eml command's extension gate accepts .mbox paths only for
+        // the mbox command.
+        assert!(validate_import_path(file.to_str().unwrap(), "mbox").is_err());
+        let _ = std::fs::remove_file(&file);
     }
 }

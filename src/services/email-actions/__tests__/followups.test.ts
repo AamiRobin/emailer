@@ -117,6 +117,7 @@ function makeEvent(
     hasAttachments: false,
     threadHasUserMessage: false,
     isMailingList: false,
+    sizeEstimate: null,
     ...overrides,
   }
 }

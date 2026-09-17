@@ -448,7 +448,9 @@ describe("palette, composer and toaster mounts", () => {
       useUiStore.getState().setComposerOpen(true)
     })
     expect(await screen.findByTestId("composer-overlay")).not.toBeNull()
-    expect(screen.getByLabelText("To")).not.toBeNull()
+    // The composer surface is code-split (React.lazy in mail-shell), so
+    // its first field arrives asynchronously inside the overlay.
+    expect(await screen.findByLabelText("To")).not.toBeNull()
     expect(useComposerStore.getState().open).toBe(true)
 
     // A composer-initiated close syncs the shell flag back.

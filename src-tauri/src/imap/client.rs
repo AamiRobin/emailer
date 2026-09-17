@@ -13,6 +13,7 @@ use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use tokio_native_tls::TlsStream;
 
 use super::types::*;
+use crate::net::require_plaintext_host_is_loopback;
 
 // ---------- Timeouts ----------
 
@@ -22,6 +23,21 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const IMAP_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 const IMAP_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Hard cap on the number of messages a single UID FETCH may return.
+/// async-imap buffers every FETCH response in a Vec before we touch it, so
+/// a `1:*` set on a 1M-message folder would allocate before we ever look at
+/// it. The TS sync layer paginates via `last`/`uidSet` windows; this is the
+/// backstop for a misbehaving caller.
+const MAX_FETCH_MESSAGES: usize = 500;
+
+/// Hard cap on the total raw bytes a single UID FETCH may download.
+/// `BODY.PEEK[]` returns the full RFC 822 source; a few megabytes of mail
+/// is normal, a server returning a multi-gigabyte response (or an attacker
+/// pointing us at a server that does) would blow memory. The cap is per
+/// fetch call, not per message — a single 64 MiB attachment fetch is fine,
+/// but the sum across a multi-message fetch is not.
+const MAX_FETCH_BYTES: u64 = 64 * 1024 * 1024;
 /// Short cap for the best-effort LOGOUT at the end of every command: a hung
 /// server must not keep the (already finished) command alive.
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,6 +50,58 @@ where
     tokio::time::timeout(dur, fut)
         .await
         .map_err(|_| format!("{what}: timed out after {}s", dur.as_secs()))?
+}
+
+/// Drain a fetch stream into a `Vec<Fetch>` while enforcing the message-count
+/// and byte-size backstops. async-imap buffers each FETCH response eagerly,
+/// so without this a `1:*` set on a large folder allocates before we ever
+/// inspect a single message.
+async fn collect_fetches<S>(
+    stream: &mut S,
+    what: &str,
+) -> Result<Vec<Fetch>, String>
+where
+    S: futures::Stream<Item = async_imap::error::Result<Fetch>> + Unpin,
+{
+    use futures::StreamExt;
+    let mut out = Vec::new();
+    let mut bytes: u64 = 0;
+    let mut count: usize = 0;
+    tokio::time::timeout(IMAP_FETCH_TIMEOUT, async {
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(fetch) => {
+                    count += 1;
+                    if count > MAX_FETCH_MESSAGES {
+                        return Err::<Vec<Fetch>, String>(
+                            format!(
+                                "{what}: FETCH returned more than {MAX_FETCH_MESSAGES} messages \
+                                 (cap); narrow the uid set or `last` window"
+                            ),
+                        );
+                    }
+                    if let Some(body) = fetch.body() {
+                        bytes += body.len() as u64;
+                        if bytes > MAX_FETCH_BYTES {
+                            return Err::<Vec<Fetch>, String>(
+                                format!(
+                                    "{what}: FETCH response exceeded the {MAX_FETCH_BYTES}-byte cap \
+                                     (got {bytes}); narrow the uid set"
+                                ),
+                            );
+                        }
+                    }
+                    out.push(fetch);
+                }
+                Err(e) => {
+                    log::warn!("{what}: fetch stream error: {e}");
+                }
+            }
+        }
+        Ok::<Vec<Fetch>, String>(out)
+    })
+    .await
+    .map_err(|_| format!("{what}: timed out after {}s", IMAP_FETCH_TIMEOUT.as_secs()))?
 }
 
 // ---------- Stream wrapper ----------
@@ -110,12 +178,14 @@ pub async fn logout(mut session: ImapSession) {
     let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
 }
 
-fn build_tls_connector(accept_invalid_certs: bool) -> Result<TokioTlsConnector, String> {
-    let mut builder = native_tls::TlsConnector::builder();
-    if accept_invalid_certs {
-        builder.danger_accept_invalid_certs(true);
-        builder.danger_accept_invalid_hostnames(true);
-    }
+fn build_tls_connector(_accept_invalid_certs: bool) -> Result<TokioTlsConnector, String> {
+    // TLS bypass flags are intentionally ignored: this is a release app
+    // handling user mail, so certificate and hostname verification stay on
+    // unconditionally. The `accept_invalid_certs` field is still deserialized
+    // (it is part of the wire contract with the TS layer) so old settings
+    // rows do not break deserialization, but its value no longer affects the
+    // connector. A local mail bridge must present a valid certificate.
+    let builder = native_tls::TlsConnector::builder();
     let connector = builder
         .build()
         .map_err(|e| format!("failed to create TLS connector: {e}"))?;
@@ -166,6 +236,10 @@ pub async fn connect(params: &ImapParams) -> Result<ImapSession, String> {
 }
 
 async fn connect_inner(params: &ImapParams) -> Result<ImapSession, String> {
+    require_plaintext_host_is_loopback(
+        matches!(params.security, Security::None),
+        &params.host,
+    )?;
     let stream = match params.security {
         Security::Tls => {
             let tcp = connect_tcp(&params.host, params.port).await?;
@@ -506,29 +580,18 @@ pub async fn fetch_messages(
     let folder_status = select_folder(session, folder).await?;
     let uid_set = resolve_uid_set(uid_set, last, &folder_status)?;
 
-    let raw_fetches: Vec<async_imap::error::Result<Fetch>> = with_timeout(
+    let fetches = with_timeout(
         async {
-            let stream = session
+            let mut stream = session
                 .uid_fetch(&uid_set, "UID FLAGS INTERNALDATE BODY.PEEK[]")
                 .await
                 .map_err(|e| format!("UID FETCH {folder} uids={uid_set} failed: {e}"))?;
-            Ok::<_, String>(stream.collect::<Vec<_>>().await)
+            collect_fetches(&mut stream, &format!("UID FETCH {folder} uids={uid_set}")).await
         },
         IMAP_FETCH_TIMEOUT,
         &format!("UID FETCH {folder} uids={uid_set}"),
     )
     .await?;
-
-    let fetches: Vec<Fetch> = raw_fetches
-        .into_iter()
-        .filter_map(|r| match r {
-            Ok(f) => Some(f),
-            Err(e) => {
-                log::warn!("IMAP fetch stream error in {folder}: {e}");
-                None
-            }
-        })
-        .collect();
 
     let mut messages = Vec::with_capacity(fetches.len());
     for fetch in &fetches {
@@ -572,27 +635,18 @@ pub async fn fetch_flags(
     let folder_status = select_folder(session, folder).await?;
     let uid_set = resolve_uid_set(uid_set, last, &folder_status)?;
 
-    let fetches: Vec<Fetch> = with_timeout(
+    let fetches = with_timeout(
         async {
-            let stream = session
+            let mut stream = session
                 .uid_fetch(&uid_set, "(UID FLAGS)")
                 .await
                 .map_err(|e| format!("UID FETCH flags {folder} uids={uid_set} failed: {e}"))?;
-            Ok::<_, String>(stream.collect::<Vec<_>>().await)
+            collect_fetches(&mut stream, &format!("UID FETCH flags {folder} uids={uid_set}")).await
         },
         IMAP_CMD_TIMEOUT,
         &format!("UID FETCH flags {folder} uids={uid_set}"),
     )
-    .await?
-    .into_iter()
-    .filter_map(|r| match r {
-        Ok(f) => Some(f),
-        Err(e) => {
-            log::warn!("IMAP flags stream error in {folder}: {e}");
-            None
-        }
-    })
-    .collect();
+    .await?;
 
     let mut out = Vec::with_capacity(fetches.len());
     for fetch in &fetches {
@@ -639,27 +693,18 @@ pub async fn fetch_flags_changed(
     let folder_status = select_folder_condstore(session, folder).await?;
     let query = changed_since_query(since_modseq);
 
-    let fetches: Vec<Fetch> = with_timeout(
+    let fetches = with_timeout(
         async {
-            let stream = session
+            let mut stream = session
                 .uid_fetch("1:*", &query)
                 .await
                 .map_err(|e| format!("UID FETCH changed-flags {folder} failed: {e}"))?;
-            Ok::<_, String>(stream.collect::<Vec<_>>().await)
+            collect_fetches(&mut stream, &format!("UID FETCH changed-flags {folder} since={since_modseq}")).await
         },
         IMAP_CMD_TIMEOUT,
         &format!("UID FETCH changed-flags {folder} since={since_modseq}"),
     )
-    .await?
-    .into_iter()
-    .filter_map(|r| match r {
-        Ok(f) => Some(f),
-        Err(e) => {
-            log::warn!("IMAP changed-flags stream error in {folder}: {e}");
-            None
-        }
-    })
-    .collect();
+    .await?;
 
     let mut flags = Vec::with_capacity(fetches.len());
     for fetch in &fetches {
@@ -940,27 +985,18 @@ pub async fn fetch_attachment(
     select_folder(session, folder).await?;
 
     let uid_str = uid.to_string();
-    let fetches: Vec<Fetch> = with_timeout(
+    let fetches = with_timeout(
         async {
-            let stream = session
+            let mut stream = session
                 .uid_fetch(&uid_str, "BODY.PEEK[]")
                 .await
                 .map_err(|e| format!("UID FETCH attachment {folder} uid={uid} failed: {e}"))?;
-            Ok::<_, String>(stream.collect::<Vec<_>>().await)
+            collect_fetches(&mut stream, &format!("UID FETCH attachment {folder} uid={uid}")).await
         },
         IMAP_FETCH_TIMEOUT,
         &format!("UID FETCH attachment {folder} uid={uid}"),
     )
-    .await?
-    .into_iter()
-    .filter_map(|r| match r {
-        Ok(f) => Some(f),
-        Err(e) => {
-            log::warn!("IMAP attachment stream error in {folder}: {e}");
-            None
-        }
-    })
-    .collect();
+    .await?;
 
     let fetch = fetches
         .first()

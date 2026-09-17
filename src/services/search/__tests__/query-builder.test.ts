@@ -137,6 +137,93 @@ describe("buildThreadSearchSql", () => {
     expect(params).toEqual(["acc-1", "%alice%", "%alice%"])
   })
 
+  it("builds negated operators as NOT over the same EXISTS shapes", () => {
+    const { sql, params } = build("-from:spammer -subject:win")
+    expect(sql).toContain(
+      "NOT EXISTS ( SELECT 1 FROM messages m WHERE m.thread_id = threads.id " +
+        "AND (m.from_address COLLATE NOCASE LIKE $2 ESCAPE '\\' " +
+        "OR m.from_name COLLATE NOCASE LIKE $3 ESCAPE '\\')"
+    )
+    expect(sql).toContain(
+      "NOT EXISTS ( SELECT 1 FROM messages m WHERE m.thread_id = threads.id " +
+        "AND m.subject COLLATE NOCASE LIKE $4 ESCAPE '\\'"
+    )
+    expect(params).toEqual(["acc-1", "%spammer%", "%spammer%", "%win%"])
+  })
+
+  it("builds negated flags as the cache column at 0", () => {
+    const { sql, params } = build("-has:attachment -is:unread -is:starred")
+    expect(sql).toContain("threads.has_attachments = 0")
+    expect(sql).toContain("threads.unread_count = 0")
+    expect(sql).toContain("threads.is_starred = 0")
+    expect(params).toEqual(["acc-1"])
+  })
+
+  it("builds a negated label as NOT EXISTS over the same join", () => {
+    const { sql, params } = build("-label:receipts")
+    expect(sql).toContain(
+      "NOT EXISTS ( SELECT 1 FROM thread_labels tl JOIN labels l ON l.id = tl.label_id"
+    )
+    expect(params).toEqual(["acc-1", "receipts", "%/receipts"])
+  })
+
+  it("gives each negated free-text term its own NOT EXISTS", () => {
+    const { sql, params } = build("-zz -planning")
+    expect(sql.split("NOT EXISTS").length - 1).toBe(2)
+    // long negated terms go through FTS, short ones through LIKE; the
+    // LIKE scan binds six column params before the FTS term
+    expect(sql).toContain("MATCH $8")
+    expect(params).toEqual([
+      "acc-1",
+      "%zz%",
+      "%zz%",
+      "%zz%",
+      "%zz%",
+      "%zz%",
+      "%zz%",
+      '"planning"',
+    ])
+  })
+
+  it("never leaks negated terms into the positive FTS MATCH", () => {
+    const { sql } = build("planning -noise")
+    expect(sql).toContain("MATCH $2")
+    expect(sql).not.toContain('"planning" "-noise"')
+    expect(sql).not.toContain('"planning" "noise"')
+  })
+
+  it("builds size predicates over messages.size_estimate", () => {
+    const { sql, params } = build("larger:10m smaller:500k")
+    expect(sql).toContain(
+      "EXISTS ( SELECT 1 FROM messages m WHERE m.thread_id = threads.id " +
+        "AND m.size_estimate > $2"
+    )
+    expect(sql).toContain("AND m.size_estimate < $3")
+    expect(params).toEqual(["acc-1", 10 * 1024 * 1024, 500 * 1024])
+  })
+
+  it("builds date predicates over messages.date, before exclusive", () => {
+    const { sql, params } = build("before:2026-01-01 after:2025/06/15")
+    expect(sql).toContain("AND m.date < $2")
+    expect(sql).toContain("AND m.date >= $3")
+    expect(params).toEqual([
+      "acc-1",
+      Date.UTC(2026, 0, 1) / 1000,
+      Date.UTC(2025, 5, 15) / 1000,
+    ])
+  })
+
+  it("builds a negation-only query against every in-scope thread", () => {
+    const { sql, params } = build("-from:newsletter@x.com")
+    expect(sql).toContain("NOT EXISTS")
+    // only the account scope and the one negated predicate bind params
+    expect(params).toEqual([
+      "acc-1",
+      "%newsletter@x.com%",
+      "%newsletter@x.com%",
+    ])
+  })
+
   it("binds the spec's label scenario in operator order", () => {
     const { sql, params } = build("label:receipts invoice")
     expect(sql).toContain("l.name = $2 COLLATE NOCASE")

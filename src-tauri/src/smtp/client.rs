@@ -16,6 +16,7 @@ use lettre::transport::smtp::extension::{ClientId, Extension};
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use super::types::*;
+use crate::net::require_plaintext_host_is_loopback;
 
 // ---------- Timeouts ----------
 
@@ -42,21 +43,31 @@ where
 
 // ---------- Transport / TLS ----------
 
-fn build_tls_parameters(host: &str, accept_invalid_certs: bool) -> Result<TlsParameters, String> {
-    let mut builder = TlsParametersBuilder::new(host.to_string());
-    if accept_invalid_certs {
-        builder = builder
-            .dangerous_accept_invalid_certs(true)
-            .dangerous_accept_invalid_hostnames(true);
-    }
-    builder
+fn build_tls_parameters(host: &str) -> Result<TlsParameters, String> {
+    // TLS is always verified: this is a release app sending user mail, so
+    // certificate and hostname checks stay on. `accept_invalid_certs` is
+    // still deserialized (it is part of the wire contract with the TS layer)
+    // so old settings rows do not break deserialization, but its value no
+    // longer opens the door to a bypass. A local mail bridge must present a
+    // valid certificate.
+    TlsParametersBuilder::new(host.to_string())
         .build()
         .map_err(|e| format!("SMTP TLS parameters for {host} failed: {e}"))
 }
 
 /// Build an async SMTP transport: implicit TLS (`Security::Tls`), STARTTLS
 /// (`Security::Starttls`) or plain TCP (`Security::None`, dev only).
+///
+/// TLS is always verified — certificate and hostname checks stay on for
+/// `Tls`/`Starttls`. The `accept_invalid_certs` field is still deserialized
+/// (part of the wire contract with the TS layer) so old settings rows do not
+/// break deserialization, but its value no longer opens a bypass; a local
+/// mail bridge must present a valid certificate.
 fn build_transport(params: &SmtpParams) -> Result<AsyncSmtpTransport<Tokio1Executor>, String> {
+    require_plaintext_host_is_loopback(
+        matches!(params.security, Security::None),
+        &params.host,
+    )?;
     let mut builder = match params.security {
         Security::Tls => AsyncSmtpTransport::<Tokio1Executor>::relay(&params.host)
             .map_err(|e| format!("invalid SMTP host {}: {e}", params.host))?,
@@ -65,9 +76,8 @@ fn build_transport(params: &SmtpParams) -> Result<AsyncSmtpTransport<Tokio1Execu
         Security::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&params.host),
     };
 
-    if params.accept_invalid_certs && matches!(params.security, Security::Tls | Security::Starttls)
-    {
-        let tls = build_tls_parameters(&params.host, true)?;
+    if matches!(params.security, Security::Tls | Security::Starttls) {
+        let tls = build_tls_parameters(&params.host)?;
         builder = builder.tls(match params.security {
             Security::Tls => Tls::Wrapper(tls),
             _ => Tls::Required(tls),
@@ -539,12 +549,13 @@ pub async fn test_connection(params: &SmtpParams) -> Result<SmtpTestResult, Stri
 }
 
 async fn test_connection_inner(params: &SmtpParams) -> Result<SmtpTestResult, String> {
+    require_plaintext_host_is_loopback(
+        matches!(params.security, Security::None),
+        &params.host,
+    )?;
     let hello_name = ClientId::default();
     let tls_wrapper = match params.security {
-        Security::Tls => Some(build_tls_parameters(
-            &params.host,
-            params.accept_invalid_certs,
-        )?),
+        Security::Tls => Some(build_tls_parameters(&params.host)?),
         Security::Starttls | Security::None => None,
     };
 
@@ -564,7 +575,7 @@ async fn test_connection_inner(params: &SmtpParams) -> Result<SmtpTestResult, St
     })?;
 
     if matches!(params.security, Security::Starttls) {
-        let tls = build_tls_parameters(&params.host, params.accept_invalid_certs)?;
+        let tls = build_tls_parameters(&params.host)?;
         conn.starttls(tls, &hello_name)
             .await
             .map_err(|e| format!("SMTP STARTTLS with {} failed: {e}", params.host))?;
