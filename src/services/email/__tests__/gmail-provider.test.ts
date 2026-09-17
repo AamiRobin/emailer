@@ -211,6 +211,39 @@ describe("message mapping", () => {
     ])
   })
 
+  it("captures the List-Unsubscribe header pair verbatim (task 18.3)", () => {
+    const message = mapGmailMessage(
+      gmailMessage({
+        payload: {
+          partId: "",
+          mimeType: "multipart/mixed",
+          headers: [
+            { name: "Subject", value: "Digest" },
+            {
+              name: "List-Unsubscribe",
+              value:
+                "<https://lists.example.com/u/1>, <mailto:leave@lists.example.com>",
+            },
+            {
+              name: "List-Unsubscribe-Post",
+              value: "List-Unsubscribe=One-Click",
+            },
+          ],
+          parts: [textPart("1", "body")],
+        },
+      })
+    )
+    expect(message.listUnsubscribe).toBe(
+      "<https://lists.example.com/u/1>, <mailto:leave@lists.example.com>"
+    )
+    expect(message.listUnsubscribePost).toBe("List-Unsubscribe=One-Click")
+
+    // Absent headers stay undefined (the sync stores a NULL headers JSON).
+    const bare = mapGmailMessage(gmailMessage())
+    expect(bare.listUnsubscribe).toBeUndefined()
+    expect(bare.listUnsubscribePost).toBeUndefined()
+  })
+
   it("maps inline attachments with content ids and header dates", () => {
     const message = mapGmailMessage(
       gmailMessage({

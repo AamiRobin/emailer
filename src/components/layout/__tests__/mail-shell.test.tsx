@@ -102,6 +102,7 @@ function resetStores(): void {
     activeThread: null,
     readingPane: "right",
     previousView: DEFAULT_VIEW,
+    listScope: null,
   })
   useThreadListStore.setState({
     accountId: null,
@@ -284,5 +285,33 @@ describe("settings view (task 11.1)", () => {
       expect(container.querySelector("[data-thread-row]")).not.toBeNull()
     )
     expect(useUiStore.getState().view).toEqual(DEFAULT_VIEW)
+  })
+})
+
+describe("active split tab title (task 9.3)", () => {
+  it("retitles the pane with the split's name instead of the folder's", async () => {
+    const { container } = render(<MailShell />)
+    await waitFor(() =>
+      expect(container.querySelector("[data-thread-row]")).not.toBeNull()
+    )
+    // The underlying view is the inbox…
+    expect(screen.getByRole("heading", { name: "Inbox" })).toBeTruthy()
+
+    // …entering the split scope retitles the pane to the split's name —
+    // the list is the split's query, not the folder.
+    act(() => {
+      useUiStore
+        .getState()
+        .setListScope({ kind: "split", name: "Receipts", query: "receipt" })
+    })
+    expect(
+      await screen.findByRole("heading", { name: "Receipts" })
+    ).toBeTruthy()
+
+    // Leaving the scope restores the folder title.
+    act(() => {
+      useUiStore.getState().setListScope(null)
+    })
+    await screen.findByRole("heading", { name: "Inbox" })
   })
 })

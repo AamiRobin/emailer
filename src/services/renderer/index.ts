@@ -11,7 +11,10 @@
  * into the individual modules. Task 7.3 layers the remote-image policy
  * (per-message "show images", per-sender allowlist) on top of
  * sanitizeEmailHtml's `blockRemoteImages` flag; task 7.4 wires link clicks
- * to the OS browser via the opener plugin; task 7.7 resolves cid: images.
+ * to the OS browser via the opener plugin; task 7.7 resolves cid: images;
+ * task 18.1 (design D12) adds the phishing detectors run beside the
+ * sanitize walk.
  */
 export * from "./plain-text"
+export * from "./phishing"
 export * from "./sanitize"

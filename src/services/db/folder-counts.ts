@@ -9,7 +9,14 @@ import type { SqlExecutor } from "./executor"
  * badge always matches the thread list its folder navigates to:
  * - inbox   → membership in the account's inbox-role label(s) via
  *             thread_labels OR threads.folder_label_id, excluding
- *             trashed/spam threads (the "inbox" preset)
+ *             trashed/spam threads (the "inbox" preset), snoozed
+ *             threads (snoozed_until IS NULL — spec: a snoozed thread's
+ *             unread state does not count toward badges), muted threads
+ *             (muted_at IS NULL — spec: muted is excluded from unread
+ *             counts), Done threads (done_at IS NULL — the badge must
+ *             match the inbox list, which hides Done mail) and delivery-
+ *             held threads (held_until IS NULL — task 12.1, spec: held
+ *             mail is excluded from unread counts until its window opens)
  * - sent    → membership in sent-role label(s) (pure membership, like the
  *             "specialUse" selector — no trash/spam exclusion)
  * - drafts  → membership in drafts-role label(s) (same)
@@ -101,7 +108,22 @@ const FLAG_PREDICATES: Record<
 }
 
 const COUNTED_PREDICATES: Record<FolderCountKey, string> = {
-  inbox: `threads.is_trashed = 0 AND threads.is_spam = 0 AND ${roleMembershipPredicate("inbox")}`,
+  // The inbox badge hides snoozed threads (snoozed_until IS NULL) so a
+  // snoozed thread's unread messages contribute zero — same predicate as
+  // the inbox list in threads.ts. This is half of how a wake "restores
+  // the prior unread state" without touching read state: the unread
+  // messages were never uncounted at the source, only filtered here, so
+  // clearing snoozed_until brings the badge back. Muted (muted_at IS
+  // NULL, spec: excluded from unread counts), Done (done_at IS NULL,
+  // the badge must match the list that hides Done mail) and delivery-
+  // HELD (held_until IS NULL — task 12.1, spec: held mail is excluded
+  // from unread counts until its window opens; releaseDueHolds clears
+  // the column and the badge returns with the batch) threads join the
+  // same inbox-only exclusion. Other folders keep counting their own
+  // mail — a snoozed/muted/Done/held thread still shows its unread state
+  // under Starred/labels/All Mail, exactly where the thread itself
+  // remains listed.
+  inbox: `threads.is_trashed = 0 AND threads.is_spam = 0 AND threads.snoozed_until IS NULL AND threads.muted_at IS NULL AND threads.done_at IS NULL AND threads.held_until IS NULL AND ${roleMembershipPredicate("inbox")}`,
   starred: FLAG_PREDICATES.starred,
   sent: roleMembershipPredicate("sent"),
   drafts: roleMembershipPredicate("drafts"),

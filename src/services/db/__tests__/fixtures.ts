@@ -95,6 +95,7 @@ export interface SeedMessageOptions {
   fromName?: string
   fromAddress?: string
   to?: ContactRef[]
+  cc?: ContactRef[]
   bodyText?: string
   snippet?: string
   isRead?: boolean
@@ -120,6 +121,7 @@ export async function createMessage(
     fromName: options.fromName,
     fromAddress: options.fromAddress,
     to: options.to,
+    cc: options.cc,
     bodyText: options.bodyText,
     snippet: options.snippet,
     isRead: options.isRead,

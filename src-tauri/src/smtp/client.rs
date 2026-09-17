@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use lettre::address::Envelope;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Mailbox, MultiPart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
@@ -375,19 +376,131 @@ fn build_message(email: &OutgoingEmail) -> Result<(Message, String), String> {
 /// The envelope (MAIL FROM / RCPT TO) is derived from the From/To/Cc/Bcc
 /// headers; lettre drops the Bcc header from the transmitted message after
 /// using it for the envelope, per RFC 5322.
-pub async fn send_email(params: &SmtpParams, email: &OutgoingEmail) -> Result<SendResult, String> {
-    collect_recipients(email)?;
+///
+/// `envelope_from` (task 16.2, design D10) switches to the raw-envelope
+/// path: MAIL FROM becomes exactly that address (the authenticated
+/// account) while the From HEADER keeps the alias the message carries.
+/// RCPT TO still comes from the message's recipients, and the transmitted
+/// bytes are the same `Message::formatted()` output `send` would use
+/// (Bcc header dropped either way). Absent/blank → the envelope is derived
+/// from the headers, unchanged.
+pub async fn send_email(
+    params: &SmtpParams,
+    email: &OutgoingEmail,
+    envelope_from: Option<&str>,
+) -> Result<SendResult, String> {
+    let recipients = collect_recipients(email)?;
     let (message, message_id) = build_message(email)?;
 
     let transport = build_transport(params)?;
+    match envelope_from.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sender) => {
+            let from = parse_address(sender)?;
+            let envelope = Envelope::new(Some(from), recipients)
+                .map_err(|e| format!("failed to build the SMTP envelope: {e}"))?;
+            with_timeout(
+                transport.send_raw(&envelope, &message.formatted()),
+                SMTP_SEND_TIMEOUT,
+                &format!("SMTP send via {}:{}", params.host, params.port),
+            )
+            .await?;
+        }
+        None => {
+            with_timeout(
+                transport.send(message),
+                SMTP_SEND_TIMEOUT,
+                &format!("SMTP send via {}:{}", params.host, params.port),
+            )
+            .await?;
+        }
+    }
+
+    Ok(SendResult { message_id })
+}
+
+// ---------- Raw send (task 18.5: PGP/MIME) ----------
+
+/// Remove the Bcc header (and its folded continuation lines) from a raw
+/// message's header block, preserving everything else byte-for-byte. SMTP
+/// delivers through the envelope only, so a transmitted Bcc header would
+/// leak the hidden recipients to every To/Cc recipient — the structured
+/// path never does this (lettre drops Bcc at send time, per RFC 5322) and
+/// Gmail's raw path matches (messages.send uses the header for delivery,
+/// then strips it). Top-level headers are NOT covered by a PGP/MIME
+/// signature (RFC 3156 signs the MIME entity), so stripping cannot break
+/// a signed or encrypted message.
+fn strip_bcc_headers(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_headers = true;
+    let mut dropping_bcc = false;
+    for line in raw.split_inclusive('\n') {
+        if !in_headers {
+            out.push_str(line);
+            continue;
+        }
+        let without_lf = line.strip_suffix('\n').unwrap_or(line);
+        let content = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+        if content.is_empty() {
+            // The blank line separates headers from the body: from here on
+            // even a literal "Bcc:" line is body text and stays.
+            in_headers = false;
+            dropping_bcc = false;
+        } else if content
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bcc:"))
+        {
+            dropping_bcc = true;
+            continue;
+        } else if dropping_bcc && (content.starts_with(' ') || content.starts_with('\t')) {
+            // Folded continuation of the Bcc header being dropped.
+            continue;
+        } else {
+            dropping_bcc = false;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Build the raw send's envelope from explicit bare addresses: MAIL FROM is
+/// the authenticated account address (design D10) and RCPT TO the
+/// structured recipient list the send flow already validated — never parsed
+/// back out of the raw headers. At least one recipient is required.
+fn parse_raw_envelope(recipients: &[String], envelope_from: &str) -> Result<Envelope, String> {
+    if recipients.is_empty() {
+        return Err("no recipients: at least one of to/cc/bcc is required".to_string());
+    }
+    let mut rcpts = Vec::with_capacity(recipients.len());
+    for addr in recipients {
+        rcpts.push(parse_address(addr)?);
+    }
+    let from = parse_address(envelope_from)?;
+    Envelope::new(Some(from), rcpts).map_err(|e| format!("failed to build the SMTP envelope: {e}"))
+}
+
+/// Transmit an ALREADY-BUILT RFC 822 message (task 18.5: the PGP/MIME the
+/// composer froze into the queued send) without rebuilding it — rebuilding
+/// from structured fields would unwrap the signing/encryption. The Bcc
+/// header is stripped from the transmitted bytes (see `strip_bcc_headers`),
+/// exactly like the structured path where lettre drops it after using it
+/// for the envelope.
+pub async fn send_raw_email(
+    params: &SmtpParams,
+    raw: &str,
+    recipients: &[String],
+    envelope_from: &str,
+) -> Result<(), String> {
+    let envelope = parse_raw_envelope(recipients, envelope_from)?;
+    let body = strip_bcc_headers(raw);
+
+    let transport = build_transport(params)?;
     with_timeout(
-        transport.send(message),
+        transport.send_raw(&envelope, body.as_bytes()),
         SMTP_SEND_TIMEOUT,
         &format!("SMTP send via {}:{}", params.host, params.port),
     )
     .await?;
-
-    Ok(SendResult { message_id })
+    Ok(())
 }
 
 // ---------- Connection test ----------
@@ -752,6 +865,86 @@ mod tests {
         assert_eq!(with.attachments.len(), 1);
         assert_eq!(with.attachments[0].filename, "f.txt");
         assert_eq!(with.attachments[0].content_base64, "aGk=");
+    }
+
+    // ----- Raw send (task 18.5: PGP/MIME) -----
+
+    #[test]
+    fn strip_bcc_removes_the_header_but_keeps_everything_else() {
+        let raw = "From: a@b.c\r\n\
+                   To: d@e.f\r\n\
+                   Bcc: hidden@x.y\r\n\
+                   Subject: s\r\n\
+                   \r\n\
+                   body\r\n";
+        assert_eq!(
+            strip_bcc_headers(raw),
+            "From: a@b.c\r\nTo: d@e.f\r\nSubject: s\r\n\r\nbody\r\n"
+        );
+    }
+
+    #[test]
+    fn strip_bcc_drops_folded_continuations_and_is_case_insensitive() {
+        let raw = "From: a@b.c\r\n\
+                   BCC: one@x.y,\r\n two@x.y,\r\n\tthree@x.y\r\n\
+                   Subject: s\r\n\
+                   \r\n\
+                   body\r\n";
+        let stripped = strip_bcc_headers(raw);
+        assert_eq!(stripped, "From: a@b.c\r\nSubject: s\r\n\r\nbody\r\n");
+        assert!(!stripped.contains("one@x.y"));
+        assert!(!stripped.contains("three@x.y"));
+    }
+
+    #[test]
+    fn strip_bcc_tolerates_lf_endings_and_headerless_messages() {
+        assert_eq!(
+            strip_bcc_headers("From: a@b.c\nBcc: x@y.z\n\nbody\n"),
+            "From: a@b.c\n\nbody\n"
+        );
+        // No blank line: everything is (still) headers.
+        assert_eq!(strip_bcc_headers("Bcc: x@y.z"), "");
+        // No Bcc at all: byte-identical.
+        let raw = "From: a@b.c\r\n\r\nbody\r\n";
+        assert_eq!(strip_bcc_headers(raw), raw);
+    }
+
+    #[test]
+    fn strip_bcc_leaves_body_mentions_and_other_headers_alone() {
+        let raw = "From: a@b.c\r\n\
+                   X-Bcc: keep me\r\n\
+                   Subject: s\r\n\
+                   \r\n\
+                   Bcc: not a header\r\n";
+        assert_eq!(strip_bcc_headers(raw), raw);
+    }
+
+    #[test]
+    fn raw_envelope_requires_recipients_and_bare_addresses() {
+        assert!(parse_raw_envelope(&[], "a@b.c")
+            .err()
+            .unwrap()
+            .contains("no recipients"));
+        assert!(parse_raw_envelope(&["d@e.f".to_string()], "a@b.c").is_ok());
+        assert!(parse_raw_envelope(&["not-an-address".to_string()], "a@b.c").is_err());
+        assert!(parse_raw_envelope(&["d@e.f".to_string()], "broken").is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_send_rejects_an_empty_recipient_list_before_connecting() {
+        let params = SmtpParams {
+            host: "smtp.invalid".to_string(),
+            port: 25,
+            security: Security::None,
+            username: String::new(),
+            password: String::new(),
+            accept_invalid_certs: false,
+        };
+        let error = send_raw_email(&params, "From: a@b.c\r\n\r\nx", &[], "a@b.c")
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("no recipients"), "{error}");
     }
 
     // ----- Capabilities -----

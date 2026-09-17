@@ -34,6 +34,9 @@ import type { SpecialUse } from "@/services/db/labels"
  *       the selection without a re-lookup
  * - {kind:"search", query}
  *     → searchThreads (src/services/db/search), not listThreadsByFolder
+ * - {kind:"contacts"}
+ *     → no thread list; the Contacts browser (task 20.2) replaces the
+ *       mailbox panes exactly like the settings view
  * - {kind:"settings"}
  *     → no thread list; the settings page (11.1) replaces the mailbox panes
  */
@@ -57,7 +60,34 @@ export type ViewSelection =
   | { kind: "folder"; folder: FolderSelection }
   | { kind: "label"; labelId: string; name: string }
   | { kind: "search"; query: string }
+  | { kind: "contacts" }
   | { kind: "settings" }
+
+/**
+ * Query-backed list scopes the mailbox can enter WITHOUT a ViewSelection
+ * kind (design D4, task 9.1). The ViewSelection union stays closed —
+ * components switch over its kinds — so the unified inbox (task 9.2),
+ * split tabs and saved-search listings (task 9.3) live BESIDE the view:
+ * a non-null `listScope` means the thread list shows that scope instead
+ * of the folder/label/search selection, and any setView() clears it
+ * again. `split` carries an optional account pin (one account) — omit it
+ * for the across-accounts variant; `saved-search` is always global.
+ * `priority` (task 13.2, design D7) is the priority inbox: the active
+ * accounts' inbox threads whose newest sender classifies important — not
+ * an operator query (the classification is a scored heuristic, not
+ * expressible as a search string), hence its own variant beside
+ * unified/split/saved-search. `nudges` (task 14.1, design D8) is the same
+ * kind of variant: the awaiting-reply threads the detection query in
+ * db/nudges.ts finds — again not expressible as a search string. Task
+ * 9.2/9.3/13.2/14.1 hang their UI on setListScope(); the thread-list store
+ * resolves the override into its scope descriptors (ThreadListScope).
+ */
+export type ListScopeOverride =
+  | { kind: "unified" }
+  | { kind: "priority" }
+  | { kind: "nudges" }
+  | { kind: "split"; name: string; query: string; accountId?: string }
+  | { kind: "saved-search"; name: string; query: string }
 
 /** Default view on launch: the account's inbox (also the test reset base). */
 export const DEFAULT_VIEW: ViewSelection = {
@@ -95,6 +125,8 @@ export function viewDisplayName(view: ViewSelection): string {
       return view.name
     case "search":
       return `Search: ${view.query}`
+    case "contacts":
+      return "Contacts"
     case "settings":
       return "Settings"
   }
@@ -110,14 +142,24 @@ interface UiState {
   readingPane: ReadingPanePosition
   /**
    * Last non-settings view (tasks 9.2/11.1): setView records every
-   * non-search AND non-settings selection here. Search views never
-   * overwrite it (clearSearch restores the folder/label the user was
-   * reading — mail-search spec "Clear a search") and settings views never
-   * overwrite it either, so the settings page's back control can restore
-   * the mailbox view via setView(previousView).
+   * non-search, non-settings AND non-contacts selection here. Search views
+   * never overwrite it (clearSearch restores the folder/label the user was
+   * reading — mail-search spec "Clear a search") and the full-pane pages
+   * (settings 11.1, Contacts browser 20.2) never overwrite it either, so
+   * their back controls can restore the mailbox view via
+   * setView(previousView).
    */
   previousView: ViewSelection
+  /**
+   * The query-backed scope overriding the view (see ListScopeOverride);
+   * null = the view itself drives the thread list. Cleared by setView,
+   * set directly by setListScope (task 9.2/9.3 entry points).
+   */
+  listScope: ListScopeOverride | null
   setView: (view: ViewSelection) => void
+  /** Enter/leave a query-backed list scope (unified inbox, split tab,
+   * saved search) without changing the underlying view selection. */
+  setListScope: (scope: ListScopeOverride | null) => void
   /** Exit a search back to the pre-search view (task 9.2); falls back to
    * the default inbox when no non-search view was visited yet. Only
    * meaningful while view.kind === "search". */
@@ -144,19 +186,27 @@ export const useUiStore = create<UiState>((set) => ({
   activeThread: null,
   readingPane: "right",
   previousView: DEFAULT_VIEW,
+  listScope: null,
 
   setView: (view) =>
     set((state) => ({
       view,
+      // Any explicit view selection replaces a query-backed scope override
+      // (leaving the unified inbox / a split by navigating a folder or
+      // running a search).
+      listScope: null,
       // Remember the most recent mailbox selection; a search (including a
-      // refined query) and the settings page never clobber it, so both
-      // "cancel" paths (clearSearch, settings back) restore what the user
-      // was reading.
+      // refined query) and the full-pane pages (settings, the Contacts
+      // browser, task 20.2) never clobber it, so the "cancel"/back paths
+      // (clearSearch, settings back) restore what the user was reading.
       previousView:
-        view.kind === "search" || view.kind === "settings"
+        view.kind === "search" ||
+        view.kind === "settings" ||
+        view.kind === "contacts"
           ? state.previousView
           : view,
     })),
+  setListScope: (listScope) => set({ listScope }),
   clearSearch: () => set((state) => ({ view: state.previousView })),
   toggleSidebar: () =>
     set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),

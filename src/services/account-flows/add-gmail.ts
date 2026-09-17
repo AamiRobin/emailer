@@ -6,6 +6,7 @@ import { insertAccount } from "../db/accounts"
 import { encryptCredentials } from "../crypto/credentials"
 import { useAccountStore } from "../../stores/account-store"
 import { triggerRefresh } from "../sync/scheduler"
+import { fetchDraftsOnConnect } from "./fetch-drafts"
 import { OauthFlowError, runGoogleConsent } from "./oauth-pkce"
 
 /**
@@ -258,6 +259,15 @@ export async function addGmailAccount(
       error
     )
   })
+
+  // Task 17.3 (design D9): pull drafts authored elsewhere into the Drafts
+  // view. Best-effort and background — a failed fetch never fails the
+  // connect; the next connect retries.
+  void fetchDraftsOnConnect(options.executor ?? getExecutor(), row.id).catch(
+    (error: unknown) => {
+      console.warn(`[add-gmail] draft fetch for ${row.id} failed`, error)
+    }
+  )
 
   return { accountId: row.id, email: profile.emailAddress }
 }

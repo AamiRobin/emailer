@@ -16,6 +16,13 @@ import {
   setThreadStarred,
 } from "../threads"
 import { setThreadFolder } from "../threads"
+import { snoozeThread, wakeDueThreads } from "../../email-actions/snooze"
+import {
+  markThreadDone,
+  muteThread,
+  unmarkThreadDone,
+  unmuteThread,
+} from "../../email-actions/thread-states"
 
 /**
  * Seeds real threads through the query layer (messages + recompute for
@@ -274,5 +281,123 @@ describe("unreadCountByLabel", () => {
     )
     await seedThread({ accountId: accountB, unread: 9, labelIds: [workB] })
     expect(await unreadCountByLabel(executor, accountA, work)).toBe(4)
+  })
+})
+
+describe("snoozed threads and badges (task 2.2)", () => {
+  it("a snoozed thread drops out of the inbox badge, keeps counting in other folders, and recovers after wake", async () => {
+    const accountId = await createAccount(executor, "gmail")
+    const inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+
+    // Starred + inbox thread (2 unread) and a plain inbox thread (1).
+    const snoozed = await seedThread({
+      accountId,
+      unread: 2,
+      labelIds: [inbox],
+      starred: true,
+    })
+    await seedThread({ accountId, unread: 1, labelIds: [inbox] })
+
+    expect((await unreadCountBySpecialUse(executor, accountId)).inbox).toBe(3)
+
+    await snoozeThread(executor, snoozed, at(20_000))
+    const whileSnoozed = await unreadCountBySpecialUse(executor, accountId)
+    // Snoozed unread contributes zero to the inbox badge…
+    expect(whileSnoozed.inbox).toBe(1)
+    // …while other folders keep counting their mail (Starred does not
+    // hide the snoozed thread, exactly like the folder list itself).
+    expect(whileSnoozed.starred).toBe(2)
+
+    // The wake (due pass / startup sweep) restores the badge — read state
+    // was never touched, so the prior unread state simply re-counts.
+    expect(await wakeDueThreads(executor, at(30_000))).toBe(1)
+    const afterWake = await unreadCountBySpecialUse(executor, accountId)
+    expect(afterWake.inbox).toBe(3)
+    expect(afterWake.starred).toBe(2)
+  })
+})
+
+describe("muted / Done threads and badges (tasks 3.1/3.2)", () => {
+  it("a muted thread drops out of the inbox badge, keeps counting in other folders, and recovers after unmute", async () => {
+    const accountId = await createAccount(executor, "gmail")
+    const inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+
+    // Starred + inbox thread (2 unread) and a plain inbox thread (1).
+    const muted = await seedThread({
+      accountId,
+      unread: 2,
+      labelIds: [inbox],
+      starred: true,
+    })
+    await seedThread({ accountId, unread: 1, labelIds: [inbox] })
+
+    expect((await unreadCountBySpecialUse(executor, accountId)).inbox).toBe(3)
+
+    await muteThread(executor, muted)
+    const whileMuted = await unreadCountBySpecialUse(executor, accountId)
+    // Muted unread contributes zero to the inbox badge…
+    expect(whileMuted.inbox).toBe(1)
+    // …while other folders keep counting their mail (Starred does not
+    // hide the muted thread, exactly like the folder list itself).
+    expect(whileMuted.starred).toBe(2)
+
+    // Unmute restores the badge — read state was never touched.
+    await unmuteThread(executor, muted)
+    const afterUnmute = await unreadCountBySpecialUse(executor, accountId)
+    expect(afterUnmute.inbox).toBe(3)
+    expect(afterUnmute.starred).toBe(2)
+  })
+
+  it("a Done thread drops out of the inbox badge only; other counts keep it", async () => {
+    const accountId = await createAccount(executor, "gmail")
+    const inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+    const allmail = await createGmailLabel(
+      executor,
+      accountId,
+      "All Mail",
+      "Label_all",
+      undefined,
+      "user"
+    )
+
+    const done = await seedThread({
+      accountId,
+      unread: 2,
+      labelIds: [inbox, allmail],
+    })
+    await seedThread({ accountId, unread: 1, labelIds: [inbox] })
+
+    expect((await unreadCountBySpecialUse(executor, accountId)).inbox).toBe(3)
+    expect(await unreadCountByLabel(executor, accountId, allmail)).toBe(2)
+
+    await markThreadDone(executor, done)
+    const whileDone = await unreadCountBySpecialUse(executor, accountId)
+    // The badge must match the inbox list, which hides Done mail…
+    expect(whileDone.inbox).toBe(1)
+    // …while the user-label badge keeps counting its mail (Done is
+    // inbox-only, exactly like the folder list that still shows the
+    // thread under its labels).
+    expect(await unreadCountByLabel(executor, accountId, allmail)).toBe(2)
+
+    await unmarkThreadDone(executor, done)
+    expect((await unreadCountBySpecialUse(executor, accountId)).inbox).toBe(3)
   })
 })

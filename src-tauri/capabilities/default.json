@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. Notes: opener:allow-open-path exists for the attachments feature (src/services/attachments/file-actions.ts) — opening downloaded/cache files with the OS default app; the paths it receives come from the Rust-managed attachment cache, so the scope is effectively content-gated (do not narrow further or save/open breaks). http:default is limited to the Google API hosts the Gmail REST client calls (token-manager.ts, gmail-api.ts, add-gmail.ts); the OAuth authorization URL is opened in the system browser, not via plugin-http.",
+  "description": "Capability for the main window. Notes: opener:allow-open-path exists for the attachments feature (src/services/attachments/file-actions.ts) — opening downloaded/cache files with the OS default app; the paths it receives come from the Rust-managed attachment cache, so the scope is effectively content-gated (do not narrow further or save/open breaks). http:default is limited to the Google API hosts the Gmail REST client calls (token-manager.ts, gmail-api.ts, add-gmail.ts) plus www.virustotal.com for the opt-in attachment malware hash lookup (src/services/attachments/malware-lookup.ts — hash-only GETs, no content upload); the OAuth authorization URL is opened in the system browser, not via plugin-http. The https://* entry exists for the RFC 8058 one-click unsubscribe POST (task 18.3, security/unsubscribe.ts): its targets are List-Unsubscribe URLs owned by arbitrary mailing-list servers, so the host set is unbounded by design — the request itself is user-initiated, form-encoded (`List-Unsubscribe=One-Click`), and carries no credentials or message content. fs:allow-open exists for data portability (tasks 19.2–19.4): the mbox exporter streams through a plugin-fs file handle (`open`, src/services/data-portability/mbox.ts) — its sibling write commands (write/remove) already ride fs:allow-appdata-write-recursive's write-all set, but `open` sits in the fs command model's read family and needs this permission. The command stays path-scope-gated at runtime — the dialog plugin adds every picked/saved path to the fs scope for the session (unpersisted; see @tauri-apps/plugin-dialog dist-js) — so no $HOME scope is granted. The import parser reads picked .eml/.mbox files Rust-side (mail_import.rs std::fs) and needs no fs permission at all.",
   "windows": [
     "main"
   ],
@@ -15,12 +15,15 @@
       "identifier": "http:default",
       "allow": [
         { "url": "https://oauth2.googleapis.com" },
-        { "url": "https://gmail.googleapis.com" }
+        { "url": "https://gmail.googleapis.com" },
+        { "url": "https://www.virustotal.com" },
+        { "url": "https://*" }
       ]
     },
     "notification:default",
     "dialog:default",
     "fs:default",
-    "fs:allow-appdata-write-recursive"
+    "fs:allow-appdata-write-recursive",
+    "fs:allow-open"
   ]
 }

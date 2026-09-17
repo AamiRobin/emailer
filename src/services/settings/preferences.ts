@@ -1,8 +1,15 @@
+import { SHORTCUTS, type ShortcutId } from "@/constants/shortcuts"
 import { ACCENTS, applyAccent, DEFAULT_ACCENT_ID } from "@/lib/accent"
 import type { SqlExecutor } from "@/services/db/executor"
 import { getSetting, setSetting } from "@/services/db/settings"
+import type { ThreadSortOption } from "@/services/db/thread-sort"
+import { isThreadSortOption } from "@/services/db/thread-sort"
 import type { ReadingPanePosition } from "@/stores/ui-store"
 import { useUiStore } from "@/stores/ui-store"
+import {
+  clampSendDelaySeconds,
+  DEFAULT_SEND_DELAY_SECONDS,
+} from "@/services/composer/undo-send"
 
 /**
  * User preferences (tasks 11.2/11.3): typed accessors over the generic
@@ -45,6 +52,71 @@ const PREFERENCE_KEYS = {
   readingPane: "mail.readingPane",
   accentId: "appearance.accentId",
   themeMode: "appearance.themeMode",
+  /** Per-account undo-send window base; the accountId is appended as
+   * `:<accountId>` (sendDelaySettingKey), the same namespacing
+   * signatures.ts uses for `signature:<accountId>`. */
+  sendDelaySeconds: "mail.sendDelaySeconds",
+  /** Per-account send-guard suppression flags (task 5.3): one boolean
+   * each for the forgotten-attachment reminder and the empty-subject
+   * confirmation — `mail.attachmentGuardSuppressed:<accountId>` /
+   * `mail.emptySubjectGuardSuppressed:<accountId>`, the same namespacing
+   * sendDelaySettingKey uses. The "Don't ask again" checkbox on each
+   * guard prompt writes one; the composer reads them per Send click. */
+  attachmentGuardSuppressed: "mail.attachmentGuardSuppressed",
+  emptySubjectGuardSuppressed: "mail.emptySubjectGuardSuppressed",
+  /** Per-scope thread-list sort map (task 4.1): one JSON object
+   * `Record<scopeKey, ThreadSortOption>` under a single key — the scope
+   * keys themselves are derived in thread-list-store
+   * (threadSortScopeKey): `special:<role>`, `label:<labelId>`, `search`. */
+  threadSorts: "mail.threadSorts",
+  /** Group-by-sender bundles (task 9.4): one GLOBAL boolean — the
+   * simplest workable scheme, deliberately not per-scope like the sorts:
+   * the grouping is a client-side view over whatever list is loaded, and
+   * one flag keeps the toggle (and its read at list mount) trivial. */
+  groupBySender: "mail.groupBySender",
+  /** Nudges age threshold (task 14.1, design D8): how many days an
+   * unanswered thread must sit before it becomes a nudge. One GLOBAL
+   * number — the spec's "configurable threshold" is a single dial, and the
+   * detection query is uniform across accounts. */
+  nudgeDays: "mail.nudgeDays",
+  /** Follow-up reminder interval (task 14.2, design D8): how many days
+   * after an accepted reply-send the reminder resurfaces the thread if no
+   * reply arrived. One GLOBAL number, like the nudge threshold. */
+  followUpDays: "mail.followUpDays",
+  /** Per-account IMAP drafts-folder override (task 17.2, design D9):
+   * `mail.imapDraftsFolder:<accountId>` (imapDraftsFolderSettingKey), the
+   * same namespacing signatures.ts uses. Escapes the folder auto-mapping
+   * when a server's Drafts detection fails. */
+  imapDraftsFolder: "mail.imapDraftsFolder",
+  /** Keyboard-shortcut overrides (task 20.1, design D15): one JSON object
+   * `Record<ShortcutId, keys>` under a single key — the same one-row shape
+   * as mail.threadSorts. Values are display strings in the exact format
+   * the default table uses (src/constants/shortcuts.ts); merging with the
+   * defaults happens at read time in hooks/shortcut-bindings.ts. */
+  shortcutOverrides: "mail.shortcutOverrides",
+  /** Per-account OpenPGP opt-in (task 18.7, design D11):
+   * `mail.pgpEnabled:<accountId>` (pgpEnabledSettingKey), the same
+   * namespacing sendDelaySettingKey uses. The encryption settings section
+   * is the writer; the key rows themselves live under
+   * `mail.pgp.{private,public}Keys:<accountId>` (crypto/pgp-keys.ts). */
+  pgpEnabled: "mail.pgpEnabled",
+  /** Global malware hash-lookup opt-in (task 18.9, design D18): one
+   * boolean + one API key, deliberately GLOBAL (not per account like the
+   * PGP flag) — the lookup is content-addressed (SHA-256), so the verdict
+   * cache is already shared across accounts and a per-account switch
+   * would only make the gating inconsistent. The attachment-security
+   * settings section is the writer; the open path (malware-lookup.ts)
+   * reads both before an attachment's first open. */
+  malwareLookupEnabled: "mail.malwareLookupEnabled",
+  malwareLookupApiKey: "mail.malwareLookupApiKey",
+  /** Per-account local junk filter (task 18.10, design D19):
+   * `mail.junkFilterEnabled:<accountId>` (junkFilterEnabledSettingKey),
+   * the same namespacing sendDelaySettingKey uses. IMAP-only (Gmail is
+   * exempt — server-side filtering already exists); off by default, so
+   * failing toward the default is failing toward no auto-junking. The
+   * junk-filter settings section is the writer; the sync engines and the
+   * thread-actions training hooks read it. */
+  junkFilterEnabled: "mail.junkFilterEnabled",
 } as const
 
 /** Theme mode as next-themes models it (theme-provider passes it to
@@ -239,6 +311,488 @@ export async function setThemeModePreference(
   mode: ThemeMode
 ): Promise<void> {
   await setSetting(executor, PREFERENCE_KEYS.themeMode, mode)
+}
+
+// ---------------------------------------------------------------------------
+// Per-account undo-send delay (design D3, task 5.1)
+// ---------------------------------------------------------------------------
+
+/** Settings key holding one account's undo-send window length (a plain
+ * JSON number of seconds). The settings-UI control is a later task —
+ * until it ships, this accessor pair is the only way the value is written
+ * or read. */
+export function sendDelaySettingKey(accountId: string): string {
+  return `${PREFERENCE_KEYS.sendDelaySeconds}:${accountId}`
+}
+
+/**
+ * The account's undo-send window in seconds: default 10 when unset or
+ * corrupt, values clamped to 5–30, and a stored 0 kept as the explicit
+ * "send immediately" opt-out (the clamp owns those rules — undo-send.ts).
+ */
+export async function getSendDelaySeconds(
+  executor: SqlExecutor,
+  accountId: string
+): Promise<number> {
+  const stored = await getSetting<unknown>(
+    executor,
+    sendDelaySettingKey(accountId),
+    DEFAULT_SEND_DELAY_SECONDS
+  )
+  return clampSendDelaySeconds(stored)
+}
+
+/** Persist the account's undo-send window (clamped on write). */
+export async function setSendDelaySecondsPreference(
+  executor: SqlExecutor,
+  accountId: string,
+  seconds: number
+): Promise<void> {
+  await setSetting(
+    executor,
+    sendDelaySettingKey(accountId),
+    clampSendDelaySeconds(seconds)
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Per-account send-guard suppression (task 5.3)
+// ---------------------------------------------------------------------------
+
+/** Settings key holding one account's "Don't ask again" flag for a send
+ * guard (a plain JSON boolean) — attachmentGuardSettingKey for the
+ * forgotten-attachment reminder, emptySubjectGuardSettingKey for the
+ * empty-subject confirmation. */
+function guardSuppressedSettingKey(prefix: string, accountId: string): string {
+  return `${prefix}:${accountId}`
+}
+
+export function attachmentGuardSettingKey(accountId: string): string {
+  return guardSuppressedSettingKey(
+    PREFERENCE_KEYS.attachmentGuardSuppressed,
+    accountId
+  )
+}
+
+export function emptySubjectGuardSettingKey(accountId: string): string {
+  return guardSuppressedSettingKey(
+    PREFERENCE_KEYS.emptySubjectGuardSuppressed,
+    accountId
+  )
+}
+
+/**
+ * The account's suppression flag for the forgotten-attachment reminder
+ * (the guard prompt's checkbox): stored JSON `true` means suppressed;
+ * unset or corrupt rows read as active — fail toward asking.
+ */
+export async function getAttachmentGuardSuppressed(
+  executor: SqlExecutor,
+  accountId: string
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    attachmentGuardSettingKey(accountId),
+    false
+  )
+  return stored === true
+}
+
+/** Persist the account's forgotten-attachment suppression flag. */
+export async function setAttachmentGuardSuppressedPreference(
+  executor: SqlExecutor,
+  accountId: string,
+  suppressed: boolean
+): Promise<void> {
+  await setSetting(executor, attachmentGuardSettingKey(accountId), suppressed)
+}
+
+/** Same accessor for the empty-subject confirmation's suppression flag. */
+export async function getEmptySubjectGuardSuppressed(
+  executor: SqlExecutor,
+  accountId: string
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    emptySubjectGuardSettingKey(accountId),
+    false
+  )
+  return stored === true
+}
+
+/** Persist the account's empty-subject suppression flag. */
+export async function setEmptySubjectGuardSuppressedPreference(
+  executor: SqlExecutor,
+  accountId: string,
+  suppressed: boolean
+): Promise<void> {
+  await setSetting(executor, emptySubjectGuardSettingKey(accountId), suppressed)
+}
+
+// ---------------------------------------------------------------------------
+// Per-scope thread-list sorts (task 4.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * The per-scope thread-list sort map (`mail.threadSorts`): a single JSON
+ * object `Record<scopeKey, ThreadSortOption>` — one settings row, one
+ * write per sort change, however many views the user has customized.
+ * Unknown scope keys and invalid options (a shape from an older build or
+ * a hand-edited row) are dropped on read; a scope with no entry falls back
+ * to date_desc at the call site.
+ */
+export async function getThreadSorts(
+  executor: SqlExecutor
+): Promise<Record<string, ThreadSortOption>> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.threadSorts,
+    {}
+  )
+  if (typeof stored !== "object" || stored === null || Array.isArray(stored)) {
+    return {}
+  }
+  return Object.fromEntries(
+    Object.entries(stored as Record<string, unknown>).filter(
+      (entry): entry is [string, ThreadSortOption] =>
+        isThreadSortOption(entry[1])
+    )
+  )
+}
+
+/** Persist the whole per-scope sort map (the caller owns merging). */
+export async function setThreadSorts(
+  executor: SqlExecutor,
+  sorts: Record<string, ThreadSortOption>
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.threadSorts, sorts)
+}
+
+// ---------------------------------------------------------------------------
+// Group-by-sender bundles (task 9.4)
+// ---------------------------------------------------------------------------
+
+/** The global "Group by sender" toggle: default off; anything but a
+ * stored JSON `true` reads as off (corrupt rows included). */
+export async function getGroupBySenderPreference(
+  executor: SqlExecutor
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.groupBySender,
+    false
+  )
+  return stored === true
+}
+
+/** Persist the "Group by sender" toggle. */
+export async function setGroupBySenderPreference(
+  executor: SqlExecutor,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.groupBySender, enabled)
+}
+
+// ---------------------------------------------------------------------------
+// Nudges + follow-up reminder thresholds (tasks 14.1/14.2, design D8)
+// ---------------------------------------------------------------------------
+
+/** Default age (days) before an unanswered thread becomes a nudge. The
+ * spec fixes no default — its "forgotten question" scenario runs at two
+ * days as a configured instance; 3 matches the follow-up interval and
+ * keeps routine threads out of the view. */
+export const DEFAULT_NUDGE_DAYS = 3
+
+/** Default follow-up reminder interval (days) attached at send time —
+ * the spec scenario's "3-day follow-up reminder". */
+export const DEFAULT_FOLLOW_UP_DAYS = 3
+
+const MIN_THRESHOLD_DAYS = 1
+const MAX_THRESHOLD_DAYS = 30
+
+function clampThresholdDays(days: number, fallback: number): number {
+  if (!Number.isFinite(days)) return fallback
+  return Math.min(
+    MAX_THRESHOLD_DAYS,
+    Math.max(MIN_THRESHOLD_DAYS, Math.floor(days))
+  )
+}
+
+/**
+ * The nudges age threshold (`mail.nudgeDays`): default 3 when unset,
+ * clamped 1–30, corrupt rows read as the default. The settings-UI control
+ * is a later consumer — until it ships, this accessor pair is the only way
+ * the value is written or read.
+ */
+export async function getNudgeDays(executor: SqlExecutor): Promise<number> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.nudgeDays,
+    DEFAULT_NUDGE_DAYS
+  )
+  return typeof stored === "number"
+    ? clampThresholdDays(stored, DEFAULT_NUDGE_DAYS)
+    : DEFAULT_NUDGE_DAYS
+}
+
+/** Persist the nudges age threshold (clamped on write). */
+export async function setNudgeDaysPreference(
+  executor: SqlExecutor,
+  days: number
+): Promise<void> {
+  await setSetting(
+    executor,
+    PREFERENCE_KEYS.nudgeDays,
+    clampThresholdDays(days, DEFAULT_NUDGE_DAYS)
+  )
+}
+
+/**
+ * The follow-up reminder interval (`mail.followUpDays`): default 3 when
+ * unset, clamped 1–30, corrupt rows read as the default. No settings-UI
+ * control yet — accessor pair only, like the nudge threshold.
+ */
+export async function getFollowUpDays(executor: SqlExecutor): Promise<number> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.followUpDays,
+    DEFAULT_FOLLOW_UP_DAYS
+  )
+  return typeof stored === "number"
+    ? clampThresholdDays(stored, DEFAULT_FOLLOW_UP_DAYS)
+    : DEFAULT_FOLLOW_UP_DAYS
+}
+
+/** Persist the follow-up reminder interval (clamped on write). */
+export async function setFollowUpDaysPreference(
+  executor: SqlExecutor,
+  days: number
+): Promise<void> {
+  await setSetting(
+    executor,
+    PREFERENCE_KEYS.followUpDays,
+    clampThresholdDays(days, DEFAULT_FOLLOW_UP_DAYS)
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Per-account IMAP drafts folder override (design D9, task 17.2)
+// ---------------------------------------------------------------------------
+
+/** Settings key holding one IMAP account's Drafts folder path override (a
+ * plain JSON string). Consulted by the draft-mirror ops BEFORE the
+ * special-use mapping and the "Drafts" name fallback; a settings-UI
+ * control is a later task — until it ships, this accessor pair is the
+ * only way the value is written or read. */
+export function imapDraftsFolderSettingKey(accountId: string): string {
+  return `${PREFERENCE_KEYS.imapDraftsFolder}:${accountId}`
+}
+
+/**
+ * The account's Drafts folder override: the stored trimmed path, or null
+ * when unset/blank/corrupt (null = fall through to the mapped/fallback
+ * resolution in the draft mirror).
+ */
+export async function getImapDraftsFolderOverride(
+  executor: SqlExecutor,
+  accountId: string
+): Promise<string | null> {
+  const stored = await getSetting<unknown>(
+    executor,
+    imapDraftsFolderSettingKey(accountId),
+    null
+  )
+  if (typeof stored !== "string") return null
+  const trimmed = stored.trim()
+  return trimmed === "" ? null : trimmed
+}
+
+/** Persist (or clear with null) the account's Drafts folder override. */
+export async function setImapDraftsFolderPreference(
+  executor: SqlExecutor,
+  accountId: string,
+  folder: string | null
+): Promise<void> {
+  const trimmed = folder?.trim() ?? ""
+  await setSetting(
+    executor,
+    imapDraftsFolderSettingKey(accountId),
+    trimmed === "" ? null : trimmed
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Per-account PGP enable flag (task 18.7, design D11)
+// ---------------------------------------------------------------------------
+
+/** Settings key holding one account's OpenPGP opt-in (a plain JSON
+ * boolean). The encryption settings section writes it; the pgp key rows
+ * themselves are scoped separately by crypto/pgp-keys.ts
+ * (`mail.pgp.{private,public}Keys:<accountId>`). */
+export function pgpEnabledSettingKey(accountId: string): string {
+  return `${PREFERENCE_KEYS.pgpEnabled}:${accountId}`
+}
+
+/**
+ * The account's PGP opt-in: default off, and anything but a stored JSON
+ * `true` reads as off (corrupt rows included). The lazy-load guarantee of
+ * design D11 — no PGP chunk cost until the user enables the feature —
+ * leans on this default, so failures must fail toward off.
+ */
+export async function getPgpEnabled(
+  executor: SqlExecutor,
+  accountId: string
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    pgpEnabledSettingKey(accountId),
+    false
+  )
+  return stored === true
+}
+
+/** Persist the account's OpenPGP opt-in. */
+export async function setPgpEnabledPreference(
+  executor: SqlExecutor,
+  accountId: string,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, pgpEnabledSettingKey(accountId), enabled)
+}
+
+// ---------------------------------------------------------------------------
+// Malware hash lookup (task 18.9, design D18)
+// ---------------------------------------------------------------------------
+
+/** The global malware-lookup opt-in: default off, and anything but a
+ * stored JSON `true` reads as off (corrupt rows included). Failures must
+ * fail toward off — the static dangerous-attachment warning (D17) stays
+ * the only gate, which is exactly the feature-off contract. */
+export async function getMalwareLookupEnabled(
+  executor: SqlExecutor
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.malwareLookupEnabled,
+    false
+  )
+  return stored === true
+}
+
+/** Persist the global malware-lookup opt-in. */
+export async function setMalwareLookupEnabledPreference(
+  executor: SqlExecutor,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.malwareLookupEnabled, enabled)
+}
+
+/**
+ * The stored lookup-service API key: the trimmed string, or "" when
+ * unset/blank/corrupt ("" = effectively keyless — the lookup short-
+ * circuits and D17 alone gates, per the spec's no-key path). A corrupt
+ * non-string row reads as "" rather than throwing.
+ */
+export async function getMalwareLookupApiKey(
+  executor: SqlExecutor
+): Promise<string> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.malwareLookupApiKey,
+    ""
+  )
+  if (typeof stored !== "string") return ""
+  return stored.trim()
+}
+
+/** Persist the lookup-service API key (trimmed; blank clears it). */
+export async function setMalwareLookupApiKeyPreference(
+  executor: SqlExecutor,
+  key: string
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.malwareLookupApiKey, key.trim())
+}
+
+// ---------------------------------------------------------------------------
+// Per-account local junk filter (task 18.10, design D19)
+// ---------------------------------------------------------------------------
+
+/** Settings key holding one account's junk-filter opt-in (a plain JSON
+ * boolean). The junk-filter settings section writes it; the sync engines'
+ * ingestion hook and the thread-actions training hooks read it. */
+export function junkFilterEnabledSettingKey(accountId: string): string {
+  return `${PREFERENCE_KEYS.junkFilterEnabled}:${accountId}`
+}
+
+/**
+ * The account's junk-filter opt-in: default off, and anything but a
+ * stored JSON `true` reads as off (corrupt rows included) — failing
+ * toward off means mail is never auto-moved by surprise (the D19
+ * false-positive risk note leans on this default).
+ */
+export async function getJunkFilterEnabled(
+  executor: SqlExecutor,
+  accountId: string
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    junkFilterEnabledSettingKey(accountId),
+    false
+  )
+  return stored === true
+}
+
+/** Persist the account's junk-filter opt-in. */
+export async function setJunkFilterEnabledPreference(
+  executor: SqlExecutor,
+  accountId: string,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, junkFilterEnabledSettingKey(accountId), enabled)
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard-shortcut overrides (task 20.1, design D15)
+// ---------------------------------------------------------------------------
+
+/**
+ * The shortcut override map (`mail.shortcutOverrides`): a single JSON
+ * object `Record<ShortcutId, keys>` where each value is the binding's
+ * display string in the default table's exact format ("a", "Shift+R",
+ * "Cmd/Ctrl+K", "j / ↓"). One settings row, one write per rebind/reset —
+ * the caller (hooks/shortcut-bindings.ts) owns merging and the in-memory
+ * store. Unknown ids and non-string/blank values (a shape from an older
+ * build or a hand-edited row) are dropped on read so a corrupt row can
+ * never poison the matcher.
+ */
+export async function getShortcutOverrides(
+  executor: SqlExecutor
+): Promise<Partial<Record<ShortcutId, string>>> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.shortcutOverrides,
+    {}
+  )
+  if (typeof stored !== "object" || stored === null || Array.isArray(stored)) {
+    return {}
+  }
+  const knownIds = new Set(SHORTCUTS.map((binding) => binding.id))
+  return Object.fromEntries(
+    Object.entries(stored as Record<string, unknown>).filter(
+      (entry): entry is [ShortcutId, string] =>
+        knownIds.has(entry[0] as ShortcutId) &&
+        typeof entry[1] === "string" &&
+        entry[1].trim() !== ""
+    )
+  )
+}
+
+/** Persist the whole override map (the caller owns merging). */
+export async function setShortcutOverrides(
+  executor: SqlExecutor,
+  overrides: Partial<Record<ShortcutId, string>>
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.shortcutOverrides, overrides)
 }
 
 // ---------------------------------------------------------------------------

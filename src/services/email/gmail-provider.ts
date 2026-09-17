@@ -370,6 +370,10 @@ export function mapGmailMessage(message: GmailMessage): NormalizedMessage {
     messageId: headerValue(payload, "Message-ID"),
     inReplyTo: headerValue(payload, "In-Reply-To"),
     references: headerValue(payload, "References"),
+    // List-unsubscribe capture (task 18.3, design D13): carried verbatim;
+    // the sync engine stores the pair in the message's headers JSON.
+    listUnsubscribe: headerValue(payload, "List-Unsubscribe"),
+    listUnsubscribePost: headerValue(payload, "List-Unsubscribe-Post"),
     subject: headerValue(payload, "Subject"),
     from: addressesFromHeader(headerValue(payload, "From")),
     to: addressesFromHeader(headerValue(payload, "To")),
@@ -722,6 +726,15 @@ export function createGmailProvider(
     },
 
     async sendMessage(input: SendEmailInput) {
+      // Task 18.5 (design D11): a PGP send arrives FULLY BUILT (the
+      // signed/encrypted PGP/MIME was frozen into the queued input at
+      // enqueue time — the passphrase exists only there) and is
+      // transmitted verbatim; rebuilding from the structured fields would
+      // unwrap the protection. The fields stay for bookkeeping only.
+      if (input.pgpMime) {
+        await client.sendMessageRaw(stringToBase64Url(input.pgpMime))
+        return { messageId: input.messageId ?? "" }
+      }
       const built = buildMimeMessage(input)
       await client.sendMessageRaw(stringToBase64Url(built.mime))
       return { messageId: built.messageId }

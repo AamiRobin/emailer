@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 
 import type { SqlExecutor } from "../db/executor"
 import type { DraftInput } from "./drafts"
-import { isDraftEmpty, saveDraft } from "./drafts"
+import { enqueueDraftMirrorUpsert, isDraftEmpty, saveDraft } from "./drafts"
 
 /**
  * useDraftAutosave (task 8.6): the one-line draft auto-save the composer
@@ -50,6 +50,11 @@ import { isDraftEmpty, saveDraft } from "./drafts"
  *     composer's content under the old draft key. Call saveNow()
  *     explicitly on close/discard flows when you need zero poll lag.
  *   - A failed save stays dirty and retries after the debounce window.
+ *   - Every successful save also enqueues the server-mirror upsert
+ *     (design D9, task 17.x — enqueueDraftMirrorUpsert), so the account's
+ *     server Drafts copy tracks the local draft; offline the queued op
+ *     replays when connectivity returns. Mirror problems never fail or
+ *     dirty the local save.
  *
  * The service half (saveDraft/deleteDraft/listDrafts and the full
  * lifecycle recipe: open → uuid key, autosave, send/discard →
@@ -142,6 +147,18 @@ export function useDraftAutosave(args: UseDraftAutosaveArgs): DraftAutosave {
             draftKey: target.draftKey,
             draft: input,
           })
+          // Design D9 (task 17.x): mirror every save to the account's
+          // server Drafts through the queue — enqueue after the local
+          // write committed, same content, FIFO-ordered. Fire-and-forget
+          // for the local save's outcome: enqueue failures are swallowed
+          // inside (the next autosave re-mirrors), and offline the op
+          // simply waits in the queue for replay.
+          await enqueueDraftMirrorUpsert(
+            target.executor,
+            target.accountId,
+            saved,
+            input
+          )
           lastSavedJsonRef.current = json
           if (!disposedRef.current) setLastSavedAt(saved.updatedAt)
         } catch {

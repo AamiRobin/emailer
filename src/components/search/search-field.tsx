@@ -6,6 +6,8 @@ import { cn } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { useUiStore } from "@/stores/ui-store"
+import { SaveAsSplitButton } from "./save-as-split-button"
+import { SaveSearchButton } from "./save-search-button"
 
 /**
  * The list-header search field (task 9.2, mail-search spec "Search
@@ -81,21 +83,25 @@ export function SearchField({ className }: { className?: string }) {
         />
       </div>
       {activeQuery !== null && (
-        <Badge
-          variant="secondary"
-          data-testid="search-query-chip"
-          className="h-6 max-w-56 gap-0.5 ps-2.5"
-        >
-          <span className="truncate">{activeQuery}</span>
-          <button
-            type="button"
-            aria-label="Clear search"
-            onClick={clearSearch}
-            className="rounded-full p-1 hover:bg-accent"
+        <>
+          <SaveSearchButton query={activeQuery} />
+          <SaveAsSplitButton query={activeQuery} />
+          <Badge
+            variant="secondary"
+            data-testid="search-query-chip"
+            className="h-6 max-w-56 gap-0.5 ps-2.5"
           >
-            <XIcon aria-hidden="true" className="size-3" />
-          </button>
-        </Badge>
+            <span className="truncate">{activeQuery}</span>
+            <button
+              type="button"
+              aria-label="Clear search"
+              onClick={clearSearch}
+              className="rounded-full p-1 hover:bg-accent"
+            >
+              <XIcon aria-hidden="true" className="size-3" />
+            </button>
+          </Badge>
+        </>
       )}
     </form>
   )

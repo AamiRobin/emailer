@@ -7,6 +7,15 @@ import {
 } from "../../db/__tests__/test-executor"
 import type { LabelRow } from "../../db/labels"
 import type { SpecialUse } from "../../db/labels"
+import { addNotificationRule } from "../../db/notification-rules"
+import { muteThread } from "../../email-actions/thread-states"
+import { setThreadFolder } from "../../db/threads"
+import {
+  blockSender,
+  listBlockedSenders,
+  unblockSender,
+} from "../../db/blocked-senders"
+import { createRule } from "../../rules"
 import {
   leafFolderName,
   systemLabelForSpecialUse,
@@ -29,6 +38,8 @@ import { getFolderSyncState } from "../folder-sync-state"
 import type { FetchFlagsChangedFn } from "../flag-sync"
 import type { ImapSyncSummary } from "../imap-sync"
 import { syncImapAccount } from "../imap-sync"
+import { setJunkFilterEnabledPreference } from "../../settings/preferences"
+import { trainJunkDocument } from "../../security/junk-filter"
 
 // ---------------------------------------------------------------------------
 // In-memory IMAP server + provider standing in for the Rust command layer
@@ -43,6 +54,11 @@ interface FakeStoredMessage {
   subject?: string
   fromName?: string
   fromEmail?: string
+  /** To-header addresses (sender-stats direct-to-me tests). */
+  toEmails?: string[]
+  /** List-unsubscribe capture (task 18.3, D13). */
+  listUnsubscribe?: string
+  listUnsubscribePost?: string
   date: number
   textBody?: string
   size: number
@@ -258,8 +274,10 @@ function toNormalizedMessage(
     inReplyTo: message.inReplyTo,
     references: message.references,
     subject: message.subject,
+    listUnsubscribe: message.listUnsubscribe,
+    listUnsubscribePost: message.listUnsubscribePost,
     from: [{ name: message.fromName, email: message.fromEmail }],
-    to: [],
+    to: (message.toEmails ?? []).map((email) => ({ email })),
     cc: [],
     bcc: [],
     date: message.date,
@@ -394,9 +412,13 @@ async function threadById(harness: TestHarness, threadId: string) {
     message_count: number
     unread_count: number
     folder_label_id: string | null
+    is_archived: number
+    is_trashed: number
+    is_spam: number
     subject: string | null
   }>(
-    `SELECT id, message_count, unread_count, folder_label_id, subject
+    `SELECT id, message_count, unread_count, folder_label_id,
+            is_archived, is_trashed, is_spam, subject
      FROM threads WHERE id = $1`,
     [threadId]
   )
@@ -466,9 +488,12 @@ describe("imap sync engine", () => {
 
     const summary = await harness.sync()
 
+    // A first sync is a seed pass: the whole folder is a backfill that is
+    // stored and filed but never announces — the count stays 0 while the
+    // messages, threads, labels and cursors below are still created.
     expect(summary).toMatchObject({
       foldersSynced: 3,
-      newMessages: 4,
+      newMessages: 0,
       errors: [],
     })
 
@@ -519,6 +544,52 @@ describe("imap sync engine", () => {
       uidvalidity: null,
       last_seen_uid: 0,
     })
+  })
+
+  it("captures list-unsubscribe headers into the stored headers JSON (task 18.3)", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: [],
+      messageId: "<list-1@x>",
+      subject: "Monthly digest",
+      fromEmail: "news@lists.example.com",
+      listUnsubscribe:
+        "<https://lists.example.com/u/1>, <mailto:leave@lists.example.com>",
+      listUnsubscribePost: "List-Unsubscribe=One-Click",
+      date: 1000,
+      textBody: "digest",
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<plain-1@x>",
+      subject: "Plain",
+      fromEmail: "friend@x",
+      date: 2000,
+      textBody: "no headers here",
+    })
+
+    await harness.sync()
+
+    const rows = await harness.executor.select<{
+      imap_uid: number
+      headers: string | null
+    }>(
+      `SELECT imap_uid, headers FROM messages
+       WHERE account_id = $1 AND imap_folder = 'INBOX' ORDER BY imap_uid ASC`,
+      [harness.accountId]
+    )
+    const byUid = new Map(rows.map((m) => [m.imap_uid, m]))
+    const listRow = byUid.get(1)
+    const plainRow = byUid.get(2)
+    // The one-click pair is stored verbatim, lowercase-keyed — exactly the
+    // shape unsubscribeTargetsFromHeaders reads on the mail view.
+    expect(JSON.parse(listRow?.headers ?? "null")).toEqual({
+      "list-unsubscribe":
+        "<https://lists.example.com/u/1>, <mailto:leave@lists.example.com>",
+      "list-unsubscribe-post": "List-Unsubscribe=One-Click",
+    })
+    // A message without the headers keeps the column NULL.
+    expect(plainRow?.headers).toBeNull()
   })
 
   it("second sync with no changes queries only the delta and inserts nothing", async () => {
@@ -581,6 +652,104 @@ describe("imap sync engine", () => {
     expect(await threadById(harness, rootThread as string)).toMatchObject({
       message_count: 2,
       unread_count: 2,
+    })
+  })
+
+  it("new mail joining a trashed thread is stored but never counted", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    harness.addFolder("Trash", 400, "trash")
+    const archive = harness.addFolder("Archive", 300, null)
+    inbox.insert({
+      flags: [],
+      messageId: "<m1@x>",
+      subject: "Hello",
+      fromEmail: "a@x",
+      date: 1000,
+    })
+    await harness.sync() // seed pass: stored, never counted
+    const threadId = (await messagesIn(harness, "INBOX"))[0]!.thread_id
+
+    // The user trashes the thread locally — the placement caches the
+    // count gate reads (folder moved onto the trash-role label).
+    const trashLabel = await labelByPath(harness, "Trash")
+    await setThreadFolder(harness.executor, threadId, trashLabel!.id)
+    expect(await threadById(harness, threadId)).toMatchObject({
+      is_trashed: 1,
+    })
+
+    // A reply lands in Archive — a non-inbox folder, so the placement
+    // gate (not the inbox re-entry rule) is what must exclude the count.
+    archive.insert({
+      flags: [],
+      messageId: "<m2@x>",
+      inReplyTo: "<m1@x>",
+      subject: "Re: Hello",
+      fromEmail: "b@x",
+      date: 5000,
+    })
+    const summary = await harness.sync()
+
+    // Stored and threaded, but the trashed thread never announces.
+    expect(summary.newMessages).toBe(0)
+    const archived = await messagesIn(harness, "Archive")
+    expect(archived).toHaveLength(1)
+    expect(archived[0]?.thread_id).toBe(threadId)
+    expect(await threadById(harness, threadId)).toMatchObject({
+      message_count: 2,
+      is_trashed: 1,
+    })
+  })
+
+  it("a reply to an archived thread re-enters the inbox; an Archive arrival does not re-file", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    const archive = harness.addFolder("Archive", 200, "archive")
+    archive.insert({
+      flags: [],
+      messageId: "<m1@x>",
+      subject: "Hello",
+      fromEmail: "a@x",
+      date: 1000,
+    })
+    await harness.sync() // seed: the thread lives in Archive
+    const threadId = (await messagesIn(harness, "Archive"))[0]!.thread_id
+    const inboxLabelId = `${harness.accountId}:INBOX`
+    expect(await threadById(harness, threadId)).toMatchObject({
+      folder_label_id: `${harness.accountId}:${systemLabelForSpecialUse("archive").id}`,
+      is_archived: 1,
+    })
+
+    // A reply lands in INBOX: the additive-INBOX rule repoints the
+    // reused thread (setThreadFolder also clears is_archived), so it
+    // re-enters the inbox — mirroring gmail's behavior.
+    inbox.insert({
+      flags: [],
+      messageId: "<m2@x>",
+      inReplyTo: "<m1@x>",
+      subject: "Re: Hello",
+      fromEmail: "b@x",
+      date: 5000,
+    })
+    const summary = await harness.sync()
+    expect(summary.newMessages).toBe(1)
+    expect(await threadById(harness, threadId)).toMatchObject({
+      folder_label_id: inboxLabelId,
+      is_archived: 0,
+    })
+
+    // A later reply landing in Archive must NOT re-file the thread away
+    // from the inbox (only inbox-role arrivals re-file).
+    archive.insert({
+      flags: [],
+      messageId: "<m3@x>",
+      inReplyTo: "<m1@x>",
+      subject: "Re: Hello again",
+      fromEmail: "c@x",
+      date: 9000,
+    })
+    const third = await harness.sync()
+    expect(third.newMessages).toBe(1)
+    expect(await threadById(harness, threadId)).toMatchObject({
+      folder_label_id: inboxLabelId,
     })
   })
 
@@ -651,7 +820,9 @@ describe("imap sync engine", () => {
     expect(harness.provider.calls).toEqual([
       { folder: "INBOX", query: { last: 200 } },
     ])
-    expect(summary.newMessages).toBe(2)
+    // The invalidation re-sync is a re-backfill (seed pass): the fresh
+    // conversation is stored and threaded but never announces.
+    expect(summary.newMessages).toBe(0)
 
     const messages = await messagesIn(harness, "INBOX")
     expect(messages.map((m) => m.imap_uid)).toEqual([1, 2])
@@ -731,6 +902,10 @@ describe("imap sync engine", () => {
   it("collects per-folder errors and still syncs the rest", async () => {
     const inbox = harness.addFolder("INBOX", 100, "inbox")
     harness.addFolder("Broken", 300, null)
+    // Seed the cursors first (both folders empty — not a seed pass): the
+    // arrival below is then a genuine delta the count can report.
+    await harness.sync()
+
     inbox.insert({
       flags: [],
       messageId: "<m1@x>",
@@ -750,6 +925,67 @@ describe("imap sync engine", () => {
     expect(summary.newMessages).toBe(1)
     expect(summary.errors).toEqual(["Broken: connection reset by peer"])
     expect(await messagesIn(harness, "INBOX")).toHaveLength(1)
+  })
+
+  it("mute gating: new mail landing in a muted thread is stored but not counted as new", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: ["\\Seen"],
+      messageId: "<m1@x>",
+      subject: "Hello",
+      fromEmail: "a@x",
+      date: 1000,
+      textBody: "first message",
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<solo@x>",
+      subject: "Other",
+      fromEmail: "c@x",
+      date: 1500,
+      textBody: "other",
+    })
+    await harness.sync()
+
+    // Mute the Hello thread locally through the thread-states service
+    // (what the UI's context menu will call).
+    const root = (await messagesIn(harness, "INBOX")).find(
+      (message) => message.subject === "Hello"
+    )
+    await muteThread(harness.executor, root?.thread_id as string)
+
+    // A reply joins the muted thread; a fresh root lands in an unmuted
+    // one. Only the latter may reach the count the scheduler forwards to
+    // notifyNewMail.
+    inbox.insert({
+      flags: [],
+      messageId: "<m2@x>",
+      inReplyTo: "<m1@x>",
+      subject: "Re: Hello",
+      fromEmail: "b@x",
+      date: 3000,
+      textBody: "reply body",
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<fresh@x>",
+      subject: "Fresh",
+      fromEmail: "d@x",
+      date: 4000,
+      textBody: "fresh",
+    })
+
+    const summary = await harness.sync()
+
+    expect(summary.newMessages).toBe(1)
+    // The muted thread's reply is still fully stored…
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(4)
+    // …and the new incoming message did NOT unmute the thread (spec).
+    const rows = await harness.executor.select<{ muted_at: number | null }>(
+      "SELECT muted_at FROM threads WHERE id = $1",
+      [root?.thread_id as string]
+    )
+    expect(rows[0]?.muted_at).toBeGreaterThan(0)
   })
 
   // ----- Flag-consistency pass (task 4.7, D14) -----
@@ -845,5 +1081,626 @@ describe("imap sync engine", () => {
     expect(await syncState(harness, "INBOX")).toMatchObject({
       highest_modseq: MODSEQ,
     })
+  })
+
+  // ----- Notification rules (task 8.1, design D16) -----
+
+  it("never-sender rule: the message is stored but not counted as new", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: ["\\Seen"],
+      messageId: "<m1@x>",
+      subject: "Hello",
+      fromEmail: "a@x",
+      date: 1000,
+    })
+    await harness.sync()
+
+    await addNotificationRule(harness.executor, {
+      accountId: harness.accountId,
+      matchType: "sender",
+      matchValue: "newsletter@x.com",
+      action: "never",
+    })
+
+    // The suppressed sender's mail lands beside a normal one. Only the
+    // normal one may reach the count the scheduler forwards to
+    // notifyNewMail.
+    inbox.insert({
+      flags: [],
+      messageId: "<m2@x>",
+      subject: "Digest",
+      fromEmail: "newsletter@x.com",
+      date: 2000,
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<m3@x>",
+      subject: "Fresh",
+      fromEmail: "a@x",
+      date: 3000,
+    })
+
+    const summary = await harness.sync()
+
+    expect(summary.newMessages).toBe(1)
+    // The suppressed message is fully stored — only the announcement
+    // count excludes it.
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(3)
+  })
+
+  it("never-label rule matches the folder's label name (full path or leaf)", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    const newsletters = harness.addFolder("Newsletters", 100, null)
+    newsletters.insert({
+      flags: [],
+      messageId: "<n1@x>",
+      subject: "Digest",
+      fromEmail: "news@x.com",
+      date: 100,
+    })
+    await harness.sync()
+
+    await addNotificationRule(harness.executor, {
+      accountId: harness.accountId,
+      matchType: "label",
+      matchValue: "newsletters",
+      action: "never",
+    })
+
+    newsletters.insert({
+      flags: [],
+      messageId: "<n2@x>",
+      subject: "Digest 2",
+      fromEmail: "news@x.com",
+      date: 200,
+    })
+    // A message in another folder is unaffected by the rule.
+    inbox.insert({
+      flags: [],
+      messageId: "<in1@x>",
+      subject: "Fresh",
+      fromEmail: "news@x.com",
+      date: 300,
+    })
+
+    const summary = await harness.sync()
+
+    expect(summary.newMessages).toBe(1)
+    expect(await messagesIn(harness, "Newsletters")).toHaveLength(2)
+  })
+
+  it("an always rule keeps its sender counted (VIP case)", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: ["\\Seen"],
+      messageId: "<m1@x>",
+      subject: "Hello",
+      fromEmail: "boss@x.com",
+      date: 1000,
+    })
+    await harness.sync()
+
+    // Only an always rule for the regular sender exists: the message is
+    // counted as before (never dominates always only when BOTH match).
+    await addNotificationRule(harness.executor, {
+      accountId: harness.accountId,
+      matchType: "sender",
+      matchValue: "boss@x.com",
+      action: "always",
+    })
+
+    inbox.insert({
+      flags: [],
+      messageId: "<m2@x>",
+      subject: "Ping",
+      fromEmail: "boss@x.com",
+      date: 2000,
+    })
+
+    const summary = await harness.sync()
+
+    expect(summary.newMessages).toBe(1)
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(2)
+  })
+
+  // ----- Ingestion rules (task 11.1/11.2, design D5) -----
+  //
+  // The engine hands every newly inserted message to the rules hook after
+  // the folder stamping + cache recompute; these scenarios verify the
+  // end-to-end imap contract: ruled moves/trashes land locally AND queue
+  // the server-side op, and ruled-away mail never notifies.
+
+  async function pendingOps(
+    harness: TestHarness
+  ): Promise<{ op_type: string; payload_json: string }[]> {
+    return harness.executor.select(
+      `SELECT op_type, payload_json FROM pending_operations
+       WHERE account_id = $1 ORDER BY seq ASC`,
+      [harness.accountId]
+    )
+  }
+
+  async function threadFlags(harness: TestHarness, threadId: string) {
+    const rows = await harness.executor.select<{
+      is_trashed: number
+      is_archived: number
+      is_spam: number
+      unread_count: number
+    }>(
+      "SELECT is_trashed, is_archived, is_spam, unread_count FROM threads WHERE id = $1",
+      [threadId]
+    )
+    return rows[0]
+  }
+
+  // The rule scenarios assert on ARRIVALS: a folder's first sync is a seed
+  // pass that stores and files but never announces, so each test syncs the
+  // empty folder first to establish the cursors, then delivers the mail.
+  it("a move rule files the message into the target folder and never notifies", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    harness.addFolder("Newsletters", 100, null)
+    await createRule(harness.executor, {
+      accountId: harness.accountId,
+      name: "File newsletters",
+      criteriaQuery: "from:news@x.com",
+      actions: [{ type: "move", folder: "Newsletters" }],
+    })
+    await harness.sync()
+
+    inbox.insert({
+      flags: [],
+      messageId: "<n1@x>",
+      subject: "Digest",
+      fromEmail: "news@x.com",
+      date: 1000,
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<k1@x>",
+      subject: "Keep",
+      fromEmail: "a@x.com",
+      date: 2000,
+    })
+
+    const summary = await harness.sync()
+
+    // The ruled message does not announce; the plain one does.
+    expect(summary.newMessages).toBe(1)
+    const inboxRows = await messagesIn(harness, "INBOX")
+    expect(inboxRows.map((row) => row.subject)).toEqual(["Keep"])
+
+    // The newsletter physically moved locally (row + thread folder cache).
+    const moved = await messagesIn(harness, "Newsletters")
+    expect(moved).toHaveLength(1)
+    const folderId = await labelByPath(harness, "Newsletters")
+    expect(
+      await threadById(harness, moved[0]?.thread_id as string)
+    ).toMatchObject({
+      folder_label_id: folderId?.id,
+    })
+
+    const ops = await pendingOps(harness)
+    expect(ops.map((op) => op.op_type)).toEqual(["move"])
+    expect(JSON.parse(ops[0]?.payload_json ?? "{}")).toMatchObject({
+      destinationFolder: "Newsletters",
+      refs: [{ folder: "INBOX", uid: 1 }], // server-side location
+    })
+    // The folder cursors are untouched by the local move.
+    expect(await syncState(harness, "INBOX")).toMatchObject({
+      last_seen_uid: 2,
+    })
+  })
+
+  it("a trash rule moves the message to the trash folder and never notifies", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    harness.addFolder("Trash", 100, "trash")
+    await createRule(harness.executor, {
+      accountId: harness.accountId,
+      name: "Bin spam",
+      criteriaQuery: "subject:winner",
+      actions: [{ type: "trash" }],
+    })
+    await harness.sync()
+
+    inbox.insert({
+      flags: [],
+      messageId: "<s1@x>",
+      subject: "You are a winner",
+      fromEmail: "spam@x.com",
+      date: 1000,
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<k1@x>",
+      subject: "Keep",
+      fromEmail: "a@x.com",
+      date: 2000,
+    })
+
+    const summary = await harness.sync()
+
+    expect(summary.newMessages).toBe(1)
+    const trashed = await messagesIn(harness, "Trash")
+    expect(trashed).toHaveLength(1)
+    expect(
+      await threadFlags(harness, trashed[0]?.thread_id as string)
+    ).toMatchObject({ is_trashed: 1 })
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(1)
+
+    const ops = await pendingOps(harness)
+    expect(ops.map((op) => op.op_type)).toEqual(["trash"])
+    expect(JSON.parse(ops[0]?.payload_json ?? "{}")).toMatchObject({
+      refs: [{ folder: "INBOX", uid: 1 }],
+    })
+  })
+
+  it("a mark-as-spam rule moves the message to the junk folder and never notifies", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    harness.addFolder("Junk", 100, "spam")
+    await createRule(harness.executor, {
+      accountId: harness.accountId,
+      name: "Spam the lottery",
+      criteriaQuery: "from:winner@lottery.example",
+      actions: [{ type: "mark_as_spam" }],
+    })
+    await harness.sync()
+
+    inbox.insert({
+      flags: [],
+      messageId: "<w1@x>",
+      subject: "Claim your prize",
+      fromEmail: "winner@lottery.example",
+      date: 1000,
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<k1@x>",
+      subject: "Keep",
+      fromEmail: "a@x.com",
+      date: 2000,
+    })
+
+    const summary = await harness.sync()
+
+    // The ruled message does not announce; the plain one does.
+    expect(summary.newMessages).toBe(1)
+    const spammed = await messagesIn(harness, "Junk")
+    expect(spammed).toHaveLength(1)
+    expect(
+      await threadFlags(harness, spammed[0]?.thread_id as string)
+    ).toMatchObject({ is_spam: 1 })
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(1)
+
+    // The spam placement queues the imap move op (junk folder by role),
+    // addressing the server-side location the message arrived at.
+    const ops = await pendingOps(harness)
+    expect(ops.map((op) => op.op_type)).toEqual(["move"])
+    expect(JSON.parse(ops[0]?.payload_json ?? "{}")).toMatchObject({
+      destinationFolder: "Junk",
+      refs: [{ folder: "INBOX", uid: 1 }],
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Sender stats (task 13.1, design D7): the ingestion hook flow's stats
+// consumer must accumulate per-sender rows from what the engine stored.
+// ---------------------------------------------------------------------------
+
+describe("imap sync sender stats", () => {
+  let harness: TestHarness
+
+  beforeEach(async () => {
+    harness = await createHarness()
+  })
+
+  afterEach(() => {
+    harness.executor.close()
+  })
+
+  it("accumulates reply/direct/list signals per sender for new messages", async () => {
+    const inbox = harness.addFolder("INBOX", 1, "inbox")
+    const me = (
+      await harness.executor.select<{ email: string }>(
+        "SELECT email FROM accounts WHERE id = $1",
+        [harness.accountId]
+      )
+    )[0]?.email as string
+
+    inbox.insert({
+      flags: [],
+      subject: "Hello",
+      fromEmail: "Alice@X.com",
+      toEmails: [me],
+      date: 100,
+    })
+    // The account's own reply in the same thread flips participation on
+    // for the thread's events (and records no row of its own).
+    inbox.insert({
+      flags: [],
+      subject: "Re: Hello",
+      fromEmail: me,
+      date: 150,
+    })
+    // The bracketed subject prefix stands in for List-Id/Precedence.
+    inbox.insert({
+      flags: [],
+      subject: "[announce] Release 1.0",
+      fromEmail: "news@lists.dev",
+      date: 200,
+    })
+
+    await harness.sync()
+
+    const rows = await harness.executor.select<{
+      sender: string
+      reply_count: number
+      direct_to_me_count: number
+      is_mailing_list: number
+      last_message_at: number | null
+    }>(
+      `SELECT sender, reply_count, direct_to_me_count, is_mailing_list,
+              last_message_at
+       FROM sender_stats WHERE account_id = $1 ORDER BY sender`,
+      [harness.accountId]
+    )
+    expect(rows).toEqual([
+      {
+        sender: "alice@x.com", // lowercased key
+        // The thread carries the account's own message (participation),
+        // though Alice's own subject has no Re:.
+        reply_count: 1,
+        direct_to_me_count: 1, // to: me
+        is_mailing_list: 0,
+        last_message_at: 100,
+      },
+      {
+        sender: "news@lists.dev",
+        reply_count: 0,
+        direct_to_me_count: 0,
+        is_mailing_list: 1, // "[announce]" subject prefix
+        last_message_at: 200,
+      },
+      // No row for the account's own address.
+    ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Blocked senders (task 18.2): the ingestion hook flow's FIFTH consumer on
+// the imap surface — a blocklist row files the sender's new message (mark
+// read + trash via the block-time action) and keeps it unannounced.
+// ---------------------------------------------------------------------------
+
+describe("imap sync blocked senders", () => {
+  let harness: TestHarness
+
+  beforeEach(async () => {
+    harness = await createHarness()
+  })
+
+  afterEach(() => {
+    harness.executor.close()
+  })
+
+  async function threadFlagsById(
+    threadRowId: string
+  ): Promise<{ is_trashed: number; unread_count: number }> {
+    const rows = await harness.executor.select<{
+      is_trashed: number
+      unread_count: number
+    }>("SELECT is_trashed, unread_count FROM threads WHERE id = $1", [
+      threadRowId,
+    ])
+    return rows[0]!
+  }
+
+  async function pendingOps(): Promise<
+    { op_type: string; payload_json: string }[]
+  > {
+    return harness.executor.select(
+      `SELECT op_type, payload_json FROM pending_operations
+       WHERE account_id = $1 ORDER BY seq ASC`,
+      [harness.accountId]
+    )
+  }
+
+  it("a blocked sender's new message is marked read, trashed and never counted", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    harness.addFolder("Trash", 100, "trash")
+    await blockSender(harness.executor, harness.accountId, {
+      sender: "spam@x.com",
+      action: "trash",
+    })
+    // Seed the cursors first: the blocked mail below is an arrival, and a
+    // folder's first sync never announces anything.
+    await harness.sync()
+
+    inbox.insert({
+      flags: [],
+      messageId: "<s1@x>",
+      subject: "Buy now",
+      fromEmail: "spam@x.com",
+      date: 1000,
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<k1@x>",
+      subject: "Keep",
+      fromEmail: "a@x.com",
+      date: 2000,
+    })
+
+    const summary = await harness.sync()
+
+    expect(summary.newMessages).toBe(1)
+    const trashed = await messagesIn(harness, "Trash")
+    expect(trashed).toHaveLength(1)
+    expect(
+      await threadFlagsById(trashed[0]?.thread_id as string)
+    ).toMatchObject({ is_trashed: 1, unread_count: 0 })
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(1)
+
+    // mark_read (spec: blocked mail is marked as read) then the trash move.
+    const ops = await pendingOps()
+    expect(ops.map((op) => op.op_type)).toEqual(["mark_read", "trash"])
+  })
+
+  it("unblocking restores the normal inbox arrival", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    harness.addFolder("Trash", 100, "trash")
+    await blockSender(harness.executor, harness.accountId, {
+      sender: "spam@x.com",
+      action: "trash",
+    })
+    await harness.sync()
+    const [row] = await listBlockedSenders(harness.executor, harness.accountId)
+    await unblockSender(harness.executor, row!.id)
+
+    inbox.insert({
+      flags: [],
+      messageId: "<s1@x>",
+      subject: "Hello again",
+      fromEmail: "spam@x.com",
+      date: 1000,
+    })
+
+    const summary = await harness.sync()
+
+    // The spec's Unblock scenario: after removal the sender's mail arrives
+    // normally — unread, in the inbox, nothing queued against it.
+    expect(summary.newMessages).toBe(1)
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(1)
+    expect(await messagesIn(harness, "Trash")).toHaveLength(0)
+    expect(await pendingOps()).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Local junk filter (task 18.10, design D19): the engine preloads the
+// per-account config once per folder pass and the hook's auto-move files
+// high-confidence mail into the spam-role folder, unannounced.
+// ---------------------------------------------------------------------------
+
+describe("imap sync junk filter", () => {
+  let harness: TestHarness
+
+  beforeEach(async () => {
+    harness = await createHarness()
+  })
+
+  afterEach(() => {
+    harness.executor.close()
+  })
+
+  async function pendingOps(): Promise<
+    { op_type: string; payload_json: string }[]
+  > {
+    return harness.executor.select(
+      `SELECT op_type, payload_json FROM pending_operations
+       WHERE account_id = $1 ORDER BY seq ASC`,
+      [harness.accountId]
+    )
+  }
+
+  async function threadFlags(threadId: string) {
+    const rows = await harness.executor.select<{ is_spam: number }>(
+      "SELECT is_spam FROM threads WHERE id = $1",
+      [threadId]
+    )
+    return rows[0]
+  }
+
+  const SPAM_BODY = "buy cheap pills now winner"
+
+  it("auto-moves trained high-confidence mail to Junk and never announces it", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    harness.addFolder("Junk", 200, "spam")
+    // Train through the REAL store until the D19 sample gate is met, and
+    // flip the per-account toggle on.
+    for (let i = 0; i < 50; i += 1) {
+      await trainJunkDocument(
+        harness.executor,
+        harness.accountId,
+        SPAM_BODY,
+        true
+      )
+    }
+    await setJunkFilterEnabledPreference(
+      harness.executor,
+      harness.accountId,
+      true
+    )
+    // Seed the cursors first: a folder's first sync never announces.
+    await harness.sync()
+
+    inbox.insert({
+      flags: [],
+      messageId: "<j1@x>",
+      subject: "Claim your prize",
+      fromEmail: "winner@lottery.example",
+      date: 1000,
+      textBody: SPAM_BODY,
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<k1@x>",
+      subject: "Notes",
+      fromEmail: "peer@x.com",
+      date: 2000,
+      textBody: "meeting notes from the project review",
+    })
+
+    const summary = await harness.sync()
+
+    // Only the delivered-normally message reaches the announcement count.
+    expect(summary.newMessages).toBe(1)
+    const junked = await messagesIn(harness, "Junk")
+    expect(junked).toHaveLength(1)
+    expect(await threadFlags(junked[0]?.thread_id as string)).toMatchObject({
+      is_spam: 1,
+    })
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(1)
+
+    // The auto-move is the markSpam placement MINUS training (D19): one
+    // move op, and the token store is exactly as the training left it.
+    const ops = await pendingOps()
+    expect(ops.map((op) => op.op_type)).toEqual(["move"])
+    expect(JSON.parse(ops[0]?.payload_json ?? "{}")).toMatchObject({
+      destinationFolder: "Junk",
+      refs: [{ folder: "INBOX", uid: 1 }],
+    })
+  })
+
+  it("with the toggle off the same mail delivers normally", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    harness.addFolder("Junk", 200, "spam")
+    for (let i = 0; i < 50; i += 1) {
+      await trainJunkDocument(
+        harness.executor,
+        harness.accountId,
+        SPAM_BODY,
+        true
+      )
+    }
+    // No setJunkFilterEnabledPreference — the default-off account.
+    await harness.sync()
+
+    inbox.insert({
+      flags: [],
+      messageId: "<j1@x>",
+      subject: "Claim your prize",
+      fromEmail: "winner@lottery.example",
+      date: 1000,
+      textBody: SPAM_BODY,
+    })
+
+    const summary = await harness.sync()
+
+    expect(summary.newMessages).toBe(1)
+    expect(await messagesIn(harness, "INBOX")).toHaveLength(1)
+    expect(await messagesIn(harness, "Junk")).toHaveLength(0)
+    expect(await pendingOps()).toEqual([])
   })
 })

@@ -12,6 +12,7 @@ function resetStore(): void {
     activeThread: null,
     readingPane: "right",
     previousView: DEFAULT_VIEW,
+    listScope: null,
   })
 }
 
@@ -126,5 +127,51 @@ describe("ui store search/clear-to-previous (task 9.2)", () => {
     useUiStore.getState().setView(search("first thing"))
     useUiStore.getState().clearSearch()
     expect(useUiStore.getState().view).toEqual(DEFAULT_VIEW)
+  })
+})
+
+describe("ui store list-scope override (task 9.1)", () => {
+  it("enters and leaves a query-backed scope without changing the view", () => {
+    expect(useUiStore.getState().listScope).toBeNull()
+    useUiStore.getState().setListScope({ kind: "unified" })
+    expect(useUiStore.getState().listScope).toEqual({ kind: "unified" })
+    // The underlying view selection stays put (the folder the scope was
+    // entered from) — the override rides beside it.
+    expect(useUiStore.getState().view).toEqual(DEFAULT_VIEW)
+    useUiStore.getState().setListScope({
+      kind: "split",
+      name: "Unread",
+      query: "is:unread",
+      accountId: "acc-1",
+    })
+    expect(useUiStore.getState().listScope).toEqual({
+      kind: "split",
+      name: "Unread",
+      query: "is:unread",
+      accountId: "acc-1",
+    })
+    useUiStore.getState().setListScope(null)
+    expect(useUiStore.getState().listScope).toBeNull()
+  })
+
+  it("any setView clears the override", () => {
+    useUiStore.getState().setListScope({ kind: "unified" })
+    useUiStore.getState().setView({ kind: "settings" })
+    expect(useUiStore.getState().listScope).toBeNull()
+
+    useUiStore.getState().setListScope({
+      kind: "saved-search",
+      name: "Receipts",
+      query: "receipt",
+    })
+    useUiStore.getState().setView({
+      kind: "folder",
+      folder: { kind: "specialUse", specialUse: "sent" },
+    })
+    expect(useUiStore.getState().listScope).toBeNull()
+    expect(useUiStore.getState().view).toEqual({
+      kind: "folder",
+      folder: { kind: "specialUse", specialUse: "sent" },
+    })
   })
 })

@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
-import { listPendingOperations } from "../../db/pending-operations"
+import {
+  listPendingOperations,
+  markOperationProcessing,
+  type PendingOperationRow,
+} from "../../db/pending-operations"
 import type { MessageRef } from "../../email/types"
 import { createAccount } from "../../db/__tests__/fixtures"
 import {
@@ -14,6 +18,8 @@ import {
   enqueueCreateLabel,
   enqueueDeleteForever,
   enqueueDeleteLabel,
+  enqueueDraftDelete,
+  enqueueDraftUpsert,
   enqueueMarkRead,
   enqueueMarkUnread,
   enqueueMove,
@@ -97,6 +103,29 @@ describe("queue operation model", () => {
       accountId: "acc-1",
       kind: "delete_folder",
       folderName: "Receipts/2026",
+    },
+    // Draft mirroring (task 17.x, design D9)
+    {
+      accountId: "acc-1",
+      kind: "draft_upsert",
+      draftId: "draft-row-1",
+      mime: "From: me@example.com\r\nSubject: Hi\r\n\r\nbody",
+    },
+    {
+      accountId: "acc-1",
+      kind: "draft_delete",
+      ref: { provider: "gmail", draftId: "draft-9" },
+    },
+    {
+      accountId: "acc-1",
+      kind: "draft_delete",
+      ref: { provider: "imap", folder: "Drafts", uid: 44 },
+    },
+    // One-click unsubscribe (task 18.3, design D13)
+    {
+      accountId: "acc-1",
+      kind: "unsubscribe_post",
+      url: "https://lists.example.com/u/123?token=abc",
     },
   ]
 
@@ -285,5 +314,129 @@ describe("typed enqueue helpers", () => {
       kind: "create_folder",
       folderName: "Receipts",
     })
+  })
+
+  it("queues draft-mirror ops with their payload (task 17.x)", async () => {
+    await enqueueDraftUpsert(executor, {
+      accountId,
+      draftId: "draft-row-1",
+      mime: "From: me@example.com\r\n\r\nbody",
+    })
+    await enqueueDraftDelete(executor, {
+      accountId,
+      ref: { provider: "imap", folder: "Drafts", uid: 44 },
+    })
+
+    const rows = await listPendingOperations(executor, accountId)
+    expect(rows.map((row) => row.op_type)).toEqual([
+      "draft_upsert",
+      "draft_delete",
+    ])
+    // The MIME rides payload_json verbatim (frozen at enqueue time).
+    expect(JSON.parse(rows[0].payload_json)).toEqual({
+      draftId: "draft-row-1",
+      mime: "From: me@example.com\r\n\r\nbody",
+    })
+    expect(await getQueuedOperation(executor, rows[0].id)).toEqual({
+      accountId,
+      kind: "draft_upsert",
+      draftId: "draft-row-1",
+      mime: "From: me@example.com\r\n\r\nbody",
+    })
+    expect(await getQueuedOperation(executor, rows[1].id)).toEqual({
+      accountId,
+      kind: "draft_delete",
+      ref: { provider: "imap", folder: "Drafts", uid: 44 },
+    })
+  })
+
+  it("coalesces superseded pending draft_upserts to the last one per draft", async () => {
+    // A long offline session: three debounced autosaves of one draft…
+    await enqueueDraftUpsert(executor, {
+      accountId,
+      draftId: "draft-1",
+      mime: "v1",
+    })
+    await enqueueDraftUpsert(executor, {
+      accountId,
+      draftId: "draft-1",
+      mime: "v2",
+    })
+    const lastId = await enqueueDraftUpsert(executor, {
+      accountId,
+      draftId: "draft-1",
+      mime: "v3",
+    })
+    // …plus traffic that must survive: another draft of the same account,
+    // and the SAME draftId under ANOTHER account.
+    await enqueueDraftUpsert(executor, {
+      accountId,
+      draftId: "draft-2",
+      mime: "other draft",
+    })
+    const otherAccountId = await createAccount(executor, "gmail")
+    await enqueueDraftUpsert(executor, {
+      accountId: otherAccountId,
+      draftId: "draft-1",
+      mime: "other account",
+    })
+
+    const upserts = (await listPendingOperations(executor)).filter(
+      (row) => row.op_type === "draft_upsert"
+    )
+    // One pending op per (account, draft): the last payload, in FIFO seq
+    // order; the other draft's and the other account's ops are untouched.
+    expect(
+      upserts.map((row) => ({
+        id: row.id,
+        accountId: row.account_id,
+        payload: JSON.parse(row.payload_json),
+      }))
+    ).toEqual([
+      {
+        id: lastId,
+        accountId,
+        payload: { draftId: "draft-1", mime: "v3" },
+      },
+      {
+        id: expect.any(String),
+        accountId,
+        payload: { draftId: "draft-2", mime: "other draft" },
+      },
+      {
+        id: expect.any(String),
+        accountId: otherAccountId,
+        payload: { draftId: "draft-1", mime: "other account" },
+      },
+    ])
+  })
+
+  it("coalescing never touches processing or done draft_upsert rows", async () => {
+    const firstId = await enqueueDraftUpsert(executor, {
+      accountId,
+      draftId: "draft-1",
+      mime: "v1",
+    })
+    // The first mirror op was picked up (or applied) — it is no longer
+    // pending, so the next autosave's coalescing must leave it alone.
+    await markOperationProcessing(executor, firstId)
+    await enqueueDraftUpsert(executor, {
+      accountId,
+      draftId: "draft-1",
+      mime: "v2",
+    })
+
+    const rows = await executor.select<
+      Pick<PendingOperationRow, "op_type" | "status" | "payload_json">
+    >(
+      "SELECT op_type, status, payload_json FROM pending_operations WHERE account_id = $1 ORDER BY seq",
+      [accountId]
+    )
+    expect(
+      rows.map((row) => [row.op_type, row.status, JSON.parse(row.payload_json)])
+    ).toEqual([
+      ["draft_upsert", "processing", { draftId: "draft-1", mime: "v1" }],
+      ["draft_upsert", "pending", { draftId: "draft-1", mime: "v2" }],
+    ])
   })
 })

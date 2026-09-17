@@ -1,9 +1,10 @@
 import type { SqlExecutor } from "./executor"
 import { placeholders } from "./executor"
-import type { LabelRow, SpecialUse } from "./labels"
-import { findLabelsBySpecialUse } from "./labels"
+import type { SpecialUse } from "./labels"
 import type { ContactRef, MessageRow } from "./messages"
 import { parseContacts } from "./messages"
+import type { ThreadSortOption } from "./thread-sort"
+import { threadSortOrderClause } from "./thread-sort"
 
 export interface ThreadInput {
   id: string
@@ -35,6 +36,22 @@ export interface ThreadRow {
    * cache added in migration v2, maintained by recomputeThreadCaches.
    */
   participants: string | null
+  /**
+   * Thread-state columns added by migration v3 (D1/D6): snooze wake-up
+   * time, mute/pin/done markers, the local-only note, and the delivery
+   * hold/release pair. NULL means the state is inactive. Optional in the
+   * type because hand-built rows (tests) may predate the columns; rows
+   * read from the database always carry them.
+   */
+  snoozed_until?: number | null
+  muted_at?: number | null
+  pinned_at?: number | null
+  done_at?: number | null
+  note?: string | null
+  /** Delivery-schedule hold (D6): inbox queries hide the thread until this passes. */
+  held_until?: number | null
+  /** Set when a hold releases / a snooze wakes, topping the inbox ordering. */
+  delivered_at?: number | null
   gmail_thread_id: string | null
   folder_label_id: string | null
   is_archived: number
@@ -103,6 +120,26 @@ export async function getThread(
     [threadId]
   )
   return rows[0] ?? null
+}
+
+/**
+ * True when the thread is muted (muted_at set). The sync engines call
+ * this as their new-mail notification gate (mail-organization spec: mail
+ * landing in a muted thread must not reach the OS notification): a newly
+ * inserted message in a muted thread is stored normally but not counted
+ * in the engine summary's newMessages, which is what the scheduler
+ * forwards to notifyNewMail. The ingestion hook (services/rules/ingestion.ts)
+ * consults this as one input to its notification suppression.
+ */
+export async function isThreadMuted(
+  executor: SqlExecutor,
+  threadId: string
+): Promise<boolean> {
+  const rows = await executor.select<Pick<ThreadRow, "id">>(
+    "SELECT id FROM threads WHERE id = $1 AND muted_at IS NOT NULL",
+    [threadId]
+  )
+  return rows.length > 0
 }
 
 /**
@@ -311,11 +348,22 @@ export async function setThreadStarred(
  * Mailbox folder selectors. "labelId" / "specialUse" resolve through both
  * membership models — gmail threads via thread_labels, imap threads via
  * threads.folder_label_id — so one predicate serves both account types.
- * Presets:
+ * The specialUse "inbox" composes the SAME exclusions the preset applies
+ * (trash/spam plus the inbox-only states below), so the sidebar role list
+ * and the preset inbox never disagree; other specialUse roles stay raw
+ * folder membership. Presets:
  * - "inbox": canonical membership in the account's inbox-role label(s),
  *   excluding trash and spam. For gmail this equals the is_archived = 0
  *   cache; going through membership also keeps imap threads filed in
  *   custom folders (which leave is_archived = 0) out of the inbox.
+ *   Snoozed threads (snoozed_until set) are excluded here and from the
+ *   inbox badge, and the inbox orders by COALESCE(delivered_at,
+ *   last_message_at) so woken threads return at the top (see
+ *   email-actions/snooze.ts). Muted (muted_at), Done (done_at) and
+ *   delivery-HELD (held_until — task 12.1, released by the due pass in
+ *   email-actions/holds.ts) threads join the same inbox-only exclusions
+ *   (see email-actions/thread-states.ts), and every selection orders
+ *   pinned-first (pinned_at).
  * - "archive": the is_archived cache (gmail absent-inbox or imap
  *   archive-role folder), excluding trash and spam.
  * - "trash" / "spam": the respective cache flag.
@@ -334,6 +382,9 @@ export interface ListThreadsOptions {
   accountId: string
   folder: FolderSelection
   limit?: number
+  /** Trailing sort after the pinned-first lead (task 4.1). Default: the
+   * historical date-desc order. */
+  sort?: ThreadSortOption
 }
 
 const PRESET_PREDICATES: Record<Exclude<FolderPreset, "inbox">, string> = {
@@ -361,52 +412,187 @@ function membershipPredicate(params: unknown[], labelIds: string[]): string {
   ))`
 }
 
-export async function listThreadsByFolder(
+/**
+ * Label ids carrying `specialUse`, restricted to `accountIds` (null/empty
+ * = every account). Replaces the per-account findLabelsBySpecialUse lookup
+ * so the across-accounts list (task 9.1) resolves one account's inbox-role
+ * labels — or the whole set's — in a single query.
+ */
+async function findSpecialUseLabelIds(
   executor: SqlExecutor,
-  options: ListThreadsOptions
-): Promise<ThreadRow[]> {
-  const { accountId, folder } = options
-  const params: unknown[] = [accountId]
-  let predicate: string
+  specialUse: SpecialUse,
+  accountIds: string[] | null
+): Promise<string[]> {
+  const scoped = accountIds !== null && accountIds.length > 0
+  const rows = await executor.select<{ id: string }>(
+    scoped
+      ? `SELECT id FROM labels WHERE special_use = $1 AND account_id IN (${placeholders(
+          accountIds.length,
+          2
+        )})`
+      : "SELECT id FROM labels WHERE special_use = $1",
+    scoped ? [specialUse, ...accountIds] : [specialUse]
+  )
+  return rows.map((row) => row.id)
+}
 
+/**
+ * The folder-list query builder behind listThreadsByFolder (one account)
+ * and listThreadsAcrossAccounts (an account set, or every account) — one
+ * predicate implementation so the unified inbox (design D4) is literally
+ * the same query minus the account filter.
+ *
+ * `accountIds`: the account restriction rendered as
+ * `threads.account_id IN ($1…$n)`; null or [] = no account filter at all.
+ * Returns null when the selection cannot match anything (a specialUse
+ * role with no labels in scope) — callers surface that as [].
+ */
+async function buildFolderListQuery(
+  executor: SqlExecutor,
+  accountIds: string[] | null,
+  folder: FolderSelection,
+  sort: ThreadSortOption | undefined,
+  limit: number | undefined
+): Promise<{ sql: string; params: unknown[] } | null> {
+  const params: unknown[] = []
+  const where: string[] = []
+  if (accountIds !== null && accountIds.length > 0) {
+    where.push(`threads.account_id IN (${placeholders(accountIds.length)})`)
+    params.push(...accountIds)
+  }
+
+  // The inbox — via either selector — hides snoozed threads. This
+  // predicate is how a wake "restores the prior unread state" without any
+  // read-state mutation: snooze never touches unread_count, the snoozed
+  // rows are simply filtered out here (and from the inbox badge / total
+  // unread counts), so clearing snoozed_until brings the thread back
+  // exactly as unread/read as it was. Snooze deliberately does NOT affect
+  // the label/specialUse/all selectors or search — snoozed mail stays
+  // visible in its labels, All Mail and search results.
+  //
+  // Mute and Done (email-actions/thread-states.ts) join the same
+  // inbox-only pattern: muted and Done threads leave the inbox list (Done
+  // like archive, but without setting is_archived) while staying visible
+  // in their labels, All Mail and search. Unmute/un-done therefore just
+  // clears the column and the thread re-enters the inbox unchanged. Both
+  // exclusions are inbox-only, like the snooze one.
+  //
+  // Delivery holds (threads.held_until, task 12.1, design D6) complete the
+  // set: a delivery schedule holds matching mail OUT of the inbox until
+  // its recurring window opens. The predicate is the STRICT
+  // `held_until IS NULL` (not `<= now`): only the due pass
+  // (email-actions/holds.ts releaseDueHolds) releases a hold, clearing the
+  // column and stamping delivered_at in the same UPDATE so the whole
+  // window's batch re-enters at the TOP of the inbox (the COALESCE
+  // ordering below). Held threads stay visible in their labels, All Mail
+  // and search — inbox-only, like snooze/mute/Done.
+  const isInbox =
+    (folder.kind === "preset" && folder.preset === "inbox") ||
+    (folder.kind === "specialUse" && folder.specialUse === "inbox")
+  // Both inbox selectors share the trash/spam exclusion: gmail local trash
+  // (applyTrash → addSpecialLabel) keeps the thread's INBOX membership, so
+  // without it a locally trashed/spammed thread would stay in the
+  // specialUse inbox list while the preset (and the badge) exclude it.
+  const inboxExclusions = isInbox
+    ? " AND threads.is_trashed = 0 AND threads.is_spam = 0" +
+      " AND threads.snoozed_until IS NULL AND threads.muted_at IS NULL" +
+      " AND threads.done_at IS NULL AND threads.held_until IS NULL"
+    : ""
+
+  let predicate: string
   if (folder.kind === "labelId") {
     // bound twice below via membershipPredicate (distinct placeholders)
     predicate = membershipPredicate(params, [folder.labelId])
   } else if (folder.kind === "specialUse") {
-    const labels = await findLabelsBySpecialUse(
+    const labelIds = await findSpecialUseLabelIds(
       executor,
-      accountId,
-      folder.specialUse
+      folder.specialUse,
+      accountIds
     )
-    if (!labels.length) return []
-    predicate = membershipPredicate(
-      params,
-      labels.map((label: LabelRow) => label.id)
-    )
+    if (!labelIds.length) return null
+    predicate = membershipPredicate(params, labelIds) + inboxExclusions
   } else if (folder.preset === "inbox") {
-    const inboxLabels = await findLabelsBySpecialUse(
+    const inboxLabelIds = await findSpecialUseLabelIds(
       executor,
-      accountId,
-      "inbox"
+      "inbox",
+      accountIds
     )
-    if (!inboxLabels.length) return []
-    predicate = `${membershipPredicate(
-      params,
-      inboxLabels.map((label: LabelRow) => label.id)
-    )} AND threads.is_trashed = 0 AND threads.is_spam = 0`
+    if (!inboxLabelIds.length) return null
+    predicate = membershipPredicate(params, inboxLabelIds) + inboxExclusions
   } else {
     predicate = PRESET_PREDICATES[folder.preset]
   }
+  where.push(predicate)
 
-  const limitClause = options.limit ? ` LIMIT $${params.length + 1}` : ""
-  if (options.limit) params.push(options.limit)
+  const limitClause = limit ? ` LIMIT $${params.length + 1}` : ""
+  if (limit) params.push(limit)
 
-  return executor.select<ThreadRow>(
-    `SELECT threads.* FROM threads
-     WHERE threads.account_id = $1 AND ${predicate}
-     ORDER BY threads.last_message_at DESC${limitClause}`,
-    params
+  // Pinned-first on EVERY folder selection and EVERY sort option
+  // (mail-organization spec: a pinned thread stays at the top of its view
+  // regardless of sort). The pinned term only leads the ordering — the
+  // trailing sort comes from the closed set in thread-sort.ts. The inbox
+  // keeps its delivered_at COALESCE as the date term (delivered_at stamped
+  // when a snooze wakes or a delivery hold releases, so woken threads
+  // reappear first within their pinned group — even under date_asc, which
+  // flips that same COALESCE to ASC); other folders use last_message_at.
+  const orderClause = threadSortOrderClause(sort ?? "date_desc", {
+    inboxDateTerm: isInbox,
+  })
+
+  return {
+    sql: `SELECT threads.* FROM threads
+     WHERE ${where.join(" AND ")}
+     ORDER BY ${orderClause}${limitClause}`,
+    params,
+  }
+}
+
+export async function listThreadsByFolder(
+  executor: SqlExecutor,
+  options: ListThreadsOptions
+): Promise<ThreadRow[]> {
+  const query = await buildFolderListQuery(
+    executor,
+    [options.accountId],
+    options.folder,
+    options.sort,
+    options.limit
   )
+  if (!query) return []
+  return executor.select<ThreadRow>(query.sql, query.params)
+}
+
+/**
+ * Across-accounts folder list (task 9.1, design D4): the SAME predicates,
+ * exclusions and ordering as listThreadsByFolder, but the account filter
+ * becomes an explicit id set — or disappears entirely when `accountIds` is
+ * omitted/empty, which means "every account" (the caller decides what set
+ * that is; the thread-list store passes its active accounts). Rows keep
+ * `threads.*`, so each carries its `account_id` — the per-row account
+ * identity the unified view's UI consumes (task 9.2). Drafts stay
+ * per-account: nothing here lists composer drafts.
+ */
+export interface ListThreadsAcrossAccountsOptions {
+  /** Restrict to these accounts; omitted/empty = no account filter. */
+  accountIds?: string[]
+  folder: FolderSelection
+  limit?: number
+  sort?: ThreadSortOption
+}
+
+export async function listThreadsAcrossAccounts(
+  executor: SqlExecutor,
+  options: ListThreadsAcrossAccountsOptions
+): Promise<ThreadRow[]> {
+  const query = await buildFolderListQuery(
+    executor,
+    options.accountIds ?? null,
+    options.folder,
+    options.sort,
+    options.limit
+  )
+  if (!query) return []
+  return executor.select<ThreadRow>(query.sql, query.params)
 }
 
 export interface ThreadWithMessages {

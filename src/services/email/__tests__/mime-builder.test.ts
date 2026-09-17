@@ -1,14 +1,45 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import {
+  base64ToBytes,
   buildMimeMessage,
+  buildMimeMessagePgp,
+  bytesToBase64,
+  decomposeMimeMessage,
   encodeHeaderValue,
   formatAddress,
   htmlToText,
   isAscii,
   stringToBase64Url,
+  type BuiltMime,
 } from "../mime-builder"
 import type { SendEmailInput } from "../types"
+
+// The PGP transforms are mocked here: this file pins the PLUMBING (what
+// buildMimeMessagePgp passes through and returns, and that the plain
+// build stays byte-identical); the real RFC 3156 crypto round-trips run
+// in crypto/__tests__/pgp-transform.test.ts (node env — openpgp cannot
+// initialize under jsdom).
+vi.mock("../../crypto/pgp-transform", () => ({
+  signMime: vi.fn(async ({ built }: { built: BuiltMime }) => ({
+    mime: `SIGNED:${built.mime}`,
+    messageId: built.messageId,
+  })),
+  encryptMime: vi.fn(async ({ built }: { built: BuiltMime }) => ({
+    mime: `ENCRYPTED:${built.mime}`,
+    messageId: built.messageId,
+  })),
+  signAndEncryptMime: vi.fn(async ({ built }: { built: BuiltMime }) => ({
+    mime: `SIGN+ENCRYPTED:${built.mime}`,
+    messageId: built.messageId,
+  })),
+}))
+
+import {
+  encryptMime,
+  signAndEncryptMime,
+  signMime,
+} from "../../crypto/pgp-transform"
 
 function baseInput(overrides: Partial<SendEmailInput> = {}): SendEmailInput {
   return {
@@ -216,6 +247,114 @@ describe("buildMimeMessage", () => {
   })
 })
 
+describe("buildMimeMessagePgp (task 18.5, design D11)", () => {
+  /** A stand-in for the decrypted private key — the plumbing test only
+   * checks the value is passed through to the transform untouched. */
+  const signingKey = { isDecrypted: () => true } as never
+
+  it("routes mode:'sign' to signMime with the built message and key", async () => {
+    const input = baseInput({ messageId: "<pgp-sign@gmail.com>" })
+    const built = await buildMimeMessagePgp(input, {
+      mode: "sign",
+      signingKey,
+    })
+
+    expect(signMime).toHaveBeenCalledTimes(1)
+    const args = vi.mocked(signMime).mock.calls[0][0]
+    // The transform receives the plain build of the SAME input (its random
+    // boundary is generated inside buildMimeMessage, so the shape is what
+    // is pinned here, not the exact boundary value).
+    expect(args.built.messageId).toBe("<pgp-sign@gmail.com>")
+    expect(args.built.mime).toContain(
+      "Content-Type: multipart/alternative; boundary="
+    )
+    expect(args.signingKey).toBe(signingKey)
+    expect(built).toEqual({
+      mime: `SIGNED:${args.built.mime}`,
+      messageId: "<pgp-sign@gmail.com>",
+    })
+  })
+
+  it("routes mode:'encrypt' to encryptMime with the armors", async () => {
+    const input = baseInput()
+    const built = await buildMimeMessagePgp(input, {
+      mode: "encrypt",
+      encryptionArmors: ["armor-1", "armor-2"],
+    })
+
+    const args = vi.mocked(encryptMime).mock.calls[0][0]
+    expect(args.encryptionArmors).toEqual(["armor-1", "armor-2"])
+    expect(built).toEqual({
+      mime: `ENCRYPTED:${args.built.mime}`,
+      messageId: args.built.messageId,
+    })
+  })
+
+  it("routes mode:'sign+encrypt' to signAndEncryptMime", async () => {
+    const input = baseInput()
+    await buildMimeMessagePgp(input, {
+      mode: "sign+encrypt",
+      signingKey,
+      encryptionArmors: ["armor-1"],
+    })
+
+    const args = vi.mocked(signAndEncryptMime).mock.calls[0][0]
+    expect(args.signingKey).toBe(signingKey)
+    expect(args.encryptionArmors).toEqual(["armor-1"])
+  })
+
+  it("leaves the non-PGP path untouched (plain builds never route here)", () => {
+    // The plain builder stays sync and byte-identical; no transform runs.
+    const built = buildMimeMessage(baseInput())
+    expect(built.mime).not.toMatch(/SIGNED:|ENCRYPTED:/)
+    expect(signMime).not.toHaveBeenCalled()
+    expect(encryptMime).not.toHaveBeenCalled()
+    expect(signAndEncryptMime).not.toHaveBeenCalled()
+  })
+})
+
+describe("buildMimeMessage From alias (task 16.2, design D10)", () => {
+  it("the From header carries the alias while the envelope identity stays in input.from", () => {
+    const built = buildMimeMessage(
+      baseInput({
+        from: { name: "Primary", email: "primary@gmail.com" },
+        fromAlias: { name: "Work Alias", email: "work@example.com" },
+        messageId: "<alias-test@gmail.com>",
+      })
+    )
+
+    // Header = alias (send-as).
+    expect(built.mime).toMatch(/^From: Work Alias <work@example\.com>\r\n/)
+    // The primary address must NOT appear anywhere in the message — the
+    // envelope is carried by the transport (the API user), not a header.
+    expect(built.mime).not.toContain("primary@gmail.com")
+    // Everything else is built exactly as without the alias.
+    expect(built.mime).toContain("To: Ada <ada@example.com>\r\n")
+    expect(built.mime).toContain("Subject: Hello\r\n")
+  })
+
+  it("an alias without a display name emits the bare address", () => {
+    const built = buildMimeMessage(
+      baseInput({ fromAlias: { email: "bare@example.com" } })
+    )
+    expect(built.mime).toMatch(/^From: bare@example\.com\r\n/)
+  })
+
+  it("a non-ASCII alias display name is RFC 2047 encoded", () => {
+    const built = buildMimeMessage(
+      baseInput({
+        fromAlias: { name: "Ünïcode Älias", email: "u@example.com" },
+      })
+    )
+    expect(built.mime).toMatch(/^From: =\?UTF-8\?B\?[^?]+\?= <u@example\.com>/)
+  })
+
+  it("without fromAlias the From header is the account identity (unchanged behavior)", () => {
+    const built = buildMimeMessage(baseInput())
+    expect(built.mime).toMatch(/^From: Me User <me@gmail\.com>\r\n/)
+  })
+})
+
 describe("htmlToText", () => {
   it("drops tags, breaks on block elements, decodes entities", () => {
     expect(htmlToText("<style>p{}</style><p>Hi</p>Bye&nbsp;!")).toBe(
@@ -362,5 +501,139 @@ describe("buildMimeMessage attachments (task 8.5)", () => {
         .join("")
     )
     expect(words.filter(Boolean)).toEqual(["résumé.txt", "résumé.txt"])
+  })
+})
+
+describe("decomposeMimeMessage (task 10.3 edit round-trip)", () => {
+  const attachmentB64 = btoa(String.fromCharCode(1, 2, 3))
+
+  function inputWith(
+    attachments: NonNullable<SendEmailInput["attachments"]>,
+    overrides: Partial<SendEmailInput> = {}
+  ): SendEmailInput {
+    return baseInput({ attachments, ...overrides })
+  }
+
+  it("recovers recipients, subject and HTML body from a built message", () => {
+    const built = buildMimeMessage(
+      baseInput({
+        to: [{ name: "Ada Lovelace", email: "ada@example.com" }],
+        cc: [{ email: "cc@example.com" }],
+        bcc: [{ email: "bcc@example.com" }],
+        subject: "Quarterly report",
+        htmlBody: "<p>Body <strong>here</strong></p>",
+      })
+    )
+
+    const decomposed = decomposeMimeMessage(built.mime)
+    expect(decomposed.to).toEqual([
+      { name: "Ada Lovelace", email: "ada@example.com" },
+    ])
+    expect(decomposed.cc).toEqual([{ email: "cc@example.com" }])
+    expect(decomposed.bcc).toEqual([{ email: "bcc@example.com" }])
+    expect(decomposed.subject).toBe("Quarterly report")
+    expect(decomposed.htmlBody).toBe("<p>Body <strong>here</strong></p>")
+    expect(decomposed.attachments).toEqual([])
+  })
+
+  it("recovers attachments (filename, type, content) and non-ASCII headers", () => {
+    const built = buildMimeMessage(
+      inputWith(
+        [
+          {
+            filename: "notes.txt",
+            mimeType: "text/plain",
+            contentBase64: attachmentB64,
+          },
+        ],
+        {
+          htmlBody: "<p>attached</p>",
+          subject: "Créé: résumé",
+          to: [{ name: "Zoë", email: "zoe@example.com" }],
+        }
+      )
+    )
+
+    const decomposed = decomposeMimeMessage(built.mime)
+    expect(decomposed.attachments).toEqual([
+      {
+        filename: "notes.txt",
+        mimeType: "text/plain",
+        contentBase64: attachmentB64,
+      },
+    ])
+    expect(decomposed.htmlBody).toBe("<p>attached</p>")
+    // RFC 2047 encoded-words decode back to the original text.
+    expect(decomposed.subject).toBe("Créé: résumé")
+    expect(decomposed.to).toEqual([{ name: "Zoë", email: "zoe@example.com" }])
+  })
+
+  it("survives a message without an HTML part (text-only body)", () => {
+    const built = buildMimeMessage(baseInput({ htmlBody: undefined }))
+    const decomposed = decomposeMimeMessage(built.mime)
+    expect(decomposed.htmlBody).toBeNull()
+    // The text/plain part is the textBody (shared contract with
+    // processor.ts's SMTP-fallback rebuild).
+    expect(decomposed.textBody).toBe("plain text")
+    expect(decomposed.subject).toBe("Hello")
+  })
+
+  it("recovers both alternative parts (textBody alongside htmlBody)", () => {
+    const built = buildMimeMessage(
+      baseInput({ htmlBody: "<p>Rich body</p>", textBody: "Rich body" })
+    )
+    const decomposed = decomposeMimeMessage(built.mime)
+    expect(decomposed.textBody).toBe("Rich body")
+    expect(decomposed.htmlBody).toBe("<p>Rich body</p>")
+  })
+
+  it("a chunked (long CJK) subject round-trips byte-exact", () => {
+    // 40 CJK characters = 120 UTF-8 bytes; the 30-byte encoded-word cap
+    // forces multiple chunks joined with CRLF + space.
+    const subject = "件".repeat(40)
+    const built = buildMimeMessage(baseInput({ subject }))
+    // Sanity: the header really is chunked (several encoded-words).
+    expect(built.mime.match(/=\?UTF-8\?B\?/g)?.length).toBeGreaterThan(1)
+
+    // Unfolding joins the chunks with spaces; the whitespace between
+    // adjacent encoded-words must vanish (RFC 2047 §6.2) or the decoded
+    // subject would carry spurious spaces mid-word.
+    const decomposed = decomposeMimeMessage(built.mime)
+    expect(decomposed.subject).toBe(subject)
+  })
+
+  it("a text/html part with Content-Disposition: attachment stays an attachment", () => {
+    const htmlAttachmentB64 = btoa("<html><body>file body</body></html>")
+    const built = buildMimeMessage(
+      inputWith(
+        [
+          {
+            filename: "notes.html",
+            mimeType: "text/html",
+            contentBase64: htmlAttachmentB64,
+          },
+        ],
+        { htmlBody: "<p>Body stays</p>" }
+      )
+    )
+
+    const decomposed = decomposeMimeMessage(built.mime)
+    // The disposition classifies FIRST: an html-typed attachment must not
+    // clobber htmlBody nor disappear from the attachment list.
+    expect(decomposed.htmlBody).toBe("<p>Body stays</p>")
+    expect(decomposed.attachments).toEqual([
+      {
+        filename: "notes.html",
+        mimeType: "text/html",
+        contentBase64: htmlAttachmentB64,
+      },
+    ])
+  })
+
+  it("base64ToBytes is the bytesToBase64 inverse", () => {
+    const bytes = new Uint8Array([0, 1, 2, 250, 251, 255])
+    expect(Array.from(base64ToBytes(bytesToBase64(bytes)))).toEqual(
+      Array.from(bytes)
+    )
   })
 })

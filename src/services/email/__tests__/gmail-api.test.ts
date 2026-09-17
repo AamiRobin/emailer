@@ -198,4 +198,161 @@ describe("endpoint shapes", () => {
       raw: "raw-b64url",
     })
   })
+
+  it("listSendAs reads users/me/settings/sendAs (task 16.1)", async () => {
+    const mock = createFetchMock()
+    mock.on("GET", /\/settings\/sendAs/, () => ({
+      json: {
+        sendAs: [
+          {
+            sendAsEmail: "me@gmail.com",
+            displayName: "Me",
+            isPrimary: true,
+            isDefault: true,
+          },
+          {
+            sendAsEmail: "work@example.com",
+            displayName: "Work",
+            verificationStatus: "accepted",
+          },
+        ],
+      },
+    }))
+
+    const sendAs = await clientFor(mock).listSendAs()
+
+    expect(mock.calls[0].url).toBe(`${GMAIL_API_ROOT}/settings/sendAs`)
+    expect(mock.calls[0].headers.authorization).toBe("Bearer at-1")
+    expect(sendAs).toHaveLength(2)
+    expect(sendAs[0]).toMatchObject({
+      sendAsEmail: "me@gmail.com",
+      isPrimary: true,
+    })
+    expect(sendAs[1]).toMatchObject({ sendAsEmail: "work@example.com" })
+  })
+
+  it("listSendAs maps an empty response to an empty array", async () => {
+    const mock = createFetchMock()
+    mock.on("GET", /\/settings\/sendAs/, () => ({ json: {} }))
+
+    expect(await clientFor(mock).listSendAs()).toEqual([])
+  })
+
+  it("listSendAs follows nextPageToken until the pages are exhausted", async () => {
+    const mock = createFetchMock()
+    mock.on("GET", /\/settings\/sendAs/, (request) => {
+      if (request.url.includes("pageToken=")) {
+        return {
+          json: {
+            sendAs: [{ sendAsEmail: "b@example.com" }],
+            // No further token — the loop must stop here.
+          },
+        }
+      }
+      return {
+        json: {
+          sendAs: [{ sendAsEmail: "a@example.com" }],
+          nextPageToken: "cursor-2",
+        },
+      }
+    })
+
+    const sendAs = await clientFor(mock).listSendAs()
+
+    expect(sendAs.map((entry) => entry.sendAsEmail)).toEqual([
+      "a@example.com",
+      "b@example.com",
+    ])
+    expect(mock.calls).toHaveLength(2)
+    // The first request stays the bare endpoint; the follow-up carries the
+    // server's token.
+    expect(mock.calls[0].url).toBe(`${GMAIL_API_ROOT}/settings/sendAs`)
+    expect(mock.calls[1].url).toContain("pageToken=cursor-2")
+  })
+
+  // ---- Drafts API (task 17.1, design D9) ----
+
+  it("createDraft posts the draft resource with the raw message", async () => {
+    const mock = createFetchMock()
+    mock.on("POST", /\/drafts$/, () => ({
+      json: { id: "draft-1", message: { id: "msg-1" } },
+    }))
+
+    const draft = await clientFor(mock).createDraft("raw-b64url")
+
+    expect(draft.id).toBe("draft-1")
+    expect(mock.calls[0].method).toBe("POST")
+    expect(mock.calls[0].url).toBe(`${GMAIL_API_ROOT}/drafts`)
+    expect(JSON.parse(mock.calls[0].body ?? "{}")).toEqual({
+      message: { raw: "raw-b64url" },
+    })
+  })
+
+  it("updateDraft PUTs the new message to drafts/{id}", async () => {
+    const mock = createFetchMock()
+    mock.on("PUT", /\/drafts\/draft-9/, () => ({
+      json: { id: "draft-9", message: { id: "msg-9" } },
+    }))
+
+    await clientFor(mock).updateDraft("draft-9", "raw-v2")
+
+    expect(mock.calls[0].method).toBe("PUT")
+    expect(mock.calls[0].url).toBe(`${GMAIL_API_ROOT}/drafts/draft-9`)
+    expect(JSON.parse(mock.calls[0].body ?? "{}")).toEqual({
+      id: "draft-9",
+      message: { raw: "raw-v2" },
+    })
+  })
+
+  it("deleteDraft hits DELETE drafts/{id} and ignores the empty body", async () => {
+    const mock = createFetchMock()
+    mock.on("DELETE", /\/drafts\/draft-9/, () => ({ json: {} }))
+
+    await clientFor(mock).deleteDraft("draft-9")
+
+    expect(mock.calls[0].method).toBe("DELETE")
+    expect(mock.calls[0].url).toBe(`${GMAIL_API_ROOT}/drafts/draft-9`)
+  })
+
+  it("sendDraft posts drafts/send with the draft id", async () => {
+    const mock = createFetchMock()
+    mock.on("POST", /\/drafts\/send/, () => ({ json: { id: "msg-sent" } }))
+
+    const sent = await clientFor(mock).sendDraft("draft-9")
+
+    expect(sent.id).toBe("msg-sent")
+    expect(mock.calls[0].url).toBe(`${GMAIL_API_ROOT}/drafts/send`)
+    expect(JSON.parse(mock.calls[0].body ?? "{}")).toEqual({ id: "draft-9" })
+  })
+
+  it("getDraft defaults to format=full and can request raw", async () => {
+    const mock = createFetchMock()
+    mock.on("GET", /\/drafts\/draft-9/, () => ({
+      json: { id: "draft-9", message: { id: "msg-9", raw: "raw-b64url" } },
+    }))
+
+    const client = clientFor(mock)
+    await client.getDraft("draft-9")
+    const raw = await client.getDraft("draft-9", "raw")
+
+    expect(mock.calls[0].url).toContain("format=full")
+    expect(mock.calls[1].url).toContain("format=raw")
+    expect(raw.message?.raw).toBe("raw-b64url")
+  })
+
+  it("listDrafts passes maxResults and returns the drafts page", async () => {
+    const mock = createFetchMock()
+    mock.on("GET", /\/drafts\?/, () => ({
+      json: {
+        drafts: [{ id: "d-1" }, { id: "d-2" }],
+        resultSizeEstimate: 2,
+      },
+    }))
+
+    const page = await clientFor(mock).listDrafts({ maxResults: 50 })
+
+    expect(mock.calls[0].url).toContain("maxResults=50")
+    expect(page.drafts).toHaveLength(2)
+    expect(page.drafts?.[0].id).toBe("d-1")
+  })
 })

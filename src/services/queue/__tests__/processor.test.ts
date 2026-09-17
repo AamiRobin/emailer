@@ -24,6 +24,13 @@ import type {
 import { GmailApiError } from "../../email/gmail-api"
 import type { LabelAdminService } from "../../labels/label-admin"
 import { useOnlineStore } from "../../../stores/online-store"
+import {
+  cancelScheduledSend,
+  createScheduledSend,
+  getScheduledSend,
+  markScheduledSendSending,
+} from "../../db/scheduled-sends"
+import { buildMimeMessage } from "../../email/mime-builder"
 import { initQueueSystem, shutdownQueueSystem } from "../index"
 import {
   MAX_OPERATION_ATTEMPTS,
@@ -42,14 +49,17 @@ import {
   enqueueNotSpam,
   enqueueRenameFolder,
   enqueueSend,
+  enqueueSendMime,
   enqueueStar,
   enqueueTrash,
+  enqueueUnsubscribePost,
 } from "../operation"
 
 type FakeProvider = EmailProvider & {
   calls: string[]
   /** Re-typed so tests can reprogram the mock without a cast. */
   archive: Mock<(refs: MessageRef[]) => Promise<void>>
+  markStarred: Mock<(refs: MessageRef[], starred: boolean) => Promise<void>>
 }
 
 function createFakeProvider(
@@ -326,6 +336,299 @@ describe("queue processor", () => {
     const result = await processQueue(options())
     expect(result.succeeded).toBe(1)
     expect(provider.calls).toEqual(["removeLabels:7:SPAM", "addLabels:7:INBOX"])
+  })
+
+  it("replays a queued one-click unsubscribe POST (task 18.3, D13)", async () => {
+    useFakeProvider(accountId, "gmail") // built like any batch, unused by the op
+    await enqueueUnsubscribePost(executor, {
+      accountId,
+      url: "https://lists.example.com/u/123",
+    })
+
+    const post = vi.fn(async (url: string) => url)
+    const result = await processQueue({
+      ...options(),
+      unsubscribePostForTest: async (id, op) => {
+        expect(id).toBe(accountId)
+        expect(op.url).toBe("https://lists.example.com/u/123")
+        await post(op.url)
+      },
+    })
+    expect(result.succeeded).toBe(1)
+    expect(result.failed).toBe(0)
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post).toHaveBeenCalledWith("https://lists.example.com/u/123")
+
+    // The op is done and out of the pending list.
+    const rows = await listPendingOperations(executor, accountId)
+    expect(rows).toHaveLength(0)
+  })
+
+  it("retries a failing unsubscribe replay and fails it at the cap", async () => {
+    useFakeProvider(accountId, "gmail")
+    await enqueueUnsubscribePost(executor, {
+      accountId,
+      url: "https://lists.example.com/u/404",
+    })
+
+    for (let attempt = 0; attempt < MAX_OPERATION_ATTEMPTS; attempt += 1) {
+      const result = await processQueue({
+        ...options(),
+        unsubscribePostForTest: async () => {
+          throw new Error("list server exploded")
+        },
+      })
+      if (attempt < MAX_OPERATION_ATTEMPTS - 1) {
+        expect(result.requeued).toBe(1)
+      } else {
+        expect(result.failed).toBe(1)
+      }
+    }
+    const rows = await executor.select<{
+      status: string
+      last_error: string | null
+    }>(
+      "SELECT status, last_error FROM pending_operations WHERE account_id = $1",
+      [accountId]
+    )
+    expect(rows[0]?.status).toBe("failed")
+    expect(rows[0]?.last_error).toContain("list server exploded")
+  })
+
+  it("keeps a scheduled IMAP send's aliased From header (fromAlias)", async () => {
+    const provider = useFakeProvider(imapAccountId, "imap")
+    // The stored payload is frozen at schedule time with the alias the
+    // composer had selected (design D10): the From HEADER carries the
+    // alias while the envelope must stay the account identity.
+    const mime = [
+      "From: Newsletter Alias <alias@sender.example>",
+      `To: reader@example.com`,
+      "Subject: Aliased later",
+      'Content-Type: text/plain; charset="utf-8"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      "SGVsbG8=",
+    ].join("\r\n")
+    await enqueueSendMime(executor, {
+      accountId: imapAccountId,
+      mime,
+      scheduledSendId: "ss-alias-1",
+    })
+
+    const result = await processQueue(options())
+    expect(result.succeeded).toBe(1)
+
+    expect(provider.sendMessage).toHaveBeenCalledTimes(1)
+    const input = vi.mocked(provider.sendMessage).mock.calls[0][0] as {
+      from: { email: string }
+      fromAlias?: { email: string; name?: string }
+      subject: string
+      to: { email: string }[]
+    }
+    // The header identity is the alias; the envelope stays the account.
+    expect(input.fromAlias).toEqual({
+      email: "alias@sender.example",
+      name: "Newsletter Alias",
+    })
+    // The envelope stays the account identity (the fixture account's
+    // address), never the alias.
+    expect(input.from.email).toBe(`${imapAccountId}@example.com`)
+    expect(input.from.email).not.toBe("alias@sender.example")
+    expect(input.subject).toBe("Aliased later")
+    expect(input.to).toEqual([{ email: "reader@example.com" }])
+  })
+
+  // ---- Cancel vs transmission races: a cancelled scheduled send must
+  // never transmit, whether the cancel lands before its claim or after
+  // (while its op sat queued through an offline hold / retry backoff). ----
+
+  it("skips a send_mime op whose row was cancelled before its claim", async () => {
+    const provider = useFakeProvider(imapAccountId, "imap")
+    const rowId = await createScheduledSend(executor, {
+      accountId: imapAccountId,
+      mimePayload: "m",
+      recipients: [{ email: "you@example.com" }],
+      subject: "Later",
+      dueAt: Math.floor(Date.now() / 1000) - 60,
+    })
+    await enqueueSendMime(executor, {
+      accountId: imapAccountId,
+      mime: "m",
+      scheduledSendId: rowId,
+    })
+    // Cancel-before-claim: the guarded transition applies ('scheduled' →
+    // 'cancelled') and reports the applied boolean.
+    expect(await cancelScheduledSend(executor, rowId)).toBe(true)
+
+    const result = await processQueue(options())
+    // The op completes (treated as applied — it must not retry) but
+    // nothing transmits and the row stays honestly 'cancelled'.
+    expect(result.succeeded).toBe(1)
+    expect(provider.sendMessage).not.toHaveBeenCalled()
+    expect((await getScheduledSend(executor, rowId))?.status).toBe("cancelled")
+    expect(await listPendingOperations(executor, imapAccountId)).toHaveLength(0)
+    // 'cancelled' is final: re-cancelling reports false.
+    expect(await cancelScheduledSend(executor, rowId)).toBe(false)
+  })
+
+  it("skips a send_mime op replaying after a cancel-during-claim (offline hold)", async () => {
+    const provider = useFakeProvider(imapAccountId, "imap")
+    const rowId = await createScheduledSend(executor, {
+      accountId: imapAccountId,
+      mimePayload: "m",
+      recipients: [{ email: "you@example.com" }],
+      subject: "Later still",
+      dueAt: Math.floor(Date.now() / 1000) - 60,
+    })
+    await enqueueSendMime(executor, {
+      accountId: imapAccountId,
+      mime: "m",
+      scheduledSendId: rowId,
+    })
+    // The due pass claimed the row immediately (even offline) and its op
+    // sat queued: go offline, then cancel the claimed ('sending') row.
+    expect(await markScheduledSendSending(executor, rowId)).toBe(true)
+    useOnlineStore.getState().setOnline(false)
+    expect((await processQueue(options())).skippedOffline).toBe(true)
+    expect(await cancelScheduledSend(executor, rowId)).toBe(true)
+
+    // Back online: the replayed op must NOT transmit. It completes so it
+    // cannot retry, and the guarded 'sending'-only sent-stamp leaves the
+    // row exactly as the user left it: 'cancelled'.
+    useOnlineStore.getState().setOnline(true)
+    const result = await processQueue(options())
+    expect(result.succeeded).toBe(1)
+    expect(provider.sendMessage).not.toHaveBeenCalled()
+    expect((await getScheduledSend(executor, rowId))?.status).toBe("cancelled")
+  })
+
+  it("unfolds a folded From header when rebuilding the send input", async () => {
+    const provider = useFakeProvider(imapAccountId, "imap")
+    // The builder folds long headers with CRLF + WSP; a naive single-line
+    // parse would truncate the display name (or see a bare address).
+    const mime = [
+      "From: A Very Long Encoded Display Name That The Builder\r\n Folds Onto A Continuation Line <sender@example.com>",
+      "To: reader@example.com",
+      "Subject: Folded from",
+      'Content-Type: text/plain; charset="utf-8"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      "SGVsbG8=",
+    ].join("\r\n")
+    await enqueueSendMime(executor, {
+      accountId: imapAccountId,
+      mime,
+      scheduledSendId: "ss-fold-1",
+    })
+
+    const result = await processQueue(options())
+    expect(result.succeeded).toBe(1)
+    const input = vi.mocked(provider.sendMessage).mock.calls[0][0] as {
+      fromAlias?: { email: string; name?: string }
+    }
+    // The full name + address survive the unfold.
+    expect(input.fromAlias).toEqual({
+      email: "sender@example.com",
+      name: "A Very Long Encoded Display Name That The Builder Folds Onto A Continuation Line",
+    })
+  })
+
+  it("rebuilds a text/plain-only payload with its body (textBody round-trip)", async () => {
+    const provider = useFakeProvider(imapAccountId, "imap")
+    // The real builder emits a text/plain-only alternative when no HTML
+    // body is set; decomposeMimeMessage must hand that body back so the
+    // SMTP rebuild carries it instead of an empty body.
+    const built = buildMimeMessage({
+      from: { email: `${imapAccountId}@example.com` },
+      to: [{ email: "reader@example.com" }],
+      subject: "Plain only",
+      textBody: "Just plain text",
+      messageId: "<plain@example.com>",
+    })
+    await enqueueSendMime(executor, {
+      accountId: imapAccountId,
+      mime: built.mime,
+      scheduledSendId: "ss-plain-1",
+    })
+
+    const result = await processQueue(options())
+    expect(result.succeeded).toBe(1)
+    const input = vi.mocked(provider.sendMessage).mock.calls[0][0] as {
+      textBody?: string
+      htmlBody?: string
+      subject: string
+      messageId?: string
+    }
+    expect(input.textBody).toBe("Just plain text")
+    expect(input.htmlBody).toBeUndefined()
+    expect(input.subject).toBe("Plain only")
+    expect(input.messageId).toBe("<plain@example.com>")
+  })
+
+  // ---- Account-wide FIFO backoff gate: a backoff-gated op must never be
+  // overtaken by a later op — across cycles too (a stale draft_upsert
+  // replaying past a newer one would overwrite it). ----
+
+  it("a backoff-gated head op gates the whole account for the cycle", async () => {
+    const gated = useFakeProvider(accountId, "imap")
+    const other = useFakeProvider(imapAccountId, "imap")
+    gated.archive.mockImplementationOnce(async () => {
+      throw new Error("transient")
+    })
+    await enqueueArchive(executor, accountId, [{ folder: "INBOX", uid: 1 }])
+    await enqueueStar(executor, accountId, [{ folder: "INBOX", uid: 2 }])
+    await enqueueTrash(executor, imapAccountId, inboxRef)
+
+    const first = await processQueue({ ...options(), backoffBaseMs: 50 })
+    expect(first.requeued).toBe(1)
+
+    // Next cycle while the head's backoff is still live: the account is
+    // skipped ENTIRELY — the star op must not overtake the gated archive
+    // (a per-op gate would have let it replay). Other accounts drain on.
+    const second = await processQueue({ ...options(), backoffBaseMs: 50 })
+    expect(second.attempted).toBe(0)
+    expect(gated.calls).toEqual([])
+    expect(other.calls).toEqual(["trash:7"])
+
+    // Once the backoff clears, the account drains in FIFO order.
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const third = await processQueue({ ...options(), backoffBaseMs: 50 })
+    expect(third.succeeded).toBe(2)
+    expect(gated.calls).toEqual(["archive:1", "markStarred:2:true"])
+  })
+
+  it("a mid-batch op's backoff does not gate the cycle's head; it gates once it is the oldest pending", async () => {
+    const provider = useFakeProvider(accountId, "imap")
+    provider.markStarred.mockImplementationOnce(async () => {
+      throw new Error("transient")
+    })
+    await enqueueArchive(executor, accountId, [{ folder: "INBOX", uid: 1 }])
+    await enqueueStar(executor, accountId, [{ folder: "INBOX", uid: 2 }])
+    await enqueueMarkRead(executor, accountId, [{ folder: "INBOX", uid: 3 }])
+
+    // Cycle 1: the head runs even though a later op's backoff gets set
+    // during this very cycle; the within-cycle fail-fast stops the batch
+    // at the star so the mark-read never starts.
+    const first = await processQueue({ ...options(), backoffBaseMs: 50 })
+    expect(first.succeeded).toBe(1)
+    expect(first.requeued).toBe(1)
+    expect(provider.calls).toEqual(["archive:1"])
+
+    // Cycle 2: the star is now the account's OLDEST pending op, so its
+    // backoff gates the account — the mark-read must not overtake it.
+    const second = await processQueue({ ...options(), backoffBaseMs: 50 })
+    expect(second.attempted).toBe(0)
+    expect(provider.calls).toEqual(["archive:1"])
+
+    // Backoff clears: FIFO resumes (star retried first, then mark-read).
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const third = await processQueue({ ...options(), backoffBaseMs: 50 })
+    expect(third.succeeded).toBe(2)
+    expect(provider.calls).toEqual([
+      "archive:1",
+      "markStarred:2:true",
+      "markRead:3:true",
+    ])
   })
 
   describe("production provider path", () => {

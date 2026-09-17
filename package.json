@@ -46,6 +46,7 @@
     "dompurify": "^3.4.15",
     "lucide-react": "^1.46.0",
     "next-themes": "^0.4.6",
+    "openpgp": "^6.3.1",
     "react": "^19.2.8",
     "react-day-picker": "^10.0.1",
     "react-dom": "^19.2.8",

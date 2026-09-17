@@ -890,8 +890,9 @@ pub(crate) fn encode_base64(data: &[u8]) -> String {
 }
 
 /// Reverse lookup for [`build_section_map`]: the mail-parser part index
-/// whose IMAP MIME section path equals `part_id` (e.g. "1.2").
-fn part_index_for_section(
+/// whose IMAP MIME section path equals `part_id` (e.g. "1.2"). Also used
+/// by the import parser (mail_import.rs) to reach attachment bytes.
+pub(crate) fn part_index_for_section(
     map: &std::collections::BTreeMap<usize, String>,
     part_id: &str,
 ) -> Option<usize> {
@@ -1182,6 +1183,20 @@ pub(crate) fn parse_raw_message(
         .or(internal_date)
         .unwrap_or(0);
 
+    // List-unsubscribe headers (task 18.3, D13): kept verbatim via the
+    // parser's raw-header accessor — List-Unsubscribe values are structured
+    // (angle-bracket URLs) and the TS grammar expects exactly that text, so
+    // the structured/decoded address parse is deliberately not used.
+    let raw_header = |name: &str| -> Option<String> {
+        message
+            .header_raw(name)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let list_unsubscribe = raw_header("List-Unsubscribe");
+    let list_unsubscribe_post = raw_header("List-Unsubscribe-Post");
+
     let text_body = message.body_text(0).map(|s| s.to_string());
     let html_body = message.body_html(0).map(|s| s.to_string());
 
@@ -1226,6 +1241,8 @@ pub(crate) fn parse_raw_message(
         message_id,
         in_reply_to,
         references,
+        list_unsubscribe,
+        list_unsubscribe_post,
         subject,
         from: addresses(message.from()),
         to: addresses(message.to()),
@@ -1698,6 +1715,35 @@ mod tests {
             .expect("parse should succeed");
         assert_eq!(msg.attachments.len(), 0);
         assert_eq!(msg.text_body.as_deref(), Some("just text"));
+    }
+
+    #[test]
+    fn parse_captures_list_unsubscribe_headers_verbatim() {
+        let raw = concat!(
+            "From: Newsletter <news@example.com>\r\n",
+            "List-Unsubscribe: <https://a/u>, <mailto:b@c>\r\n",
+            "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
+            "Subject: weekly digest\r\n",
+            "\r\n",
+            "body"
+        );
+        let msg = parse_raw_message(raw.as_bytes(), 3, vec![], None).expect("parse should succeed");
+        assert_eq!(
+            msg.list_unsubscribe.as_deref(),
+            Some("<https://a/u>, <mailto:b@c>")
+        );
+        assert_eq!(
+            msg.list_unsubscribe_post.as_deref(),
+            Some("List-Unsubscribe=One-Click")
+        );
+    }
+
+    #[test]
+    fn parse_without_list_headers_leaves_them_none() {
+        let msg = parse_raw_message(b"Subject: plain\r\n\r\njust text", 1, vec![], None)
+            .expect("parse should succeed");
+        assert_eq!(msg.list_unsubscribe, None);
+        assert_eq!(msg.list_unsubscribe_post, None);
     }
 
     #[test]

@@ -1,19 +1,26 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { DraftInput } from "../drafts"
 import {
   deleteDraft,
   deleteDraftByKey,
+  draftMessageId,
+  enqueueDraftMirrorUpsert,
   getDraft,
   isDraftEmpty,
   listDrafts,
+  parseServerDraftRef,
   saveDraft,
+  saveServerDraft,
+  setDraftServerRef,
 } from "../drafts"
 import {
   createTestExecutor,
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
 import { createAccount, createThread } from "@/services/db/__tests__/fixtures"
+import { listPendingOperations } from "@/services/db/pending-operations"
+import { operationFromRow } from "@/services/queue/operation"
 
 function draftInput(overrides?: Partial<DraftInput>): DraftInput {
   return {
@@ -66,6 +73,7 @@ describe("drafts service", () => {
         attachments: [{ filename: "notes.txt", size: 128 }],
         inReplyTo: "<msg-1@x.com>",
         threadId,
+        serverDraftRef: null,
         createdAt: saved.createdAt,
         updatedAt: saved.updatedAt,
       })
@@ -284,5 +292,217 @@ describe("drafts service", () => {
         isDraftEmpty(draftInput({ to: [], subject: "Subject", bodyHtml: "" }))
       ).toBe(false)
     })
+  })
+})
+
+describe("draft server mirroring (task 17.x, design D9)", () => {
+  let executor: TestExecutor
+  let accountId: string
+  let consoleWarn: ReturnType<typeof vi.spyOn>
+
+  function draftInput(overrides?: Partial<DraftInput>): DraftInput {
+    return {
+      to: [{ email: "alice@x.com" }],
+      cc: [],
+      bcc: [],
+      subject: "Hello",
+      bodyHtml: "<p>Hi</p>",
+      ...overrides,
+    }
+  }
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor)
+    consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    consoleWarn.mockRestore()
+    executor.close()
+  })
+
+  async function queuedOps() {
+    const rows = await listPendingOperations(executor)
+    return rows.map(operationFromRow)
+  }
+
+  it("stores, preserves, and clears the server mirror ref on the row", async () => {
+    const saved = await saveDraft(executor, {
+      accountId,
+      draftKey: "k",
+      draft: draftInput(),
+    })
+    expect((await getDraft(executor, saved.id))?.serverDraftRef).toBeNull()
+
+    await setDraftServerRef(executor, saved.id, {
+      provider: "gmail",
+      draftId: "draft-1",
+    })
+    // A content autosave (draft_key upsert) must NOT clobber the ref.
+    await saveDraft(executor, {
+      accountId,
+      draftKey: "k",
+      draft: draftInput({ subject: "v2" }),
+    })
+    expect((await getDraft(executor, saved.id))?.serverDraftRef).toEqual({
+      provider: "gmail",
+      draftId: "draft-1",
+    })
+
+    await setDraftServerRef(executor, saved.id, {
+      provider: "imap",
+      folder: "Drafts",
+      uid: 12,
+    })
+    expect((await getDraft(executor, saved.id))?.serverDraftRef).toEqual({
+      provider: "imap",
+      folder: "Drafts",
+      uid: 12,
+    })
+
+    await setDraftServerRef(executor, saved.id, null)
+    expect((await getDraft(executor, saved.id))?.serverDraftRef).toBeNull()
+  })
+
+  it("parses refs tolerantly (corrupt or unknown shapes read as not mirrored)", () => {
+    expect(parseServerDraftRef(null)).toBeNull()
+    expect(parseServerDraftRef("not json")).toBeNull()
+    expect(parseServerDraftRef('{"provider":"carrier"}')).toBeNull()
+    expect(parseServerDraftRef('{"provider":"gmail"}')).toBeNull()
+    expect(
+      parseServerDraftRef('{"provider":"imap","folder":"Drafts"}')
+    ).toBeNull()
+    expect(parseServerDraftRef('{"provider":"gmail","draftId":"d-1"}')).toEqual(
+      { provider: "gmail", draftId: "d-1" }
+    )
+  })
+
+  it("enqueueDraftMirrorUpsert queues a draft_upsert with the stable Message-ID MIME", async () => {
+    const saved = await saveDraft(executor, {
+      accountId,
+      draftKey: "k",
+      draft: draftInput(),
+    })
+    await enqueueDraftMirrorUpsert(executor, accountId, saved, draftInput())
+
+    const ops = await queuedOps()
+    expect(ops).toHaveLength(1)
+    expect(ops[0]).toMatchObject({
+      kind: "draft_upsert",
+      accountId,
+      draftId: saved.id,
+    })
+    if (ops[0].kind !== "draft_upsert") return
+    expect(ops[0].mime).toContain(`Message-ID: ${draftMessageId(saved.id)}`)
+    expect(ops[0].mime).toContain("Subject: Hello")
+    expect(ops[0].mime).toContain("alice@x.com")
+  })
+
+  it("enqueueDraftMirrorUpsert is a silent no-op when the account is gone", async () => {
+    await enqueueDraftMirrorUpsert(
+      executor,
+      "missing-account",
+      { id: "row" },
+      draftInput()
+    )
+    expect(await queuedOps()).toHaveLength(0)
+    expect(consoleWarn).not.toHaveBeenCalled()
+  })
+
+  it("deleteDraft enqueues draft_delete for a mirrored row and none for a plain row", async () => {
+    const mirrored = await saveDraft(executor, {
+      accountId,
+      draftKey: "mirrored",
+      draft: draftInput(),
+    })
+    await setDraftServerRef(executor, mirrored.id, {
+      provider: "gmail",
+      draftId: "draft-9",
+    })
+    const plain = await saveDraft(executor, {
+      accountId,
+      draftKey: "plain",
+      draft: draftInput(),
+    })
+
+    await deleteDraft(executor, plain.id)
+    expect(await queuedOps()).toHaveLength(0)
+
+    await deleteDraft(executor, mirrored.id)
+    const ops = await queuedOps()
+    expect(ops).toEqual([
+      {
+        accountId,
+        kind: "draft_delete",
+        ref: { provider: "gmail", draftId: "draft-9" },
+      },
+    ])
+    expect(await getDraft(executor, mirrored.id)).toBeNull()
+  })
+
+  it("deleteDraftByKey enqueues the mirror delete for the composer's discard path", async () => {
+    const saved = await saveDraft(executor, {
+      accountId,
+      draftKey: "k",
+      draft: draftInput(),
+    })
+    await setDraftServerRef(executor, saved.id, {
+      provider: "imap",
+      folder: "Drafts",
+      uid: 44,
+    })
+
+    await deleteDraftByKey(executor, accountId, "k")
+
+    expect(await queuedOps()).toEqual([
+      {
+        accountId,
+        kind: "draft_delete",
+        ref: { provider: "imap", folder: "Drafts", uid: 44 },
+      },
+    ])
+  })
+
+  it("saveServerDraft upserts fetched drafts by key with their ref (no mirror ops)", async () => {
+    const first = await saveServerDraft(executor, {
+      accountId,
+      draftKey: "server:<fetched-1@x.com>",
+      ref: { provider: "gmail", draftId: "srv-1" },
+      fields: {
+        to: [{ email: "bob@x.com" }],
+        cc: [],
+        bcc: [],
+        subject: "From the web",
+        bodyHtml: "<p>remote</p>",
+      },
+    })
+    expect(first.created).toBe(true)
+
+    // Re-fetch of the same server draft: same key updates in place.
+    const second = await saveServerDraft(executor, {
+      accountId,
+      draftKey: "server:<fetched-1@x.com>",
+      ref: { provider: "gmail", draftId: "srv-1" },
+      fields: {
+        to: [{ email: "bob@x.com" }],
+        cc: [],
+        bcc: [],
+        subject: "From the web (edited elsewhere)",
+        bodyHtml: "<p>remote v2</p>",
+      },
+    })
+    expect(second).toEqual({ id: first.id, created: false })
+
+    const drafts = await listDrafts(executor, accountId)
+    expect(drafts).toHaveLength(1)
+    expect(drafts[0]).toMatchObject({
+      draftKey: "server:<fetched-1@x.com>",
+      subject: "From the web (edited elsewhere)",
+      bodyHtml: "<p>remote v2</p>",
+      serverDraftRef: { provider: "gmail", draftId: "srv-1" },
+    })
+    // Fetching never pushes back to the server.
+    expect(await queuedOps()).toHaveLength(0)
   })
 })

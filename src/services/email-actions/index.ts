@@ -29,8 +29,15 @@
  *
  * Module layout: message-refs.ts builds the per-message queue addresses;
  * thread-actions.ts holds the action implementations, the typed errors
- * and the change hook.
+ * and the change hook; snooze.ts holds the local-only snooze state
+ * (set/cancel/wake/list + the preset picker data the snooze menu renders);
+ * thread-states.ts holds the other local-only thread states (mute, pin,
+ * Done — set/clear pairs over their threads.ts columns); notes.ts holds
+ * the local-only per-thread note write (task 15.1).
  */
 
 export * from "./message-refs"
 export * from "./thread-actions"
+export * from "./snooze"
+export * from "./thread-states"
+export * from "./notes"

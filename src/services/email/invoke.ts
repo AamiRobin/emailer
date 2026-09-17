@@ -70,6 +70,10 @@ export interface ImapMessage {
   messageId?: string | null
   inReplyTo?: string | null
   references?: string | null
+  /** `List-Unsubscribe` value, verbatim (task 18.3); null when absent. */
+  listUnsubscribe?: string | null
+  /** `List-Unsubscribe-Post` value, verbatim; null when absent. */
+  listUnsubscribePost?: string | null
   subject?: string | null
   from: ImapAddress[]
   to: ImapAddress[]
@@ -241,15 +245,113 @@ export function imapAppend(
 
 // ---- SMTP commands ----
 
+/**
+ * `envelopeFrom` (task 16.2, design D10): overrides SMTP MAIL FROM while
+ * the MIME From header stays whatever `email.from` carries. When an alias
+ * sends, callers pass the authenticated account address here so the
+ * envelope never diverges from the credentials. Omitted/null → the Rust
+ * side derives the envelope from the headers (previous behavior, and the
+ * option is absent from the payload entirely when undefined).
+ */
 export function smtpSendEmail(
   params: SmtpParams,
-  email: OutgoingEmail
+  email: OutgoingEmail,
+  envelopeFrom?: string | null
 ): Promise<SmtpSendResult> {
-  return invoke("smtp_send_email", { params, email })
+  return invoke("smtp_send_email", { params, email, envelopeFrom })
 }
 
 export function smtpTestConnection(
   params: SmtpParams
 ): Promise<SmtpTestResult> {
   return invoke("smtp_test_connection", { params })
+}
+
+/**
+ * Raw send (task 18.5, design D11): transmits an ALREADY-BUILT RFC 822
+ * message verbatim — the PGP/MIME sendComposerDraft froze into the queued
+ * input (the passphrase existed only at enqueue time, so the MIME must
+ * never be rebuilt Rust-side; that would unwrap the protection). The
+ * envelope mirrors `smtp_send_email`'s alias rules (design D10): MAIL FROM
+ * is `envelopeFrom` (the authenticated account address) and RCPT TO is
+ * `recipients` (the structured to/cc/bcc the send flow validated) — never
+ * parsed back out of the raw headers. The Rust side strips the Bcc header
+ * from the transmitted bytes, like lettre does on the structured path.
+ */
+export function smtpSendRawEmail(
+  params: SmtpParams,
+  raw: string,
+  recipients: string[],
+  envelopeFrom: string
+): Promise<void> {
+  return invoke("smtp_send_raw_email", {
+    params,
+    raw,
+    recipients,
+    envelopeFrom,
+  })
+}
+
+// ---- Mail import commands (task 19.3, data portability) ----
+//
+// The wrappers mirror src-tauri/src/mail_import.rs (same serde camelCase
+// convention as the imap/smtp wire types; the address shape reuses
+// imap::types::ImapAddress). The Rust side reads the picked files itself
+// and returns decoded messages plus the raw RFC 822 source (base64), so
+// the importer never parses MIME and server upload can transmit the
+// original bytes verbatim.
+
+/** Mirrors mail_import::ImportedAttachment (content base64 across the bridge). */
+export interface ImportedAttachment {
+  filename?: string | null
+  contentType: string
+  contentId?: string | null
+  isInline: boolean
+  size: number
+  /** Decoded content, standard base64; empty when the part was unreachable. */
+  base64Bytes: string
+}
+
+/** Mirrors mail_import::ParsedEml. */
+export interface ParsedEml {
+  messageId?: string | null
+  inReplyTo?: string | null
+  references?: string | null
+  /** `List-Unsubscribe` value, verbatim (task 18.3, D13); null when absent. */
+  listUnsubscribe?: string | null
+  /** `List-Unsubscribe-Post` value, verbatim; null when absent. */
+  listUnsubscribePost?: string | null
+  subject?: string | null
+  from: ImapAddress[]
+  to: ImapAddress[]
+  cc: ImapAddress[]
+  bcc: ImapAddress[]
+  /** Date header as unix seconds (fallback mbox separator time, else 0). */
+  date: number
+  textBody?: string | null
+  htmlBody?: string | null
+  attachments: ImportedAttachment[]
+  /** Size of the raw source in octets. */
+  size: number
+  /** The message's RFC 822 source, standard base64 (faithful upload). */
+  rawBase64: string
+}
+
+/** Mirrors mail_import::MboxEntryResult (per-entry, never aborts the batch). */
+export interface MboxEntryResult {
+  /** 0-based position in the mbox (framing order). */
+  index: number
+  error?: string | null
+  message?: ParsedEml | null
+}
+
+/** Parse one user-picked .eml file; rejects when unreadable or non-mail. */
+export function parseEmlFile(path: string): Promise<ParsedEml> {
+  return invoke("parse_eml_file", { path })
+}
+
+/** Parse one user-picked mbox file into per-entry outcomes; only an
+ * unreadable file rejects, bad entries come back as `error` entries. */
+export function parseMboxFile(path: string): Promise<MboxEntryResult[]> {
+  return invoke("parse_mbox_file", { path })
 }

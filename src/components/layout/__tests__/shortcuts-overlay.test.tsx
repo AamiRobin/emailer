@@ -2,16 +2,20 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { cleanup, render, screen } from "@testing-library/react"
 
 import { SHORTCUTS, SHORTCUT_GROUPS } from "@/constants/shortcuts"
+import { useShortcutBindingsStore } from "@/hooks/shortcut-bindings"
 import { ShortcutsOverlay } from "../shortcuts-overlay"
 
 afterEach(() => {
   cleanup()
+  useShortcutBindingsStore.setState({ overrides: {}, captureActive: false })
 })
 
 /**
- * Shortcuts help overlay (task 6.6): rows must render the fixed binding
- * table exactly — the overlay and the future settings reference (11.3)
- * share that table, so this test doubles as its data contract.
+ * Shortcuts help overlay (task 6.6; effective bindings per D15, task
+ * 20.1): rows must render the binding table — defaults merged with the
+ * persisted overrides via the shared useEffectiveShortcuts accessor, so
+ * a rebind made in settings shows up here immediately and after a
+ * restart.
  */
 describe("ShortcutsOverlay", () => {
   it("renders nothing when closed", () => {
@@ -41,6 +45,16 @@ describe("ShortcutsOverlay", () => {
     for (const group of usedGroups) {
       expect(screen.getByText(group.label)).toBeTruthy()
     }
+  })
+
+  it("renders the effective binding when an override is set (D15)", () => {
+    useShortcutBindingsStore.getState().setOverrides({ archive: "a" })
+    render(<ShortcutsOverlay open={true} onOpenChange={vi.fn()} />)
+    expect(screen.getByTestId("shortcut-keys-archive").textContent).toBe("a")
+    // Untouched bindings keep their defaults.
+    expect(screen.getByTestId("shortcut-keys-toggle-star").textContent).toBe(
+      "s"
+    )
   })
 })
 

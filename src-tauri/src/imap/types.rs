@@ -114,6 +114,12 @@ pub struct ImapMessage {
     pub in_reply_to: Option<String>,
     /// Space-separated References chain, newest last.
     pub references: Option<String>,
+    /// `List-Unsubscribe` header value, verbatim (RFC 2369) — the TS side
+    /// (security/unsubscribe.ts) owns the grammar. None when absent.
+    pub list_unsubscribe: Option<String>,
+    /// `List-Unsubscribe-Post` header value, verbatim (RFC 8058, one-click
+    /// = "List-Unsubscribe=One-Click"). None when absent.
+    pub list_unsubscribe_post: Option<String>,
     pub subject: Option<String>,
     pub from: Vec<ImapAddress>,
     pub to: Vec<ImapAddress>,

@@ -33,19 +33,32 @@ import { updateUnreadBadge } from "../notifications/unread-badge"
  * over all connected accounts plus the 60s interval.
  *
  * Semantics:
- * - syncAllAccounts() runs the active accounts (status "active",
- *   is_active on) sequentially; accounts marked "auth-error" (task 5.6)
- *   are skipped. Per-account failures are isolated: collected into the
+ * - syncAllAccounts() runs the active accounts (status "active")
+ *   sequentially; accounts marked "auth-error" (task 5.6) are skipped.
+ *   Per-account failures are isolated: collected into the
  *   result and surfaced in the sync store, the run continues.
- * - startScheduler({intervalMs = 60_000}) ticks syncAllAccounts();
- *   stopScheduler() clears the tick. Starting does NOT sync immediately —
- *   call triggerRefresh() for that (bootstrap decides the initial sync).
+ * - startScheduler({intervalMs = 60_000}) ticks one combined pass: due
+ *   jobs first, then syncAllAccounts(). stopScheduler() clears the tick.
+ *   Starting does NOT sync immediately — call triggerRefresh() for that
+ *   (bootstrap decides the initial sync).
  * - triggerRefresh(accountId?) syncs immediately, bypassing the interval
- *   wait: all active accounts, or one specific account.
+ *   wait: all active accounts, or one specific account. Manual refreshes
+ *   carry no due-jobs drain; only the scheduled tick does.
  * - Single-flight: overlapping triggers never run concurrently. A request
  *   made while a pass is in flight is merged into one queued pass that
  *   drains after the current one (triggerRefresh returns a promise
  *   settling after the whole chain; its result is the final pass's).
+ * - Due jobs (design D2): feature modules register named async handlers
+ *   (snooze wake-ups, scheduled sends, delivery-window releases,
+ *   follow-up reminders, auto-archive batches) with
+ *   registerDueJobHandler(). Each tick runs ONE pass — the due drain
+ *   first (cheap and local, so wake-ups land before the pass's UI
+ *   refresh), then the account sync — through the same single-flight
+ *   machinery, so a due pass never overlaps a sync pass and overlapping
+ *   ticks merge exactly as sync-only ticks did. Handler failures are
+ *   logged and isolated: the due pass never rejects and never affects
+ *   the sync result or the interval. runDueJobsOnce() drains just the
+ *   due pass through the same chain (launch-time catch-up).
  *
  * Auth errors: syncAccount converts ProviderAuthError (and undecryptable
  * credentials) into AccountSyncAuthError — the typed marker task 5.6
@@ -56,10 +69,12 @@ import { updateUnreadBadge } from "../notifications/unread-badge"
  *
  * Bootstrap wiring (do NOT call at import time): after initDatabase(),
  *   import { startScheduler } from "@/services/sync/scheduler"
- *   startScheduler()            // periodic pass every 60s
+ *   startScheduler()            // periodic combined pass every 60s
  *   void triggerRefresh()       // optional immediate initial sync
+ *   void runDueJobsOnce()       // optional due-job catch-up at launch
  * and stopScheduler() on teardown. registerEmailProviders() runs on
- * import of this module.
+ * import of this module; feature modules register due-job handlers at
+ * startup with registerDueJobHandler(name, handler).
  *
  * New-mail notifications (task 4.6): after each account sync the engine
  * summary's newMessages count is forwarded to notifyNewMail (which does
@@ -222,11 +237,66 @@ export function setSyncAccountImplForTests(impl: SyncAccountImpl | null): void {
 }
 
 // ---------------------------------------------------------------------------
+// Due jobs registry (design D2): named handlers drained beside the sync pass.
+// ---------------------------------------------------------------------------
+
+/**
+ * A due-job handler drains everything that is due right now for its
+ * feature (snooze wake-ups, scheduled sends, delivery-window releases,
+ * follow-up reminders, auto-archive batches). It takes no arguments and
+ * consults the database itself. It may resolve to any value (feature
+ * summaries); the drain ignores return values. It should resolve; a
+ * rejection is tolerated and isolated (see runDueJobs).
+ */
+export type DueJobHandler = () => Promise<unknown>
+
+// The scheduler is a singleton, so the registry lives as long as the
+// app. Insertion order is the drain order; re-registering a name
+// replaces its handler in place.
+const dueJobHandlers = new Map<string, DueJobHandler>()
+
+/**
+ * Register a due-job handler under `name`. Registering the same name
+ * again replaces the previous handler, so re-registration on re-init is
+ * idempotent.
+ */
+export function registerDueJobHandler(
+  name: string,
+  handler: DueJobHandler
+): void {
+  dueJobHandlers.set(name, handler)
+}
+
+/** Remove a previously registered handler (teardown). */
+export function unregisterDueJobHandler(name: string): void {
+  dueJobHandlers.delete(name)
+}
+
+/**
+ * Drain every registered handler sequentially. Failure isolation: a
+ * throwing handler logs a warning and the remaining handlers still run;
+ * the drain itself never rejects, so it cannot fail the pass that
+ * awaits it.
+ */
+export async function runDueJobs(): Promise<void> {
+  for (const [name, handler] of dueJobHandlers) {
+    try {
+      await handler()
+    } catch (error) {
+      console.warn(`[scheduler] due-job handler "${name}" failed`, error)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Single-flight pass runner
 // ---------------------------------------------------------------------------
 
 let inFlight = false
 let pendingAccountIds: Set<string> | null = null
+// A tick (or catch-up drain) requested while a pass is in flight marks
+// the chained pass to drain due jobs too.
+let pendingDueJobs = false
 let currentRun: Promise<SyncAllResult> = Promise.resolve({
   synced: [],
   errors: [],
@@ -267,7 +337,9 @@ function executePass(accountIds: string[]): Promise<SyncAllResult> {
           accountId
         )
         // Skip accounts deleted mid-run or paused as auth-errors (5.6).
-        if (!row || row.status !== "active" || row.is_active !== 1) continue
+        // is_active is the switcher's "last selected" flag (account-store),
+        // not an enable switch — it never gates a sync.
+        if (!row || row.status !== "active") continue
         account = toEmailAccount(row)
       } catch (error) {
         errors.push({ accountId, error })
@@ -340,16 +412,32 @@ async function refreshUnreadIndicators(): Promise<void> {
 /**
  * Run one pass over the given accounts. Single-flight: while a pass is
  * running, the request is merged into the pending set and the current
- * chain promise is returned; the pending pass drains right after.
+ * chain promise is returned; the pending pass drains right after. A pass
+ * may also carry the due-jobs drain (`withDueJobs`), which runs before
+ * the account sync — due jobs are cheap and local, so wake-ups land in
+ * the same pass's UI refresh. A request made mid-pass keeps its flag, so
+ * a tick arriving during a sync still drains due jobs in the chained
+ * pass, and an in-flight pass delays any requested drain (and vice
+ * versa): the two never overlap.
  */
-function runPass(accountIds: string[]): Promise<SyncAllResult> {
+function runPass(
+  accountIds: string[],
+  withDueJobs: boolean
+): Promise<SyncAllResult> {
   if (inFlight) {
     pendingAccountIds = new Set([...(pendingAccountIds ?? []), ...accountIds])
+    if (withDueJobs) pendingDueJobs = true
     return currentRun
   }
 
   inFlight = true
-  const pass = executePass(accountIds)
+  const dueFirst = withDueJobs
+  const pass = (async () => {
+    // runDueJobs never rejects, so the sync result below is unaffected
+    // by due-job failures.
+    if (dueFirst) await runDueJobs()
+    return executePass(accountIds)
+  })()
   currentRun = (async () => {
     let result: SyncAllResult
     try {
@@ -357,11 +445,13 @@ function runPass(accountIds: string[]): Promise<SyncAllResult> {
     } finally {
       inFlight = false
     }
-    if (pendingAccountIds) {
-      const next = [...pendingAccountIds]
+    if (pendingAccountIds || pendingDueJobs) {
+      const next = [...(pendingAccountIds ?? [])]
+      const nextDue = pendingDueJobs
       pendingAccountIds = null
+      pendingDueJobs = false
       // The chain resolves with the final (drained) pass's result.
-      return runPass(next)
+      return runPass(next, nextDue)
     }
     return result
   })()
@@ -375,7 +465,19 @@ function runPass(accountIds: string[]): Promise<SyncAllResult> {
 /** Sync every active account sequentially, isolating per-account errors. */
 export async function syncAllAccounts(): Promise<SyncAllResult> {
   const rows = await listActiveAccounts(getExecutor())
-  return runPass(rows.map((row) => row.id))
+  return runPass(
+    rows.map((row) => row.id),
+    false
+  )
+}
+
+/**
+ * Launch-time catch-up (design D2): drain due jobs once without a sync
+ * pass, through the same single-flight chain — an in-flight sync delays
+ * the drain and vice versa. Bootstrap calls this once at launch.
+ */
+export async function runDueJobsOnce(): Promise<void> {
+  await runPass([], true)
 }
 
 /**
@@ -388,22 +490,44 @@ export async function triggerRefresh(
 ): Promise<SyncAllResult> {
   if (accountId !== undefined) {
     const row = await getAccount(getExecutor(), accountId)
-    if (!row || row.status !== "active" || row.is_active !== 1) {
+    // Same skip rule as the pass itself: missing/deleted or paused as
+    // auth-error. is_active (the switcher's last-selected flag) never
+    // gates a manual refresh.
+    if (!row || row.status !== "active") {
       return { synced: [], errors: [] }
     }
-    return runPass([accountId])
+    return runPass([accountId], false)
   }
   return syncAllAccounts()
 }
 
 let intervalHandle: ReturnType<typeof setInterval> | null = null
 
+/**
+ * One scheduled tick = one combined pass (design D2): due jobs drained
+ * first, then the account sync, serialized through the single-flight
+ * machinery so neither overlaps the other.
+ */
+async function runScheduledPass(): Promise<SyncAllResult> {
+  const rows = await listActiveAccounts(getExecutor())
+  return runPass(
+    rows.map((row) => row.id),
+    true
+  )
+}
+
 /** Start the periodic background pass (does not sync immediately). */
 export function startScheduler(options: SchedulerOptions = {}): void {
   stopScheduler()
   const intervalMs = options.intervalMs ?? DEFAULT_SYNC_INTERVAL_MS
   intervalHandle = setInterval(() => {
-    void syncAllAccounts()
+    // The tick must never raise an unhandled rejection (e.g. the account
+    // listing failing while the DB is momentarily unavailable): the
+    // failure is logged in the scheduler's isolation voice and the next
+    // tick simply retries.
+    runScheduledPass().catch((error) => {
+      console.warn("[scheduler] scheduled pass failed to start", error)
+    })
   }, intervalMs)
 }
 

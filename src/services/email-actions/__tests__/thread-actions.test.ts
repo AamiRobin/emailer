@@ -13,10 +13,13 @@ import {
   type TestExecutor,
 } from "../../db/__tests__/test-executor"
 import type { SqlExecutor } from "../../db/executor"
+import { findLabelsBySpecialUse } from "../../db/labels"
 import {
   listOperationsByStatus,
   type PendingOperationRow,
 } from "../../db/pending-operations"
+import { countJunkTokens } from "../../db/junk-tokens"
+import { getSetting } from "../../db/settings"
 import { operationFromRow, type QueueOperation } from "../../queue/operation"
 import {
   getThreadWithMessages,
@@ -35,6 +38,8 @@ import {
   useFolderCountsStore,
 } from "../../../stores/folder-counts-store"
 import { MissingProviderRefError } from "../message-refs"
+import { loadJunkFilterConfig } from "../../security/junk-filter"
+import { setJunkFilterEnabledPreference } from "../../settings/preferences"
 import {
   AccountNotFoundError,
   archiveThread,
@@ -850,5 +855,147 @@ describe("thread actions — indicators and change hook", () => {
     unsubscribe()
     await archiveThread(executor, accountId, threadId)
     expect(events).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Junk-filter training hooks (task 18.10, design D19): the spam/not-spam
+// actions ARE the training events — but only for IMAP accounts with the
+// per-account filter on, and never when the caller opts out (the rules
+// engine and the auto-move filing pass trainJunkFilter: false).
+// ---------------------------------------------------------------------------
+
+describe("thread actions — junk-filter training hooks", () => {
+  let executor: TestExecutor
+  let accountId: string
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "imap")
+    await seedImapFolders(executor, accountId)
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  /** An inbox thread whose messages carry trainable text (the seed helper
+   * above writes snippets only — training reads subject + body_text). */
+  let trainableUid = 200
+  async function seedTrainableThread(): Promise<string> {
+    const inbox = await findLabelsBySpecialUse(executor, accountId, "inbox")
+    const threadId = await createThread(executor, accountId, {
+      subject: "Hello",
+    })
+    await setThreadFolder(executor, threadId, inbox[0]!.id)
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: at(0),
+      imapFolder: "INBOX",
+      imapUid: (trainableUid += 1),
+      bodyText: "buy cheap pills",
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: at(60),
+      imapFolder: "INBOX",
+      imapUid: (trainableUid += 1),
+      bodyText: "winner prize offer",
+    })
+    await recomputeThreadCaches(executor, threadId)
+    return threadId
+  }
+
+  async function trainingState() {
+    const config = await loadJunkFilterConfig(executor, accountId)
+    return config
+  }
+
+  it("markSpam trains spam documents when the filter is on", async () => {
+    const threadId = await seedTrainableThread()
+    await setJunkFilterEnabledPreference(executor, accountId, true)
+
+    await markSpam(executor, accountId, threadId)
+
+    const config = await trainingState()
+    expect(config?.spamDocuments).toBe(2) // one document per message
+    expect(config?.tokens.get("cheap")).toEqual({ spamCount: 1, hamCount: 0 })
+    expect(config?.tokens.get("prize")).toEqual({ spamCount: 1, hamCount: 0 })
+  })
+
+  it("markNotSpam retrains the same text as ham (the D19 correction)", async () => {
+    const threadId = await seedTrainableThread()
+    await setJunkFilterEnabledPreference(executor, accountId, true)
+    await markSpam(executor, accountId, threadId)
+
+    await markNotSpam(executor, accountId, threadId)
+
+    const config = await trainingState()
+    expect(config?.spamDocuments).toBe(2)
+    expect(config?.hamDocuments).toBe(2)
+    expect(config?.tokens.get("cheap")).toEqual({ spamCount: 1, hamCount: 1 })
+  })
+
+  it("with the toggle off nothing trains (no residue)", async () => {
+    const threadId = await seedTrainableThread()
+    await markSpam(executor, accountId, threadId)
+
+    expect(await countJunkTokens(executor, accountId)).toBe(0)
+    const stored = await getSetting<unknown>(
+      executor,
+      "mail.junkFilterTraining:" + accountId,
+      null
+    )
+    expect(stored).toBeNull()
+  })
+
+  it("gmail accounts never train, even with a persisted opt-in", async () => {
+    const gmailId = await createAccount(executor, "gmail")
+    await createGmailLabel(executor, gmailId, "SPAM", "SPAM", "spam")
+    await createGmailLabel(executor, gmailId, "INBOX", "INBOX", "inbox")
+    const threadId = await createThread(executor, gmailId, { subject: "Hi" })
+    const ids = ["700000000000001", "700000000000002"]
+    let offset = 0
+    for (const gmailMessageId of ids) {
+      await createMessage(executor, {
+        threadId,
+        accountId: gmailId,
+        date: at(offset),
+        gmailMessageId,
+        bodyText: "buy cheap pills",
+      })
+      offset += 60
+    }
+    await recomputeThreadCaches(executor, threadId)
+    await setJunkFilterEnabledPreference(executor, gmailId, true)
+
+    await markSpam(executor, gmailId, threadId)
+
+    // The action itself worked (gmail SPAM label); the store stayed empty.
+    expect(await countJunkTokens(executor, gmailId)).toBe(0)
+  })
+
+  it("the rules/auto-move path opts out via trainJunkFilter: false", async () => {
+    const threadId = await seedTrainableThread()
+    await setJunkFilterEnabledPreference(executor, accountId, true)
+
+    await markSpam(executor, accountId, threadId, { trainJunkFilter: false })
+
+    expect(await countJunkTokens(executor, accountId)).toBe(0)
+    // Nothing trained: the config reports zero spam documents (it is an
+    // always-present config, defaulting to 0 — never undefined).
+    expect((await trainingState())?.spamDocuments).toBe(0)
+  })
+
+  it("bulkApply trains per thread like the single action", async () => {
+    const first = await seedTrainableThread()
+    const second = await seedTrainableThread()
+    await setJunkFilterEnabledPreference(executor, accountId, true)
+
+    await bulkApply(executor, accountId, [first, second], "spam")
+
+    expect((await trainingState())?.spamDocuments).toBe(4)
   })
 })

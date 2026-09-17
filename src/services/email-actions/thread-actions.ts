@@ -31,6 +31,10 @@ import {
   enqueueTrash,
   enqueueUnstar,
 } from "../queue/operation"
+import {
+  junkFilterTrainingActive,
+  trainJunkFromMessages,
+} from "../security/junk-filter"
 import { useAccountStore } from "../../stores/account-store"
 import { useFolderCountsStore } from "../../stores/folder-counts-store"
 import { buildMessageRefs } from "./message-refs"
@@ -94,6 +98,21 @@ export type ThreadActionKind =
  * change event shares the shape so list caches refresh uniformly.
  */
 export type ThreadLabelEventKind = "labels_add" | "labels_remove"
+
+/**
+ * Per-action options. `trainJunkFilter` (task 18.10, design D19) defaults
+ * to true — every user-facing entry point (toolbar, context menu,
+ * shortcuts, multi-select) trains the account's adaptive junk filter on
+ * spam/not-spam actions. The ONE programmatic caller that must not train
+ * is the rules engine (rules are heuristics; D19 trains exclusively on
+ * explicit user actions — an auto-junk move likewise files with training
+ * off, see rules/ingestion.ts applyJunkFiling), and it opts out
+ * explicitly. Gmail accounts and opted-out accounts never train
+ * regardless of the flag (junkFilterTrainingActive is the single guard).
+ */
+export interface ThreadActionOptions {
+  trainJunkFilter?: boolean
+}
 
 // ---- Typed errors (the UI layer maps these to toasts/disabled states) ----
 
@@ -217,13 +236,16 @@ export function trashThread(
   return runThreadAction(executor, accountId, threadId, "trash")
 }
 
-/** Mark a thread as spam (gmail adds SPAM; imap moves to the junk folder). */
+/** Mark a thread as spam (gmail adds SPAM; imap moves to the junk folder).
+ * Trains the junk filter on the thread's messages (spam) when the account
+ * has the adaptive filter on — see ThreadActionOptions. */
 export function markSpam(
   executor: SqlExecutor,
   accountId: string,
-  threadId: string
+  threadId: string,
+  options?: ThreadActionOptions
 ): Promise<void> {
-  return runThreadAction(executor, accountId, threadId, "spam")
+  return runThreadAction(executor, accountId, threadId, "spam", options)
 }
 
 /**
@@ -233,13 +255,17 @@ export function markSpam(
  * - imap: move the messages back to the inbox-role folder's path and
  *   queue `move` (the processor's not_spam dispatch would translate to
  *   label no-ops on imap, so the move op carries the real semantics).
+ * This is ALSO the junk filter's one-click retraining path (task 18.10,
+ * D19): the mail-display "Not spam" affordance on an auto-junked message
+ * calls this, so the correction both restores the thread and trains ham.
  */
 export function markNotSpam(
   executor: SqlExecutor,
   accountId: string,
-  threadId: string
+  threadId: string,
+  options?: ThreadActionOptions
 ): Promise<void> {
-  return runThreadAction(executor, accountId, threadId, "not_spam")
+  return runThreadAction(executor, accountId, threadId, "not_spam", options)
 }
 
 /**
@@ -300,11 +326,12 @@ export async function bulkApply(
   executor: SqlExecutor,
   accountId: string,
   threadIds: string[],
-  action: ThreadActionKind
+  action: ThreadActionKind,
+  options?: ThreadActionOptions
 ): Promise<void> {
   const applied: string[] = []
   for (const threadId of threadIds) {
-    await applyThreadAction(executor, accountId, threadId, action)
+    await applyThreadAction(executor, accountId, threadId, action, options)
     applied.push(threadId)
   }
   if (applied.length > 0) {
@@ -385,25 +412,29 @@ interface ActionContext {
   refs: MessageRef[]
 }
 
-/** One thread's full D10 sequence: local mutation, then enqueue. No
- * notification — the public wrappers own that (bulkApply coalesces). */
+/** One thread's full D10 sequence: local mutation, then enqueue, then the
+ * junk-filter training side-quest. No notification — the public wrappers
+ * own that (bulkApply coalesces). */
 async function runThreadAction(
   executor: SqlExecutor,
   accountId: string,
   threadId: string,
-  action: ThreadActionKind
+  action: ThreadActionKind,
+  options?: ThreadActionOptions
 ): Promise<void> {
-  await applyThreadAction(executor, accountId, threadId, action)
+  await applyThreadAction(executor, accountId, threadId, action, options)
   await finishAction({ action, accountId, threadIds: [threadId] })
 }
 
 /** Resolve the context, apply the local mutation branch, then enqueue
- * the matching provider op(s) — in that order (D10). */
+ * the matching provider op(s) — in that order (D10) — and finally train
+ * the junk filter when the action is a spam/not-spam USER action. */
 async function applyThreadAction(
   executor: SqlExecutor,
   accountId: string,
   threadId: string,
-  action: ThreadActionKind
+  action: ThreadActionKind,
+  options?: ThreadActionOptions
 ): Promise<void> {
   const context = await resolveContext(executor, accountId, threadId)
   switch (action) {
@@ -443,6 +474,34 @@ async function applyThreadAction(
         await enqueueUnstar(executor, accountId, context.refs)
       }
       break
+  }
+  // Junk-filter training (task 18.10, design D19) — AFTER the mutation
+  // and the enqueue, so a training failure can never affect the action's
+  // D10 guarantees; isolated below like every cosmetic step. Runs only
+  // for the two training actions, only when the caller allows it (rules
+  // and the auto-move opt out) and only for IMAP accounts with the
+  // per-account filter on (junkFilterTrainingActive is the single D19
+  // guard — gmail never trains).
+  if (
+    options?.trainJunkFilter !== false &&
+    (action === "spam" || action === "not_spam")
+  ) {
+    try {
+      if (await junkFilterTrainingActive(executor, accountId)) {
+        await trainJunkFromMessages(
+          executor,
+          accountId,
+          context.messages,
+          action === "spam"
+        )
+      }
+    } catch (error) {
+      console.warn(
+        `[email-actions] junk-filter training failed on thread ` +
+          `${threadId}; continuing`,
+        error
+      )
+    }
   }
 }
 
@@ -489,9 +548,16 @@ async function findSpecialLabel(
   return labels[0] ?? null
 }
 
-/** imap move semantics: rewrite every message's imap_folder, repoint the
- * thread's folder cache, rebuild the archive/trash/spam flags. */
-async function moveThreadToFolder(
+/**
+ * imap move semantics: rewrite every message's imap_folder, repoint the
+ * thread's folder cache, rebuild the archive/trash/spam flags.
+ *
+ * Exported (behavior-neutral) for the rules engine (task 11, design D5):
+ * rule `move` actions take this exact branch so a ruled move is the same
+ * operation as the user one — local folder rewrite + cache rebuild; the
+ * queue op itself stays with the caller (rules/actions.ts enqueues it).
+ */
+export async function moveThreadToFolder(
   executor: SqlExecutor,
   threadId: string,
   messages: MessageRow[],

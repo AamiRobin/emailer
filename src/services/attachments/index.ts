@@ -18,8 +18,10 @@
  * - Save: `saveAttachmentAs(attachment, content)` → system save dialog,
  *   writes the chosen path, null on cancel.
  * - Open: `openAttachment(executor, account, message, attachment)` →
- *   ensures the content is cached, then opens the cached file with the
- *   OS default app.
+ *   runs the security gates (static dangerous-file first-open
+ *   confirmation per D17, opt-in malware hash lookup per D18), ensures
+ *   the content is cached, then opens the cached file with the OS
+ *   default app. Resolves null when the static warning is declined.
  * - Inline `cid:` images: `ensureAttachmentCached(...)` returns
  *   `{ bytes, localPath, fromCache }` — the HTML sanitizer/viewer can
  *   swap a cid: placeholder once bytes are available.
@@ -52,7 +54,31 @@ export {
 } from "./cache"
 
 export {
+  attachmentExtension,
+  attachmentRisk,
+  BLOCK_EXTENSIONS,
+  CAUTION_EXTENSIONS,
+  type AttachmentRisk,
+} from "./attachment-policy"
+
+export {
+  MALWARE_LOOKUP_API_ROOT,
+  defaultHashLookup,
+  lookupAttachmentVerdict,
+  scanBeforeOpen,
+  sha256OfBytes,
+  type HashLookupResult,
+  type LookupFn,
+  type MalwareLookupDeps,
+  type ScanOutcome,
+} from "./malware-lookup"
+
+export {
   openAttachment,
+  openConfirmationMessage,
   saveAttachmentAs,
   type FileActionDeps,
+  type OpenAttachmentResult,
+  type OpenConfirmation,
+  type OpenConfirmationKind,
 } from "./file-actions"

@@ -1,5 +1,6 @@
 import { create } from "zustand"
 
+import { UNREAD_BADGE_THREAD_EXCLUSION } from "@/services/db/accounts"
 import type { SqlExecutor } from "@/services/db/executor"
 import { getExecutor } from "@/services/db/executor"
 import { useUiStore } from "@/stores/ui-store"
@@ -15,7 +16,9 @@ import { useUiStore } from "@/stores/ui-store"
  * Unread counts are the number of unread messages in the account
  * (`COUNT(messages) WHERE is_read = 0`, summed across the whole account —
  * the plain per-account total the accounts spec's "unread badge per
- * account" scenario needs). They are a cached aggregate: refreshUnreadCounts()
+ * account" scenario needs), minus unread messages in snoozed or muted
+ * threads (UNREAD_BY_ACCOUNT_SQL below — the OS badge's exclusion).
+ * They are a cached aggregate: refreshUnreadCounts()
  * re-runs the GROUP BY query; sync/mark-read/account flows call it (or
  * reload()) after they change messages.
  *
@@ -84,6 +87,23 @@ function toAccountInfo(row: AccountRow, unreadCount: number): AccountInfo {
   }
 }
 
+/**
+ * The one per-account unread aggregate, shared by loadAccounts() and
+ * refreshUnreadCounts() so the two copies can never drift. Besides
+ * is_read = 0 it applies UNREAD_BADGE_THREAD_EXCLUSION (db/accounts.ts):
+ * unread messages in snoozed or muted threads do not count — exactly the
+ * predicate getTotalUnreadCount() uses for the OS badge, so the switcher
+ * badges always agree with it (snooze carry-over from task 2.2; mute from
+ * the mail-organization spec). Thread states only filter here — read
+ * state is never mutated — so clearing the flag restores the count.
+ */
+const UNREAD_BY_ACCOUNT_SQL = `
+  SELECT account_id, COUNT(*) AS unread
+  FROM messages
+  WHERE is_read = 0
+    AND ${UNREAD_BADGE_THREAD_EXCLUSION}
+  GROUP BY account_id`
+
 async function loadAccounts(
   executor: SqlExecutor
 ): Promise<{ accounts: AccountInfo[]; persistedActiveId: string | null }> {
@@ -95,12 +115,7 @@ async function loadAccounts(
   const unreadRows = await executor.select<{
     account_id: string
     unread: number
-  }>(
-    `SELECT account_id, COUNT(*) AS unread
-     FROM messages
-     WHERE is_read = 0
-     GROUP BY account_id`
-  )
+  }>(UNREAD_BY_ACCOUNT_SQL)
   const unreadByAccount = new Map(
     unreadRows.map((row) => [row.account_id, row.unread])
   )
@@ -199,12 +214,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     const unreadRows = await resolveExecutor().select<{
       account_id: string
       unread: number
-    }>(
-      `SELECT account_id, COUNT(*) AS unread
-       FROM messages
-       WHERE is_read = 0
-       GROUP BY account_id`
-    )
+    }>(UNREAD_BY_ACCOUNT_SQL)
     const unreadByAccount = new Map(
       unreadRows.map((row) => [row.account_id, row.unread])
     )

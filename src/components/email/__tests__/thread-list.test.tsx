@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react"
 
 import {
@@ -25,6 +26,8 @@ import {
   setThreadStarred,
 } from "@/services/db/threads"
 import { updateLabel } from "@/services/db/labels"
+import { getSnoozePresets } from "@/services/email-actions/snooze"
+import * as threadActions from "@/services/email-actions/thread-actions"
 import {
   setThreadListStoreExecutor,
   useThreadListStore,
@@ -66,6 +69,7 @@ function resetStores(): void {
     composerOpen: false,
     activeThread: null,
     readingPane: "right",
+    listScope: null,
   })
   useComposerStore.getState().reset()
   useAccountStore.setState({
@@ -76,11 +80,15 @@ function resetStores(): void {
   useThreadListStore.setState({
     accountId: null,
     view: null,
+    scope: null,
     threads: [],
     drafts: [],
     labelsByThreadId: {},
     loading: false,
     loaded: false,
+    selectedIds: new Set<string>(),
+    selectionAnchor: null,
+    unreadOnly: false,
   })
 }
 
@@ -747,5 +755,625 @@ describe("local drafts in the Drafts folder (task 8.6 UI half)", () => {
     const { container } = render(<ThreadList />)
     await screen.findByTestId("empty-state")
     expect(draftRows(container).length).toBe(0)
+  })
+})
+
+describe("thread list sort selector (task 4.1)", () => {
+  it("renders in the header; choosing an option re-sorts through the store", async () => {
+    await setupAccount()
+    useThreadListStore.setState({ sort: "date_desc" })
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelector("[data-thread-row]")).not.toBeNull()
+    )
+
+    const rowSubjects = () =>
+      Array.from(container.querySelectorAll("[data-thread-row]")).map((row) =>
+        row.getAttribute("data-thread-row")
+      )
+    const bySubject = () =>
+      useThreadListStore.getState().threads.map((thread) => thread.subject)
+
+    // Default: newest first.
+    expect(bySubject()).toEqual([
+      "Newest unread",
+      "Starred read",
+      "Yesterday read",
+      "This week read",
+      "Earlier read",
+    ])
+
+    // The header exposes the selector; picking "Oldest first" calls the
+    // store's setSort, which persists and re-runs the reload.
+    fireEvent.click(screen.getByTestId("thread-sort-selector"))
+    fireEvent.click(
+      await screen.findByRole("menuitemradio", { name: "Oldest first" })
+    )
+    expect(useThreadListStore.getState().sort).toBe("date_asc")
+    await waitFor(() =>
+      expect(bySubject()).toEqual([
+        "Earlier read",
+        "This week read",
+        "Yesterday read",
+        "Starred read",
+        "Newest unread",
+      ])
+    )
+    // The mounted rows follow the reloaded store order.
+    await waitFor(() => {
+      const storeOrder = useThreadListStore
+        .getState()
+        .threads.map((thread) => thread.id)
+      expect(rowSubjects()).toEqual(storeOrder)
+    })
+  })
+})
+
+describe("group-by-sender bundles (task 9.4)", () => {
+  /**
+   * Six inbox threads whose date_desc order is
+   * [alice1, alice2, bob, alice3, carol, nosender]: the first two Alice
+   * rows are CONSECUTIVE (with mixed-case addresses — grouping identity
+   * is case-insensitive), the third Alice row is NOT consecutive (Bob
+   * sits between), and the last row has no cached sender at all — so
+   * grouping must produce one bundle of 2 plus four standalone rows.
+   * Every message carries a gmail id so the bundle's real thread-actions
+   * runs (which enqueue server ops for gmail) go through unrefused.
+   */
+
+  let ids: Record<string, string>
+
+  async function setupBundleAccount(): Promise<void> {
+    ids = {}
+    // Each test starts from the per-account inbox view (no scope leak
+    // between cases in this file).
+    useUiStore.setState({ listScope: null })
+    const accountId = await createAccount(executor, "gmail")
+    const inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+    // The trash action adds the trash-role label (gmail model) — the row
+    // must exist for the bundle's Trash to have a local effect.
+    await createGmailLabel(executor, accountId, "TRASH", "TRASH", "trash")
+    const seed = async (
+      key: string,
+      subject: string,
+      seconds: number,
+      fromName?: string,
+      fromAddress?: string,
+      unread = false
+    ): Promise<void> => {
+      const threadId = await createThread(executor, accountId, { subject })
+      await createMessage(executor, {
+        threadId,
+        accountId,
+        date: secondsAgo(seconds),
+        subject,
+        fromName,
+        fromAddress,
+        isRead: !unread,
+        gmailMessageId: `g-${key}`,
+      })
+      await recomputeThreadCaches(executor, threadId)
+      await setThreadLabels(executor, threadId, [inbox])
+      ids[key] = threadId
+    }
+    await seed("alice1", "Alice latest", 60, "Alice", "ALICE@Example.com", true)
+    await seed("alice2", "Alice older", 120, "Alice", "alice@example.com")
+    await seed("bob", "Bob note", 180, "Bob", "bob@example.com")
+    await seed("alice3", "Alice oldest", 240, "Alice", "alice@example.com")
+    await seed("carol", "Carol note", 300, "Carol", "carol@example.com")
+    await seed("nosender", "No sender", 360)
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+  }
+
+  async function threadFlags(id: string): Promise<{
+    unread_count: number
+    is_archived: number
+    is_trashed: number
+    snoozed_until: number | null
+  }> {
+    const rows = await executor.select<{
+      unread_count: number
+      is_archived: number
+      is_trashed: number
+      snoozed_until: number | null
+    }>(
+      "SELECT unread_count, is_archived, is_trashed, snoozed_until FROM threads WHERE id = $1",
+      [id]
+    )
+    return rows[0]
+  }
+
+  /** Render, switch grouping on, wait for the collapsed bundle. */
+  async function renderGrouped(): Promise<HTMLElement> {
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelector("[data-thread-row]")).not.toBeNull()
+    )
+    fireEvent.click(screen.getByTestId("group-by-sender-toggle"))
+    await waitFor(() =>
+      expect(container.querySelector("[data-bundle-row]")).not.toBeNull()
+    )
+    return container
+  }
+
+  it("collapses consecutive same-sender runs into one counted bundle row", async () => {
+    await setupBundleAccount()
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-thread-row]").length).toBe(6)
+    )
+    // Grouping off (the default): flat list, no bundle chrome.
+    expect(container.querySelector("[data-bundle-row]")).toBeNull()
+
+    fireEvent.click(screen.getByTestId("group-by-sender-toggle"))
+    const bundle = await waitFor(() => {
+      const el = container.querySelector("[data-bundle-row]")
+      expect(el).not.toBeNull()
+      return el as HTMLElement
+    })
+    expect(bundle.getAttribute("data-bundle-count")).toBe("2")
+    expect(bundle.getAttribute("data-bundle-expanded")).toBe("false")
+    // Sender display name (participants cache), count chip, latest subject.
+    expect(bundle.textContent).toContain("Alice")
+    expect(bundle.textContent).toContain("2 threads")
+    expect(bundle.textContent).toContain("Alice latest")
+
+    // The members collapse; every other thread renders alone (bob, the
+    // NON-consecutive alice3, carol, and the senderless row).
+    expect(container.querySelectorAll("[data-thread-row]").length).toBe(4)
+    expect(
+      container.querySelector(`[data-thread-row="${ids.alice1}"]`)
+    ).toBeNull()
+    expect(
+      container.querySelector(`[data-thread-row="${ids.alice2}"]`)
+    ).toBeNull()
+    expect(
+      container.querySelector(`[data-thread-row="${ids.alice3}"]`)
+    ).not.toBeNull()
+  })
+
+  it("expanding a bundle reveals its member threads; collapsing hides them again", async () => {
+    await setupBundleAccount()
+    const container = await renderGrouped()
+
+    fireEvent.click(container.querySelector("[data-bundle-row]") as Element)
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-thread-row]").length).toBe(6)
+    )
+    expect(
+      container
+        .querySelector("[data-bundle-row]")
+        ?.getAttribute("data-bundle-expanded")
+    ).toBe("true")
+    for (const key of ["alice1", "alice2"] as const) {
+      const member = container.querySelector(`[data-thread-row="${ids[key]}"]`)
+      expect(member).not.toBeNull()
+      expect(member?.getAttribute("data-bundle-member")).toBe("true")
+    }
+
+    fireEvent.click(container.querySelector("[data-bundle-row]") as Element)
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-thread-row]").length).toBe(4)
+    )
+    expect(
+      container
+        .querySelector("[data-bundle-row]")
+        ?.getAttribute("data-bundle-expanded")
+    ).toBe("false")
+  })
+
+  it("bundle mark-read applies to every member", async () => {
+    await setupBundleAccount()
+    const container = await renderGrouped()
+
+    fireEvent.click(
+      within(
+        container.querySelector("[data-bundle-row]") as HTMLElement
+      ).getByRole("button", { name: "Mark read" })
+    )
+    // Both members flip to read (the rows stay in the inbox view).
+    await waitFor(() =>
+      expect(container.querySelectorAll('[data-unread="true"]').length).toBe(0)
+    )
+    expect((await threadFlags(ids.alice1)).unread_count).toBe(0)
+    expect((await threadFlags(ids.alice2)).unread_count).toBe(0)
+  })
+
+  it("bundle archive applies to every member and empties the bundle", async () => {
+    await setupBundleAccount()
+    const container = await renderGrouped()
+
+    fireEvent.click(
+      within(
+        container.querySelector("[data-bundle-row]") as HTMLElement
+      ).getByRole("button", { name: "Archive" })
+    )
+    // Both members leave the inbox → the run disappears entirely.
+    await waitFor(() =>
+      expect(container.querySelector("[data-bundle-row]")).toBeNull()
+    )
+    expect(container.querySelectorAll("[data-thread-row]").length).toBe(4)
+    expect((await threadFlags(ids.alice1)).is_archived).toBe(1)
+    expect((await threadFlags(ids.alice2)).is_archived).toBe(1)
+  })
+
+  it("bundle trash applies to every member", async () => {
+    await setupBundleAccount()
+    // Gmail trash keeps the INBOX membership (it adds the TRASH role), so
+    // the membership-based specialUse-inbox selector legitimately still
+    // lists it; the unified scope runs the PRESET inbox whose predicate
+    // excludes trashed rows — and doubles as the mixed-scope coverage of
+    // design decision 4 (bundles + unified actions via the row's account).
+    useUiStore.setState({ listScope: { kind: "unified" } })
+    const container = await renderGrouped()
+
+    fireEvent.click(
+      within(
+        container.querySelector("[data-bundle-row]") as HTMLElement
+      ).getByRole("button", { name: "Trash" })
+    )
+    await waitFor(() =>
+      expect(container.querySelector("[data-bundle-row]")).toBeNull()
+    )
+    expect(container.querySelectorAll("[data-thread-row]").length).toBe(4)
+    expect((await threadFlags(ids.alice1)).is_trashed).toBe(1)
+    expect((await threadFlags(ids.alice2)).is_trashed).toBe(1)
+  })
+
+  it("bundle snooze snoozes every member through the shared flow", async () => {
+    await setupBundleAccount()
+    const container = await renderGrouped()
+
+    fireEvent.click(
+      within(
+        container.querySelector("[data-bundle-row]") as HTMLElement
+      ).getByLabelText("Snooze bundle")
+    )
+    const preset = getSnoozePresets().presets.find(
+      (entry) => entry.id === "tomorrow"
+    )
+    if (!preset) throw new Error("tomorrow preset missing")
+    fireEvent.click(await screen.findByRole("menuitem", { name: preset.label }))
+
+    await waitFor(async () => {
+      expect((await threadFlags(ids.alice1)).snoozed_until).toBe(preset.until)
+      expect((await threadFlags(ids.alice2)).snoozed_until).toBe(preset.until)
+    })
+  })
+
+  it("toggling off restores the flat list and persists the flag", async () => {
+    await setupBundleAccount()
+    const container = await renderGrouped()
+    expect(container.querySelectorAll("[data-bundle-row]").length).toBe(1)
+
+    // The first toggle persisted "on" through the preferences service.
+    await waitFor(async () => {
+      const stored = await executor.select<{ value: string }>(
+        "SELECT value FROM settings WHERE key = 'mail.groupBySender'"
+      )
+      expect(JSON.parse(stored[0].value)).toBe(true)
+    })
+
+    fireEvent.click(screen.getByTestId("group-by-sender-toggle"))
+    await waitFor(() =>
+      expect(container.querySelector("[data-bundle-row]")).toBeNull()
+    )
+    expect(container.querySelectorAll("[data-thread-row]").length).toBe(6)
+
+    // And the second toggle persisted "off".
+    await waitFor(async () => {
+      const stored = await executor.select<{ value: string }>(
+        "SELECT value FROM settings WHERE key = 'mail.groupBySender'"
+      )
+      expect(JSON.parse(stored[0].value)).toBe(false)
+    })
+  })
+})
+
+describe("select-all and bulk actions under the unread filter", () => {
+  /** Two unread + two read inbox threads (gmail ids: archive enqueues). */
+  async function setupMixedReadState(): Promise<{
+    unread: string[]
+    read: string[]
+  }> {
+    const accountId = await createAccount(executor, "gmail")
+    const inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+    const ids: { unread: string[]; read: string[] } = { unread: [], read: [] }
+    for (const [key, subject, seconds, unread] of [
+      ["u1", "Unread one", 60, true],
+      ["u2", "Unread two", 120, true],
+      ["r1", "Read one", 180, false],
+      ["r2", "Read two", 240, false],
+    ] as const) {
+      const threadId = await createThread(executor, accountId, { subject })
+      await createMessage(executor, {
+        threadId,
+        accountId,
+        date: secondsAgo(seconds),
+        subject,
+        fromName: "Alice",
+        fromAddress: "alice@example.com",
+        isRead: !unread,
+        gmailMessageId: `g-${key}`,
+      })
+      await recomputeThreadCaches(executor, threadId)
+      await setThreadLabels(executor, threadId, [inbox])
+      ;(unread ? ids.unread : ids.read).push(threadId)
+    }
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+    return ids
+  }
+
+  it("select-all selects only the visible unread rows; bulk archive applies to them", async () => {
+    const ids = await setupMixedReadState()
+    useThreadListStore.getState().setUnreadOnly(true)
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-thread-row]")).toHaveLength(2)
+    )
+
+    // Open the selection bar with one checkbox, then select-all.
+    const firstId = ids.unread[0]
+    const firstWrap = container
+      .querySelector(`[data-thread-row="${firstId}"]`)
+      ?.querySelector(`[data-thread-checkbox="${firstId}"]`)
+    expect(firstWrap).not.toBeNull()
+    fireEvent.click(firstWrap as Element)
+    expect(screen.getByTestId("thread-selection-bar")).not.toBeNull()
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all" }))
+
+    // Exactly the VISIBLE (unread) rows joined — the two read rows hidden
+    // by the filter never do…
+    expect([...useThreadListStore.getState().selectedIds].sort()).toEqual(
+      [...ids.unread].sort()
+    )
+    // …and "all selected" reads against the visible set.
+    expect(
+      screen.getByRole("checkbox", { name: "Clear selection" })
+    ).not.toBeNull()
+
+    // The bulk action applies to the selected (visible) rows only.
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }))
+    await waitFor(() =>
+      expect(useThreadListStore.getState().selectedIds.size).toBe(0)
+    )
+    for (const id of ids.unread) {
+      const rows = await executor.select<{ is_archived: number }>(
+        "SELECT is_archived FROM threads WHERE id = $1",
+        [id]
+      )
+      expect(rows[0]?.is_archived).toBe(1)
+    }
+    for (const id of ids.read) {
+      const rows = await executor.select<{ is_archived: number }>(
+        "SELECT is_archived FROM threads WHERE id = $1",
+        [id]
+      )
+      expect(rows[0]?.is_archived).toBe(0)
+    }
+  })
+})
+
+describe("bulk action failure isolation across account groups", () => {
+  it("a rejected group does not skip the rest; the list still refreshes", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+    const seedAccountThread = async (
+      email: string,
+      subject: string,
+      seconds: number,
+      key: string
+    ): Promise<{ accountId: string; threadId: string }> => {
+      const accountId = await createAccount(executor, "gmail")
+      const inbox = await createGmailLabel(
+        executor,
+        accountId,
+        "INBOX",
+        "INBOX",
+        "inbox"
+      )
+      const threadId = await createThread(executor, accountId, { subject })
+      await createMessage(executor, {
+        threadId,
+        accountId,
+        date: secondsAgo(seconds),
+        subject,
+        fromName: subject,
+        fromAddress: email,
+        isRead: false,
+        gmailMessageId: `g-${key}`,
+      })
+      await recomputeThreadCaches(executor, threadId)
+      await setThreadLabels(executor, threadId, [inbox])
+      return { accountId, threadId }
+    }
+    // A's row is older, so B's account group is the FIRST bulkApply call.
+    const a = await seedAccountThread("a@example.com", "A mail", 240, "iso-a")
+    const b = await seedAccountThread("b@example.com", "B mail", 60, "iso-b")
+    useAccountStore.setState({
+      accounts: [
+        {
+          id: a.accountId,
+          type: "gmail",
+          email: "a@example.com",
+          displayName: null,
+          status: "active",
+          unreadCount: 1,
+        },
+        {
+          id: b.accountId,
+          type: "gmail",
+          email: "b@example.com",
+          displayName: null,
+          status: "active",
+          unreadCount: 1,
+        },
+      ],
+      activeAccountId: a.accountId,
+      loaded: true,
+    })
+    useUiStore.setState({ listScope: { kind: "unified" } })
+
+    const spy = vi
+      .spyOn(threadActions, "bulkApply")
+      .mockImplementationOnce(async () => {
+        throw new Error("account B apply exploded")
+      })
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-thread-row]")).toHaveLength(2)
+    )
+
+    for (const id of [b.threadId, a.threadId]) {
+      const row = container.querySelector(`[data-thread-row="${id}"]`)
+      const wrap = row?.querySelector(`[data-thread-checkbox="${id}"]`)
+      expect(wrap).not.toBeNull()
+      fireEvent.click(wrap as Element)
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }))
+
+    // Both groups ran despite the first rejection…
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(2))
+    expect(spy).toHaveBeenNthCalledWith(
+      1,
+      expect.anything(),
+      b.accountId,
+      [b.threadId],
+      "archive"
+    )
+    expect(spy).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      a.accountId,
+      [a.threadId],
+      "archive"
+    )
+    // …the rows that DID apply are durably gone: the refresh ran and A's
+    // row left the unified view, while the failed B row stayed.
+    await waitFor(() =>
+      expect(
+        container.querySelector(`[data-thread-row="${a.threadId}"]`)
+      ).toBeNull()
+    )
+    expect(
+      container.querySelector(`[data-thread-row="${b.threadId}"]`)
+    ).not.toBeNull()
+    // And the consumed bulk selection was cleared anyway.
+    expect(useThreadListStore.getState().selectedIds.size).toBe(0)
+
+    warn.mockRestore()
+  })
+})
+
+describe("split scope presentation (title, empty state, badges)", () => {
+  async function setupSplitMailbox(): Promise<{
+    accountA: string
+    accountB: string
+    threadA: string
+    threadB: string
+  }> {
+    const seed = async (
+      email: string,
+      subject: string,
+      seconds: number
+    ): Promise<{ accountId: string; threadId: string }> => {
+      const accountId = await createAccount(executor, "gmail")
+      const threadId = await createThread(executor, accountId, { subject })
+      await createMessage(executor, {
+        threadId,
+        accountId,
+        date: secondsAgo(seconds),
+        subject,
+        fromName: subject,
+        fromAddress: email,
+      })
+      await recomputeThreadCaches(executor, threadId)
+      return { accountId, threadId }
+    }
+    const a = await seed("alpha@example.com", "Quarterly roadmap", 240)
+    const b = await seed("beta@example.com", "B roadmap", 60)
+    useAccountStore.setState({
+      accounts: [
+        {
+          id: a.accountId,
+          type: "gmail",
+          email: "alpha@example.com",
+          displayName: null,
+          status: "active",
+          unreadCount: 0,
+        },
+        {
+          id: b.accountId,
+          type: "gmail",
+          email: "beta@example.com",
+          displayName: "Beta Corp",
+          status: "active",
+          unreadCount: 0,
+        },
+      ],
+      activeAccountId: a.accountId,
+      loaded: true,
+    })
+    return {
+      accountA: a.accountId,
+      accountB: b.accountId,
+      threadA: a.threadId,
+      threadB: b.threadId,
+    }
+  }
+
+  it("renders account badges on an un-pinned split's cross-account rows", async () => {
+    const { accountA, accountB } = await setupSplitMailbox()
+    useUiStore.setState({
+      listScope: { kind: "split", name: "Roadmaps", query: "roadmap" },
+    })
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-thread-row]")).toHaveLength(2)
+    )
+    expect(
+      container.querySelector(`[data-account-badge="${accountA}"]`)
+    ).not.toBeNull()
+    expect(
+      container.querySelector(`[data-account-badge="${accountB}"]`)
+    ).not.toBeNull()
+  })
+
+  it("renders no badges on an account-pinned split", async () => {
+    const { accountA } = await setupSplitMailbox()
+    useUiStore.setState({
+      listScope: {
+        kind: "split",
+        name: "Alpha roadmaps",
+        query: "roadmap",
+        accountId: accountA,
+      },
+    })
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-thread-row]")).toHaveLength(1)
+    )
+    expect(container.querySelector("[data-account-badge]")).toBeNull()
+  })
+
+  it("shows the split's own empty state, not the underlying folder's", async () => {
+    await setupSplitMailbox()
+    useUiStore.setState({
+      listScope: { kind: "split", name: "Receipts", query: "zzz-nothing" },
+    })
+    render(<ThreadList />)
+    expect(await screen.findByText('No threads in "Receipts"')).not.toBeNull()
   })
 })

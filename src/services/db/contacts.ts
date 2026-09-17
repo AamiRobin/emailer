@@ -1,4 +1,5 @@
 import type { SqlExecutor } from "./executor"
+import type { ThreadRow } from "./threads"
 
 /**
  * Contacts query module (task 8.3): the local address book accumulated
@@ -18,7 +19,17 @@ import type { SqlExecutor } from "./executor"
  * Name update policy everywhere in this module: an existing non-null
  * name always wins, a null name is filled from the incoming value — the
  * first name we learned about a person is kept until it is replaced by
- * an explicit edit (no contact editing exists yet).
+ * an explicit edit (updateContact, task 20.2's Contacts browser).
+ *
+ * ── Browser listing and lifecycle (task 20.2, contacts spec) ──
+ * The Contacts browser lists across ALL accounts (like the Todos
+ * sidebar section): listAllContacts is the only unscoped contact query.
+ * Every row still belongs to one account, so cross-account people are
+ * distinct rows and the UI carries the account identity alongside.
+ * Edits (display name, notes) are explicit user writes that never touch
+ * mail history; deleteContact removes ONLY the contacts row — no
+ * message references it (the schema has no FK from messages), and the
+ * next correspondence with the same address simply upserts a fresh row.
  *
  * ── Integration recipe for the composer autocomplete UI (8.3 UI half) ──
  * The query layer deliberately ships no component. To wire suggestions
@@ -45,6 +56,8 @@ export interface ContactRow {
   account_id: string
   email: string
   name: string | null
+  /** Free-form user notes (migration v7, task 20.2); NULL = none yet. */
+  notes: string | null
   interaction_count: number
   last_interaction_at: number | null
   created_at: number
@@ -203,5 +216,157 @@ export async function searchContactsRanked(
       `${escaped}%`,
       limit,
     ]
+  )
+}
+
+export interface ListAllContactsOptions {
+  /** Non-empty text narrows the address book to contacts whose email OR
+   * name matches (LIKE, wildcards escaped); empty/whitespace lists all. */
+  query?: string
+}
+
+/**
+ * The Contacts browser's rows (task 20.2, contacts spec "Address book
+ * list and search"): every known contact across ALL accounts — the one
+ * deliberately unscoped contact query — sorted by most recent
+ * correspondence first (last_interaction_at DESC puts never-contacted
+ * rows last), then frequency, then the alphabetical picker order.
+ * Search narrows by partial name or email; the ordering is unchanged so
+ * typing never re-ranks the visible list.
+ */
+export async function listAllContacts(
+  executor: SqlExecutor,
+  options: ListAllContactsOptions = {}
+): Promise<ContactRow[]> {
+  const trimmed = (options.query ?? "").trim()
+  if (!trimmed) {
+    return executor.select<ContactRow>(
+      `SELECT * FROM contacts
+       ORDER BY last_interaction_at DESC,
+                interaction_count DESC,
+                COALESCE(name, email) COLLATE NOCASE ASC,
+                email ASC`
+    )
+  }
+  const escaped = escapeLike(trimmed)
+  return executor.select<ContactRow>(
+    `SELECT * FROM contacts
+     WHERE email LIKE $1 ESCAPE '\\' OR name LIKE $2 ESCAPE '\\'
+     ORDER BY last_interaction_at DESC,
+              interaction_count DESC,
+              COALESCE(name, email) COLLATE NOCASE ASC,
+              email ASC`,
+    [`%${escaped}%`, `%${escaped}%`]
+  )
+}
+
+/** One contact by row id; null when the row is gone (deleted). */
+export async function getContact(
+  executor: SqlExecutor,
+  contactId: string
+): Promise<ContactRow | null> {
+  const rows = await executor.select<ContactRow>(
+    "SELECT * FROM contacts WHERE id = $1",
+    [contactId]
+  )
+  return rows[0] ?? null
+}
+
+export interface ContactEditPatch {
+  /** Explicit display-name edit (the Contacts browser's rename). Trimmed;
+   * an empty value clears the name back to NULL. Unlike the upsert fill
+   * policy this OVERWRITES the stored name — it is the user's explicit
+   * edit, and the COALESCE upserts keep it afterwards. */
+  name?: string
+  /** Free-form notes text, stored verbatim; empty clears back to NULL. */
+  notes?: string
+}
+
+/**
+ * Apply an explicit edit to one contact (task 20.2, contacts spec
+ * "Contact detail and editing"): display name and/or free-form notes.
+ * Local-only by definition — mail history is never touched. A no-op
+ * patch (neither field) writes nothing.
+ */
+export async function updateContact(
+  executor: SqlExecutor,
+  contactId: string,
+  patch: ContactEditPatch
+): Promise<void> {
+  const sets: string[] = []
+  const params: unknown[] = []
+  if (patch.name !== undefined) {
+    params.push(patch.name.trim() === "" ? null : patch.name.trim())
+    sets.push(`name = $${params.length}`)
+  }
+  if (patch.notes !== undefined) {
+    params.push(patch.notes.trim() === "" ? null : patch.notes)
+    sets.push(`notes = $${params.length}`)
+  }
+  if (!sets.length) return
+  // placeholder numbers ascend by occurrence in the SQL text (see executor.ts)
+  params.push(contactId)
+  await executor.execute(
+    `UPDATE contacts SET ${sets.join(", ")} WHERE id = $${params.length}`,
+    params
+  )
+}
+
+/**
+ * Delete one contact (task 20.2, contacts spec "Contact lifecycle"):
+ * removes ONLY the address-book row. Messages are never touched — the
+ * schema has no reference from messages to contacts — and the next
+ * correspondence with the same address re-inserts a fresh row via the
+ * normal upsert/interaction paths.
+ */
+export async function deleteContact(
+  executor: SqlExecutor,
+  contactId: string
+): Promise<void> {
+  await executor.execute("DELETE FROM contacts WHERE id = $1", [contactId])
+}
+
+export interface ContactThreadsOptions {
+  /** Maximum related threads returned; default 5. */
+  limit?: number
+}
+
+/**
+ * The contact's related recent threads (task 20.2, contacts spec
+ * "related recent threads"): threads on the contact's OWN account where
+ * any message is from the contact's address or addresses them in
+ * To/Cc — the same `"email":"…"` JSON match the nudges detection uses
+ * (serializeContacts' exact spelling, lowercased on both sides), with
+ * the LIKE wildcards in the address escaped. Trashed/spam threads are
+ * excluded (deliberate placements are not correspondence worth
+ * surfacing, mirroring the nudges exclusion set), most recent first.
+ */
+export async function listContactThreads(
+  executor: SqlExecutor,
+  accountId: string,
+  email: string,
+  options: ContactThreadsOptions = {}
+): Promise<ThreadRow[]> {
+  const normalized = normalizeEmail(email)
+  if (!normalized) return []
+  const escaped = escapeLike(normalized)
+  const addressPattern = `%"email":"${escaped}"%`
+  return executor.select<ThreadRow>(
+    `SELECT threads.* FROM threads
+     WHERE threads.account_id = $1
+       AND threads.is_trashed = 0
+       AND threads.is_spam = 0
+       AND EXISTS (
+         SELECT 1 FROM messages m
+         WHERE m.thread_id = threads.id
+           AND (
+             lower(COALESCE(m.from_address, '')) = $2
+             OR lower(COALESCE(m.to_json, '')) LIKE $3 ESCAPE '\\'
+             OR lower(COALESCE(m.cc_json, '')) LIKE $4 ESCAPE '\\'
+           )
+       )
+     ORDER BY threads.last_message_at DESC, threads.id ASC
+     LIMIT $5`,
+    [accountId, normalized, addressPattern, addressPattern, options.limit ?? 5]
   )
 }

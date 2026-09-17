@@ -1,11 +1,15 @@
 import { useEffect, useState, type PropsWithChildren } from "react"
 import { useDroppable } from "@dnd-kit/core"
 import {
+  BellRing,
+  BookUser,
   CirclePlus,
+  Layers,
   PanelLeftClose,
   PanelLeftOpen,
   Settings,
   SquarePen,
+  Zap,
 } from "lucide-react"
 
 import { cn } from "@/lib/utils"
@@ -23,9 +27,14 @@ import {
   type LabelDialogState,
 } from "@/components/labels/label-dialog"
 import { LabelRowMenu } from "@/components/labels/label-row-menu"
+import { getExecutor } from "@/services/db/executor"
+import { listActiveAccounts } from "@/services/db/accounts"
+import { countNudges } from "@/services/db/nudges"
+import { getNudgeDays } from "@/services/settings/preferences"
 import type { LabelRow } from "@/services/db/labels"
 import { useAccountStore } from "@/stores/account-store"
 import { useFolderCountsStore } from "@/stores/folder-counts-store"
+import { useThreadListStore } from "@/stores/thread-list-store"
 import type { FolderSelection, ViewSelection } from "@/stores/ui-store"
 import { useUiStore } from "@/stores/ui-store"
 import {
@@ -33,13 +42,23 @@ import {
   DEPTH_SPACERS,
   useUserLabels,
 } from "@/components/layout/use-sidebar-data"
+import { SavedSearchesSection } from "./saved-searches-section"
+import { ScheduledSendsSection } from "./scheduled-sends-dialog"
+import { SnoozedSection } from "./snoozed-section"
+import { TodosSection } from "./todos-section"
 import { FOLDER_ITEMS } from "./folders"
 
 /**
  * The real mailbox sidebar (task 6.3, mailbox-ui spec "Sidebar
  * navigation"): compose button, system folders with live unread counts,
  * the active account's user labels as a "/"-hierarchy, and a settings
- * entry. Collapses to an icon rail (tooltips carry the names) — the
+ * entry — plus the scope entries above the folders: Unified inbox with 2+
+ * active accounts (task 9.2), the Priority inbox (task 13.2, design D7)
+ * and Nudges (task 14.1, design D8) with 1+ — all entering an
+ * across-accounts list scope without changing the view selection. The
+ * Nudges row carries the inbox marker: a live count of awaiting-reply
+ * threads. Collapses to an icon rail (tooltips carry
+ * the names) — the
  * collapsed flag lives in uiStore and the shell mirrors it onto the
  * ResizablePanel. The account switcher stays above this composite in the
  * shell's left pane. The folder rows come from the shared FOLDER_ITEMS
@@ -97,11 +116,107 @@ interface SidebarProps {
   isCollapsed: boolean
 }
 
+/**
+ * The Nudges inbox marker (task 14.1, mail-organization spec "surface
+ * them in a Nudges view and/or with an inbox marker"): the count of
+ * awaiting-reply threads across the ACTIVE accounts (db/nudges.countNudges
+ * — the exact detection the view lists), rendered as a small pill on the
+ * sidebar's Nudges entry. Liveness mirrors the split-tab counts (the
+ * cheapest "mail changed" signal available): recomputed on mount, on
+ * every account switch, and whenever the thread-list store's rows change
+ * (refreshThreadList runs after sync completion and thread actions). A
+ * failed count (e.g. no DB outside Tauri) keeps the badge empty.
+ */
+function useNudgeCount(): number {
+  const activeAccountId = useAccountStore((state) => state.activeAccountId)
+  const [count, setCount] = useState(0)
+  const [revision, setRevision] = useState(0)
+  useEffect(
+    () =>
+      useThreadListStore.subscribe((state, previous) => {
+        if (state.threads !== previous.threads) {
+          setRevision((value) => value + 1)
+        }
+      }),
+    []
+  )
+  useEffect(() => {
+    let cancelled = false
+    Promise.resolve()
+      .then(async () => {
+        const executor = getExecutor()
+        const activeIds = (await listActiveAccounts(executor)).map(
+          (row) => row.id
+        )
+        if (activeIds.length === 0) return 0
+        const thresholdDays = await getNudgeDays(executor)
+        return countNudges(executor, { accountIds: activeIds, thresholdDays })
+      })
+      .then((next) => {
+        if (!cancelled) setCount(next ?? 0)
+      })
+      .catch((error) => {
+        console.warn("[sidebar] nudge count failed", error)
+        if (!cancelled) setCount(0)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [revision, activeAccountId])
+  return count
+}
+
 export function Sidebar({ isCollapsed }: SidebarProps) {
   const view = useUiStore((state) => state.view)
   const setView = useUiStore((state) => state.setView)
   const toggleSidebar = useUiStore((state) => state.toggleSidebar)
   const activeAccountId = useAccountStore((state) => state.activeAccountId)
+  // Unified inbox entry (task 9.2): the entry point for the across-
+  // accounts scope. It earns its place only with 2+ ACTIVE accounts —
+  // with fewer it would just duplicate the single account's inbox.
+  // Entering is one ui-store write; setView clears the scope again, so
+  // every other navigation doubles as the way out.
+  const accounts = useAccountStore((state) => state.accounts)
+  const listScopeKind = useUiStore((state) => state.listScope?.kind)
+  const unifiedActive = listScopeKind === "unified"
+  const unifiedAvailable =
+    accounts.filter((account) => account.status === "active").length >= 2
+  // Priority inbox entry (task 13.2, design D7): unlike unified it is
+  // useful with a SINGLE active account (the classification works within
+  // one mailbox), so it renders with 1+ active accounts, next to Unified.
+  const priorityAvailable = accounts.some(
+    (account) => account.status === "active"
+  )
+  const priorityActive = listScopeKind === "priority"
+  // Nudges entry (task 14.1, design D8): like Priority it is useful with
+  // a single active account, so it renders with 1+ — always (the marker
+  // count, not the entry, appears only while nudges exist).
+  const nudgesAvailable = accounts.some(
+    (account) => account.status === "active"
+  )
+  const nudgesActive = listScopeKind === "nudges"
+  const nudgeCount = useNudgeCount()
+  // Contacts entry (task 20.2): the address book accumulated across the
+  // ACTIVE accounts, useful with 1+ like Priority/Nudges. Unlike those
+  // scopes it is a real ViewSelection — the browser replaces the mailbox
+  // panes (settings-style), so entering is one setView and any folder or
+  // label click navigates out of it again.
+  const contactsAvailable = accounts.some(
+    (account) => account.status === "active"
+  )
+  const contactsActive = view.kind === "contacts"
+  const enterContacts = () => {
+    setView({ kind: "contacts" })
+  }
+  const enterUnifiedInbox = () => {
+    useUiStore.getState().setListScope({ kind: "unified" })
+  }
+  const enterPriorityInbox = () => {
+    useUiStore.getState().setListScope({ kind: "priority" })
+  }
+  const enterNudges = () => {
+    useUiStore.getState().setListScope({ kind: "nudges" })
+  }
   const activeAccount = useAccountStore(
     (state) =>
       state.accounts.find((account) => account.id === state.activeAccountId) ??
@@ -177,6 +292,184 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
             isCollapsed && "justify-items-center"
           )}
         >
+          {/* Unified inbox (task 9.2): aggregates the active accounts'
+              inboxes through the ui-store list-scope override — the view
+              selection stays untouched, so any folder/label/search click
+              exits again via setView. Rendered with 2+ active accounts in
+              both layouts; the icon rail keeps the name in the tooltip. */}
+          {unifiedAvailable &&
+            (isCollapsed ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Unified inbox"
+                      aria-current={unifiedActive ? "true" : undefined}
+                      className={cn(
+                        buttonVariants({ variant: "ghost", size: "icon-lg" }),
+                        "mx-auto",
+                        unifiedActive && "bg-muted text-foreground"
+                      )}
+                      onClick={enterUnifiedInbox}
+                    >
+                      <Layers />
+                    </button>
+                  }
+                />
+                <TooltipContent side="right">Unified inbox</TooltipContent>
+              </Tooltip>
+            ) : (
+              <button
+                type="button"
+                aria-current={unifiedActive ? "true" : undefined}
+                className={cn(
+                  buttonVariants({ variant: "ghost", size: "sm" }),
+                  "w-full justify-start",
+                  unifiedActive && "bg-muted text-foreground"
+                )}
+                onClick={enterUnifiedInbox}
+              >
+                <Layers />
+                Unified inbox
+              </button>
+            ))}
+          {/* Priority inbox (task 13.2, design D7): the classified view —
+              inbox threads whose newest sender scores important — entered
+              through the same list-scope mechanism as Unified. Renders
+              with 1+ active accounts (useful within a single mailbox). */}
+          {priorityAvailable &&
+            (isCollapsed ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Priority"
+                      aria-current={priorityActive ? "true" : undefined}
+                      className={cn(
+                        buttonVariants({ variant: "ghost", size: "icon-lg" }),
+                        "mx-auto",
+                        priorityActive && "bg-muted text-foreground"
+                      )}
+                      onClick={enterPriorityInbox}
+                    >
+                      <Zap />
+                    </button>
+                  }
+                />
+                <TooltipContent side="right">Priority</TooltipContent>
+              </Tooltip>
+            ) : (
+              <button
+                type="button"
+                aria-current={priorityActive ? "true" : undefined}
+                className={cn(
+                  buttonVariants({ variant: "ghost", size: "sm" }),
+                  "w-full justify-start",
+                  priorityActive && "bg-muted text-foreground"
+                )}
+                onClick={enterPriorityInbox}
+              >
+                <Zap />
+                Priority
+              </button>
+            ))}
+          {/* Nudges (task 14.1, design D8): the awaiting-reply threads the
+              db/nudges.ts detection finds, entered through the same
+              list-scope mechanism as Unified/Priority. The pill is the
+              inbox marker — the count across the active accounts, shown
+              only while it is positive (the folder-badge styling). */}
+          {nudgesAvailable &&
+            (isCollapsed ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Nudges"
+                      aria-current={nudgesActive ? "true" : undefined}
+                      className={cn(
+                        buttonVariants({ variant: "ghost", size: "icon-lg" }),
+                        "mx-auto",
+                        nudgesActive && "bg-muted text-foreground"
+                      )}
+                      onClick={enterNudges}
+                    >
+                      <BellRing />
+                    </button>
+                  }
+                />
+                <TooltipContent side="right" className="gap-2">
+                  Nudges
+                  {nudgeCount > 0 && (
+                    <span className="text-muted-foreground tabular-nums">
+                      {nudgeCount}
+                    </span>
+                  )}
+                </TooltipContent>
+              </Tooltip>
+            ) : (
+              <button
+                type="button"
+                aria-current={nudgesActive ? "true" : undefined}
+                className={cn(
+                  buttonVariants({ variant: "ghost", size: "sm" }),
+                  "w-full justify-start",
+                  nudgesActive && "bg-muted text-foreground"
+                )}
+                onClick={enterNudges}
+              >
+                <BellRing />
+                Nudges
+                {nudgeCount > 0 && (
+                  <span className="ml-auto rounded-full bg-muted px-1.5 text-xs font-medium text-muted-foreground tabular-nums">
+                    {nudgeCount}
+                  </span>
+                )}
+              </button>
+            ))}
+          {/* Contacts (task 20.2): the cross-account address book behind
+              the ui-store "contacts" view — the settings-style full-pane
+              browser (search/detail/edit/compose/delete). Renders with 1+
+              active accounts, in both layouts like the entries above. */}
+          {contactsAvailable &&
+            (isCollapsed ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Contacts"
+                      aria-current={contactsActive ? "true" : undefined}
+                      className={cn(
+                        buttonVariants({ variant: "ghost", size: "icon-lg" }),
+                        "mx-auto",
+                        contactsActive && "bg-muted text-foreground"
+                      )}
+                      onClick={enterContacts}
+                    >
+                      <BookUser />
+                    </button>
+                  }
+                />
+                <TooltipContent side="right">Contacts</TooltipContent>
+              </Tooltip>
+            ) : (
+              <button
+                type="button"
+                aria-current={contactsActive ? "true" : undefined}
+                className={cn(
+                  buttonVariants({ variant: "ghost", size: "sm" }),
+                  "w-full justify-start",
+                  contactsActive && "bg-muted text-foreground"
+                )}
+                onClick={enterContacts}
+              >
+                <BookUser />
+                Contacts
+              </button>
+            ))}
           {FOLDER_ITEMS.map((item) =>
             isCollapsed ? (
               <Tooltip key={item.countKey}>
@@ -235,6 +528,24 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
             )
           )}
         </nav>
+        {/* Scheduled sends (tasks 10.1/10.3): the sidebar entry opens the
+            dialog listing pending sends (edit/cancel) plus sent/failed
+            history — deliberately not a threads view, so it is a dialog
+            like the label dialogs, not a ViewSelection. Always rendered
+            expanded (discoverable before the first scheduled send); the
+            badge counts pending rows. */}
+        {!isCollapsed && <ScheduledSendsSection />}
+        {/* Todos (task 15.2): pending threads across ALL accounts, each
+            row completing/reordering/removing in place — renders only
+            while pending todos exist, like the Snoozed section. */}
+        {!isCollapsed && <TodosSection />}
+        {/* Snoozed (task 2.4): renders only while the account has snoozed
+            threads — like the labels section it yields to the icon rail. */}
+        {!isCollapsed && <SnoozedSection />}
+        {/* Saved searches (task 7.1): stored query bookmarks created from
+            the results view's "Save search" affordance; sits with the other
+            user-created sections, just above Labels. */}
+        {!isCollapsed && <SavedSearchesSection />}
         {/* User labels keep the wide layout only — an icon rail cannot
             represent a hierarchy, so the section yields until expanded.
             The section (and its "+" button) renders whenever expanded, so

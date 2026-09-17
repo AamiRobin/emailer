@@ -4,6 +4,7 @@ use tauri_plugin_opener::OpenerExt;
 
 mod badge;
 mod imap;
+mod mail_import;
 mod oauth;
 mod smtp;
 
@@ -83,9 +84,12 @@ pub fn run() {
             imap::commands::imap_rename_folder,
             imap::commands::imap_delete_folder,
             smtp::commands::smtp_send_email,
+            smtp::commands::smtp_send_raw_email,
             smtp::commands::smtp_test_connection,
             oauth::start_oauth_server,
             oauth::cancel_oauth_server,
+            mail_import::parse_eml_file,
+            mail_import::parse_mbox_file,
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {

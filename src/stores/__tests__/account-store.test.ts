@@ -4,6 +4,11 @@ import {
   createTestExecutor,
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
+import { snoozeThread, wakeDueThreads } from "@/services/email-actions/snooze"
+import {
+  muteThread,
+  unmuteThread,
+} from "@/services/email-actions/thread-states"
 import {
   setAccountStoreExecutor,
   useAccountStore,
@@ -60,7 +65,8 @@ async function seedUnread(
   accountId: string,
   unread: number,
   read = 0
-): Promise<void> {
+): Promise<string[]> {
+  const threadIds: string[] = []
   for (let index = 0; index < unread + read; index += 1) {
     idSequence += 1
     const threadId = `th-${idSequence}`
@@ -79,7 +85,9 @@ async function seedUnread(
         index < read ? 1 : 0,
       ]
     )
+    threadIds.push(threadId)
   }
+  return threadIds
 }
 
 async function persistedActiveId(): Promise<string | null> {
@@ -248,6 +256,50 @@ describe("account store", () => {
     expect(
       accounts.find((account) => account.id === secondId)?.unreadCount
     ).toBe(4)
+  })
+
+  it("per-account counts exclude snoozed and muted threads (same exclusion as the OS badge)", async () => {
+    const firstId = await seedAccount({
+      email: "one@example.com",
+      isActive: true,
+    })
+    await seedAccount({ email: "two@example.com" })
+    const [, snoozedThread, mutedThread] = await seedUnread(firstId, 3)
+    await useAccountStore.getState().init()
+    expect(
+      useAccountStore.getState().accounts.find((a) => a.id === firstId)
+        ?.unreadCount
+    ).toBe(3)
+
+    // Snoozed (task 2.2 carry-over) and muted (task 3.1) threads stop
+    // counting toward the switcher badges — UNREAD_BY_ACCOUNT_SQL applies
+    // the same exclusion predicate as getTotalUnreadCount's OS badge.
+    await snoozeThread(executor, snoozedThread, 1_700_000_500)
+    await muteThread(executor, mutedThread)
+
+    // refreshUnreadCounts runs the shared aggregate…
+    await useAccountStore.getState().refreshUnreadCounts()
+    expect(
+      useAccountStore.getState().accounts.find((a) => a.id === firstId)
+        ?.unreadCount
+    ).toBe(1)
+
+    // …and so does the initial load (the two call sites share one SQL
+    // constant and cannot drift).
+    await useAccountStore.getState().reload()
+    expect(
+      useAccountStore.getState().accounts.find((a) => a.id === firstId)
+        ?.unreadCount
+    ).toBe(1)
+
+    // Clearing the flags restores the counts without any read-state change.
+    await unmuteThread(executor, mutedThread)
+    expect(await wakeDueThreads(executor, 1_700_001_000)).toBe(1)
+    await useAccountStore.getState().refreshUnreadCounts()
+    expect(
+      useAccountStore.getState().accounts.find((a) => a.id === firstId)
+        ?.unreadCount
+    ).toBe(3)
   })
 
   it("reload re-applies the restore semantics after the flag changed on disk", async () => {

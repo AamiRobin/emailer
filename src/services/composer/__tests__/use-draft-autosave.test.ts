@@ -6,6 +6,8 @@ import {
   createTestExecutor,
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
+import { listPendingOperations } from "@/services/db/pending-operations"
+import { operationFromRow } from "@/services/queue/operation"
 import type { DraftInput } from "../drafts"
 import { listDrafts } from "../drafts"
 import {
@@ -245,5 +247,37 @@ describe("useDraftAutosave", () => {
     await advance(DRAFT_AUTOSAVE_DEBOUNCE_MS + 1_000) // retry succeeds
     const drafts = await listDrafts(executor, accountId)
     expect(drafts.map((draft) => draft.subject)).toEqual(["must survive"])
+  })
+
+  it("coalesces the pending draft_upsert mirror op to the newest save (design D9, task 17.x)", async () => {
+    renderAutosave()
+    await advance(1_000) // prime the baseline
+    currentInput = { ...currentInput, subject: "mirror me" }
+    await advance(DRAFT_AUTOSAVE_DEBOUNCE_MS + 1_000)
+
+    // The local save is accompanied by exactly one queued server-mirror
+    // upsert, carrying the saved content and the row id.
+    const rows = await listPendingOperations(executor)
+    expect(rows).toHaveLength(1)
+    const op = operationFromRow(rows[0])
+    expect(op).toMatchObject({ accountId, kind: "draft_upsert" })
+    if (op.kind !== "draft_upsert") return
+    expect(op.mime).toContain("Subject: mirror me")
+    const drafts = await listDrafts(executor, accountId)
+    expect(op.draftId).toBe(drafts[0].id)
+
+    // A second save COALESCES rather than stacks: the mirror is
+    // last-write-wins, so the still-pending upsert for the same draft is
+    // replaced and at most one full-MIME op waits for replay — carrying
+    // the newest snapshot.
+    currentInput = { ...currentInput, subject: "mirror me again" }
+    await advance(DRAFT_AUTOSAVE_DEBOUNCE_MS + 1_000)
+    const rows2 = await listPendingOperations(executor)
+    expect(rows2).toHaveLength(1)
+    expect(rows2[0].op_type).toBe("draft_upsert")
+    const op2 = operationFromRow(rows2[0])
+    if (op2.kind !== "draft_upsert") return
+    expect(op2.mime).toContain("Subject: mirror me again")
+    expect(op2.mime).not.toContain("Subject: mirror me\r\n")
   })
 })

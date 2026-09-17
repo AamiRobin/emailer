@@ -47,7 +47,13 @@ vi.mock("@/services/db/executor", () => ({
     ),
 }))
 
-vi.mock("@/services/composer/send", () => ({ sendComposerDraft: vi.fn() }))
+vi.mock("@/services/composer/send", async (importOriginal) => ({
+  // sendComposerDraft is the module boundary under test here; the real
+  // resolveMissingPgpRecipients stays live (pure settings reads — the
+  // missing-key guard exercises the actual 18.4 lookup).
+  ...(await importOriginal<object>()),
+  sendComposerDraft: vi.fn(),
+}))
 
 vi.mock("sonner", () => ({
   toast: Object.assign(vi.fn(), {
@@ -69,11 +75,23 @@ const readFileMock = vi.mocked(readFile)
 const sendComposerDraftMock = vi.mocked(sendComposerDraft)
 const toastMock = vi.mocked(toast)
 
-import { createAccount } from "@/services/db/__tests__/fixtures"
+import {
+  createAccount,
+  createThread,
+  uid,
+} from "@/services/db/__tests__/fixtures"
 import {
   createTestExecutor,
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
+import { upsertManualAlias } from "@/services/db/aliases"
+import { setSetting } from "@/services/db/settings"
+import {
+  privateKeysSettingKey,
+  publicKeysSettingKey,
+} from "@/services/crypto/pgp-keys"
+import { createSnippet } from "@/services/db/snippets"
+import { insertMessage } from "@/services/db/messages"
 import { listDrafts, saveDraft } from "@/services/composer/drafts"
 import {
   sendComposerDraft,
@@ -83,7 +101,13 @@ import {
   DRAFT_AUTOSAVE_DEBOUNCE_MS,
   DRAFT_AUTOSAVE_POLL_INTERVAL_MS,
 } from "@/services/composer/use-draft-autosave"
+import {
+  attachmentGuardSettingKey,
+  getAttachmentGuardSuppressed,
+  sendDelaySettingKey,
+} from "@/services/settings/preferences"
 import { getComposerPayload, useComposerStore } from "@/stores/composer-store"
+import { getScheduleSendPresets } from "@/components/layout/use-scheduled-sends"
 import { getAttachmentBytes } from "../attachment-bytes"
 import {
   AttachmentTooLargeError,
@@ -175,6 +199,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   cleanup()
+  // Kill any leaked undo window (its timers) before dropping the draft.
+  useComposerStore.getState().cancelUndoSend()
   useComposerStore.getState().reset()
   vi.useRealTimers()
   // Let the unmount autosave flush settle before closing the database.
@@ -663,6 +689,12 @@ describe("Composer draft key (task 8.6)", () => {
 })
 
 describe("Composer send wiring (task 8.7)", () => {
+  // These tests exercise the IMMEDIATE send path, so undo send is turned
+  // off for the account; the window itself has its own suites (5.1/5.2).
+  beforeEach(async () => {
+    await setSetting(executor, sendDelaySettingKey(accountId), 0)
+  })
+
   function renderSendable(): string {
     openComposer()
     render(<Composer />)
@@ -690,6 +722,7 @@ describe("Composer send wiring (task 8.7)", () => {
       accountId,
       draftKey,
       mode: { kind: "new" },
+      fromAlias: null, // no alias chosen — the bare account identity
       payload: expect.objectContaining({
         to: [{ email: "ada@example.com" }],
         subject: "Quarterly report",
@@ -797,6 +830,196 @@ describe("Composer send wiring (task 8.7)", () => {
     )
     // The attachment registry is cleared with the reset.
     expect(getComposerPayload().attachments).toBeUndefined()
+  })
+
+  it("a positive undo delay starts the pre-send window instead of sending (5.1/5.2)", async () => {
+    await setSetting(executor, sendDelaySettingKey(accountId), 5)
+    renderSendable()
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    // Nothing transmitted: the store holds the window and the banner
+    // state instead (expiry is the undo-send service/store suites' job).
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+    const window = useComposerStore.getState().undoWindow
+    expect(window).toMatchObject({
+      accountId,
+      subject: "Quarterly report",
+      totalSeconds: 5,
+      remainingSeconds: 5,
+    })
+
+    // Leave no live timer behind for later tests.
+    expect(useComposerStore.getState().cancelUndoSend()).toBe(true)
+    expect(useComposerStore.getState().open).toBe(true)
+  })
+})
+
+describe("Composer send guards (task 5.3)", () => {
+  // Guards are verified against the IMMEDIATE send path; the undo-send
+  // window itself has its own suites (5.1/5.2) and starts only after the
+  // prompts are answered.
+  beforeEach(async () => {
+    await setSetting(executor, sendDelaySettingKey(accountId), 0)
+  })
+
+  /** Open the composer with a recipient and a body; the subject stays
+   * empty unless given. */
+  function renderWithBody(bodyHtml: string, subject?: string): void {
+    openComposer()
+    render(<Composer />)
+    const toInput = screen.getByLabelText("To")
+    typeInto(toInput, "ada@example.com")
+    pressKey(toInput, "Enter")
+    // Wrapped in act: setContent syncs the store outside a React event,
+    // and the Send button's canSend gate reads the subscribed html.
+    act(() => {
+      getMountedEditor().commands.setContent(bodyHtml)
+    })
+    if (subject !== undefined) {
+      typeInto(screen.getByLabelText("Subject"), subject)
+    }
+  }
+
+  it("prompts the forgotten-attachment reminder before sending", async () => {
+    renderWithBody("<p>I attached the report</p>", "Quarterly report")
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText("Missing attachment?")).toBeTruthy()
+    expect(
+      within(dialog).getByRole("button", { name: "Send anyway" })
+    ).toBeTruthy()
+    // A guard prompt is not a send: nothing was transmitted.
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+    expect(useComposerStore.getState().open).toBe(true)
+  })
+
+  it("'Attach a file' goes back and opens the picker without sending", async () => {
+    renderWithBody("<p>I attached the report</p>", "Quarterly report")
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+    openMock.mockResolvedValue(null)
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Attach a file",
+      })
+    )
+
+    await waitFor(() => expect(openMock).toHaveBeenCalled())
+    // The attempt is aborted: the prompt closes, the composer keeps the
+    // draft and nothing was sent.
+    expect(screen.queryByRole("dialog")).toBeNull()
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+    expect(useComposerStore.getState().open).toBe(true)
+  })
+
+  it("'Send anyway' proceeds with the send", async () => {
+    renderWithBody("<p>I attached the report</p>", "Quarterly report")
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Send anyway",
+      })
+    )
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("queues the empty-subject confirmation after the attachment guard, each once per attempt", async () => {
+    renderWithBody("<p>I attached the report</p>") // no subject
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+
+    // First prompt: the attachment reminder.
+    const attachmentDialog = await screen.findByRole("dialog")
+    expect(
+      within(attachmentDialog).getByText("Missing attachment?")
+    ).toBeTruthy()
+
+    // Confirming it advances to the NEXT guard — never the same one twice.
+    fireEvent.click(
+      within(attachmentDialog).getByRole("button", { name: "Send anyway" })
+    )
+    const subjectDialog = await screen.findByRole("dialog")
+    expect(
+      within(subjectDialog).getByText("Send without a subject?")
+    ).toBeTruthy()
+
+    // The second answer sends; each guard fired exactly once.
+    fireEvent.click(
+      within(subjectDialog).getByRole("button", { name: "Send anyway" })
+    )
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole("dialog")).toBeNull()
+  })
+
+  it("confirms sending with an empty subject; 'Add a subject' goes back", async () => {
+    renderWithBody("<p>Here is the update</p>") // no wording, no subject
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText("Send without a subject?")).toBeTruthy()
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+
+    // Going back aborts the attempt and focuses the subject field.
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Add a subject" })
+    )
+    expect(screen.queryByRole("dialog")).toBeNull()
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+    expect(useComposerStore.getState().open).toBe(true)
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByLabelText("Subject"))
+    })
+  })
+
+  it("a suppressed guard does not fire for the account", async () => {
+    await setSetting(executor, attachmentGuardSettingKey(accountId), true)
+    renderWithBody("<p>I attached the report</p>", "Quarterly report")
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole("dialog")).toBeNull()
+  })
+
+  it("'Don't ask again' persists the suppression for the account", async () => {
+    renderWithBody("<p>I attached the report</p>", "Quarterly report")
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    const dialog = await screen.findByRole("dialog")
+    // The prompt's one checkbox: "Don't ask again for this account".
+    fireEvent.click(within(dialog).getByRole("checkbox"))
+    fireEvent.click(within(dialog).getByRole("button", { name: "Send anyway" }))
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+    expect(await getAttachmentGuardSuppressed(executor, accountId)).toBe(true)
   })
 })
 
@@ -944,5 +1167,527 @@ describe("Recipient autocomplete (task 8.3)", () => {
       await new Promise((resolve) => setTimeout(resolve, 300))
     })
     expect(screen.queryByRole("listbox")).toBeNull()
+  })
+})
+
+describe("Composer snippets (task 6.2)", () => {
+  /** Seed one snippet with a shortcut (menu + keyboard paths) and one
+   * without (menu-only). */
+  async function seedSnippets(): Promise<void> {
+    await createSnippet(executor, {
+      name: "Thanks",
+      body: "Thanks so much!\n\nThe Team",
+      shortcut: "thx",
+    })
+    await createSnippet(executor, {
+      name: "Signature",
+      body: "Signed,\nTest User",
+    })
+    await createSnippet(executor, {
+      name: "Be right back",
+      body: "Be right back soon",
+      shortcut: "brb",
+    })
+  }
+
+  /** Open the composer and block until the snippet list round-trip
+   * finished (opening the picker awaits an entry, then closes it). */
+  async function openWithSnippetsLoaded(): Promise<void> {
+    openComposer()
+    render(<Composer />)
+    fireEvent.click(screen.getByRole("button", { name: "Insert snippet" }))
+    await screen.findByRole("listbox", { name: "Snippets" })
+    fireEvent.click(screen.getByRole("button", { name: "Insert snippet" }))
+    expect(screen.queryByRole("listbox", { name: "Snippets" })).toBeNull()
+  }
+
+  it("picker lists snippets by name with shortcut and body preview", async () => {
+    await seedSnippets()
+    await openWithSnippetsLoaded()
+
+    fireEvent.click(screen.getByRole("button", { name: "Insert snippet" }))
+    const list = await screen.findByRole("listbox", { name: "Snippets" })
+
+    const thanks = within(list).getByRole("button", { name: "Insert Thanks" })
+    expect(within(thanks).getByText("thx")).toBeTruthy()
+    expect(thanks.textContent).toContain("Thanks so much!")
+    expect(thanks.textContent).toContain("The Team")
+    const signature = within(list).getByRole("button", {
+      name: "Insert Signature",
+    })
+    expect(signature.textContent).toContain("Signed,")
+    // No shortcut kbd on the shortcut-less snippet (menu-only).
+    expect(signature.querySelector("kbd")).toBeNull()
+  })
+
+  it("picking a snippet inserts its body at the cursor, after existing text", async () => {
+    await seedSnippets()
+    await openWithSnippetsLoaded()
+    const editor = getMountedEditor()
+
+    editor.commands.setContent("<p>Before: </p>")
+    editor.commands.focus("end")
+
+    fireEvent.click(screen.getByRole("button", { name: "Insert snippet" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Insert Thanks" })
+    )
+
+    const html = useComposerStore.getState().html
+    // Inserted at the caret (end of "Before: "), not appended or replacing
+    // the draft; the multi-paragraph body lands as proper paragraphs.
+    expect(html).toContain("Before:")
+    expect(html.indexOf("Before:")).toBeLessThan(
+      html.indexOf("Thanks so much!")
+    )
+    expect(html).toContain("<p>The Team</p>")
+
+    // The picker closes after insertion.
+    expect(screen.queryByRole("listbox", { name: "Snippets" })).toBeNull()
+  })
+
+  it("typing a shortcut then Space expands it to the body at the cursor", async () => {
+    await seedSnippets()
+    await openWithSnippetsLoaded()
+    const editor = getMountedEditor()
+    const editorDom = document.querySelector(".tiptap") as HTMLElement
+
+    // Simulate the typed text: "Hello " already there, "brb" typed last.
+    editor.commands.setContent("<p>Hello brb</p>")
+    editor.commands.focus("end")
+    expect(useComposerStore.getState().html).toBe("<p>Hello brb</p>")
+
+    fireEvent.keyDown(editorDom, { key: " " })
+
+    // The typed shortcut is replaced in place by the single-block body
+    // (inline merge, no paragraph split); the trigger space is consumed.
+    expect(useComposerStore.getState().html).toBe(
+      "<p>Hello Be right back soon</p>"
+    )
+
+    // A multi-paragraph body expands as proper paragraphs, replacing only
+    // the shortcut word.
+    editor.commands.setContent("<p>Go thx</p>")
+    editor.commands.focus("end")
+    fireEvent.keyDown(editorDom, { key: " " })
+
+    expect(useComposerStore.getState().html).toBe(
+      "<p>Go </p><p>Thanks so much!</p><p>The Team</p>"
+    )
+  })
+
+  it("space after text without a matching shortcut inserts nothing", async () => {
+    await seedSnippets()
+    await openWithSnippetsLoaded()
+    const editor = getMountedEditor()
+
+    editor.commands.setContent("<p>Hello there</p>")
+    editor.commands.focus("end")
+
+    fireEvent.keyDown(document.querySelector(".tiptap") as HTMLElement, {
+      key: " ",
+    })
+
+    expect(useComposerStore.getState().html).toBe("<p>Hello there</p>")
+  })
+
+  it("does not expand during IME composition (isComposing / keyCode 229)", async () => {
+    await seedSnippets()
+    await openWithSnippetsLoaded()
+    const editor = getMountedEditor()
+    const editorDom = document.querySelector(".tiptap") as HTMLElement
+
+    editor.commands.setContent("<p>Hello brb</p>")
+    editor.commands.focus("end")
+
+    // Asian IME: the keydown that commits a candidate fires with
+    // isComposing set (or the legacy keyCode 229) — expanding then would
+    // corrupt the composing text, so the space must pass through.
+    fireEvent.keyDown(editorDom, { key: " ", isComposing: true })
+    expect(useComposerStore.getState().html).toBe("<p>Hello brb</p>")
+
+    fireEvent.keyDown(editorDom, { key: " ", keyCode: 229 })
+    expect(useComposerStore.getState().html).toBe("<p>Hello brb</p>")
+
+    // Control: the same space without composition expands normally.
+    fireEvent.keyDown(editorDom, { key: " " })
+    expect(useComposerStore.getState().html).toBe(
+      "<p>Hello Be right back soon</p>"
+    )
+  })
+})
+
+describe("Composer From picker (task 16.2, design D10)", () => {
+  const DEFAULT_ALIAS = "team-default@example.com"
+  const OTHER_ALIAS = "work-alias@example.com"
+
+  function fromSelect(): HTMLSelectElement {
+    return screen.getByLabelText("From address") as HTMLSelectElement
+  }
+
+  async function seedAliases(options?: {
+    defaultEmail?: string
+  }): Promise<void> {
+    // Written through the CRUD layer: isDefault sweeps the account.
+    await upsertManualAlias(executor, accountId, {
+      email: OTHER_ALIAS,
+      displayName: "Work Alias",
+    })
+    await upsertManualAlias(executor, accountId, {
+      email: options?.defaultEmail ?? DEFAULT_ALIAS,
+      displayName: "Default Alias",
+      isDefault: true,
+    })
+  }
+
+  /** Seed a received message whose To list was addressed to `toEmails`. */
+  async function seedIncomingMessage(
+    toEmails: string[],
+    ccEmails: string[] = []
+  ): Promise<string> {
+    const threadId = await createThread(executor, accountId, {
+      subject: "Thread about aliases",
+    })
+    const id = uid("msg")
+    await insertMessage(executor, {
+      id,
+      threadId,
+      accountId,
+      messageIdHeader: `<${id}@sender.example>`,
+      subject: "Thread about aliases",
+      fromAddress: "ada@example.com",
+      to: toEmails.map((email) => ({ email })),
+      cc: ccEmails.map((email) => ({ email })),
+      date: Math.floor(Date.now() / 1000),
+      snippet: "hello",
+      bodyText: "hello",
+    })
+    return id
+  }
+
+  it("renders the account identity plus every alias (default first)", async () => {
+    // No default alias here: the picker must show the bare identity as
+    // the visible value when nothing was preselected.
+    await upsertManualAlias(executor, accountId, {
+      email: OTHER_ALIAS,
+      displayName: "Work Alias",
+    })
+    await upsertManualAlias(executor, accountId, {
+      email: DEFAULT_ALIAS,
+      displayName: "Default Alias",
+    })
+    openComposer()
+    render(<Composer />)
+
+    const select = await screen.findByLabelText("From address")
+    const labels = Array.from(select.querySelectorAll("option")).map(
+      (option) => option.textContent
+    )
+    expect(labels).toEqual([
+      expect.stringMatching(/Account address/),
+      "Default Alias <team-default@example.com>",
+      "Work Alias <work-alias@example.com>",
+    ])
+    // Without a selection the bare identity is the visible value.
+    expect((select as HTMLSelectElement).value).toBe("")
+  })
+
+  it("renders nothing without aliases", () => {
+    openComposer()
+    render(<Composer />)
+    expect(screen.queryByLabelText("From address")).toBeNull()
+  })
+
+  it("choosing an alias stores it; choosing the account identity clears it", async () => {
+    await seedAliases()
+    openComposer()
+    render(<Composer />)
+    await screen.findByLabelText("From address")
+
+    fireEvent.change(fromSelect(), { target: { value: OTHER_ALIAS } })
+    expect(useComposerStore.getState().fromAlias).toEqual({
+      email: OTHER_ALIAS,
+      name: "Work Alias",
+    })
+
+    fireEvent.change(fromSelect(), { target: { value: "" } })
+    expect(useComposerStore.getState().fromAlias).toBeNull()
+  })
+
+  it("preselects the account's default alias on open", async () => {
+    await seedAliases()
+    openComposer()
+    render(<Composer />)
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().fromAlias).toEqual({
+        email: DEFAULT_ALIAS,
+        name: "Default Alias",
+      })
+    })
+    expect(fromSelect().value).toBe(DEFAULT_ALIAS)
+  })
+
+  it("a reply preselects the alias the original message was addressed to", async () => {
+    await seedAliases()
+    const messageId = await seedIncomingMessage([
+      "other@example.com",
+      "WORK-alias@example.com", // case-insensitive match
+    ])
+
+    useComposerStore.getState().openWith(
+      {
+        kind: "reply",
+        replyAll: false,
+        sourceMessageId: messageId,
+      },
+      accountId
+    )
+    render(<Composer />)
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().fromAlias).toEqual({
+        email: OTHER_ALIAS,
+        name: "Work Alias",
+      })
+    })
+    // The addressed alias wins over the account's default.
+    expect(useComposerStore.getState().fromAlias?.email).toBe(OTHER_ALIAS)
+  })
+
+  it("a reply matches the original Cc list too", async () => {
+    await seedAliases()
+    const messageId = await seedIncomingMessage(
+      ["someone-else@example.com"],
+      [DEFAULT_ALIAS]
+    )
+
+    useComposerStore
+      .getState()
+      .openWith(
+        { kind: "reply", replyAll: false, sourceMessageId: messageId },
+        accountId
+      )
+    render(<Composer />)
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().fromAlias?.email).toBe(DEFAULT_ALIAS)
+    })
+  })
+
+  it("a reply to a message addressed to no alias falls back to the default", async () => {
+    await seedAliases()
+    const messageId = await seedIncomingMessage(["unrelated@example.com"])
+
+    useComposerStore
+      .getState()
+      .openWith(
+        { kind: "reply", replyAll: false, sourceMessageId: messageId },
+        accountId
+      )
+    render(<Composer />)
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().fromAlias).toEqual({
+        email: DEFAULT_ALIAS,
+        name: "Default Alias",
+      })
+    })
+  })
+})
+
+describe("Composer PGP send (task 18.5)", () => {
+  // The PGP send-path tests run against the IMMEDIATE send path (no undo
+  // window); key rows are seeded directly into the 18.4 settings storage —
+  // armor strings only, no openpgp under jsdom.
+  const FINGERPRINT = "a".repeat(40)
+
+  beforeEach(async () => {
+    await setSetting(executor, sendDelaySettingKey(accountId), 0)
+  })
+
+  function renderSendable(): string {
+    openComposer()
+    render(<Composer />)
+    const toInput = screen.getByLabelText("To")
+    typeInto(toInput, "ada@example.com")
+    pressKey(toInput, "Enter")
+    typeInto(screen.getByLabelText("Subject"), "Quarterly report")
+    return useComposerStore.getState().draftKey ?? ""
+  }
+
+  async function seedRecipientKey(email = "ada@example.com"): Promise<void> {
+    await setSetting(executor, publicKeysSettingKey(accountId), [
+      {
+        id: FINGERPRINT,
+        armor: "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+        email,
+        source: "imported",
+        createdAt: Math.floor(Date.now() / 1000),
+      },
+    ])
+  }
+
+  async function seedDefaultPrivateKey(): Promise<void> {
+    await setSetting(executor, privateKeysSettingKey(accountId), [
+      {
+        id: FINGERPRINT,
+        armor: "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        wrappedArmor: "v1.wrapped",
+        name: "Me User",
+        email: "me@example.com",
+        createdAt: Math.floor(Date.now() / 1000),
+        isDefault: true,
+      },
+    ])
+  }
+
+  it("toolbar toggles set the per-message PGP intent in the store", () => {
+    openComposer()
+    render(<Composer />)
+
+    const sign = screen.getByRole("button", { name: "Sign (PGP)" })
+    const encrypt = screen.getByRole("button", { name: "Encrypt (PGP)" })
+    expect(sign.getAttribute("aria-pressed")).toBe("false")
+    expect(encrypt.getAttribute("aria-pressed")).toBe("false")
+
+    fireEvent.click(sign)
+    fireEvent.click(encrypt)
+    expect(useComposerStore.getState().pgpSign).toBe(true)
+    expect(useComposerStore.getState().pgpEncrypt).toBe(true)
+    expect(sign.getAttribute("aria-pressed")).toBe("true")
+
+    fireEvent.click(sign)
+    expect(useComposerStore.getState().pgpSign).toBe(false)
+  })
+
+  it("a fresh compose starts with both toggles off", () => {
+    useComposerStore.getState().togglePgpSign()
+    openComposer()
+    expect(useComposerStore.getState().pgpSign).toBe(false)
+    expect(useComposerStore.getState().pgpEncrypt).toBe(false)
+  })
+
+  it("encrypt without a key for a recipient blocks, naming them, and offers to disable encryption", async () => {
+    renderSendable()
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+    fireEvent.click(screen.getByRole("button", { name: "Encrypt (PGP)" }))
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(
+      within(dialog).getByText(
+        /No PGP public key is known for: ada@example\.com/
+      )
+    ).toBeTruthy()
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+
+    // "Keep editing" aborts the attempt, keeping draft and toggle.
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Keep editing" })
+    )
+    expect(screen.queryByRole("dialog")).toBeNull()
+    expect(useComposerStore.getState().open).toBe(true)
+    expect(useComposerStore.getState().pgpEncrypt).toBe(true)
+
+    // The spec's offer: disabling encryption for this draft lets it send.
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Disable encryption and send",
+      })
+    )
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+    expect(sendComposerDraftMock.mock.calls[0][0].pgp).toBeUndefined()
+    expect(useComposerStore.getState().pgpEncrypt).toBe(false)
+  })
+
+  it("encrypt with a known key for every recipient sends without prompting", async () => {
+    await seedRecipientKey()
+    renderSendable()
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+    fireEvent.click(screen.getByRole("button", { name: "Encrypt (PGP)" }))
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(screen.queryByRole("dialog")).toBeNull()
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+    expect(sendComposerDraftMock.mock.calls[0][0].pgp).toEqual({
+      mode: "encrypt",
+    })
+  })
+
+  it("sign asks for the passphrase at send time and rides it to the send", async () => {
+    await seedDefaultPrivateKey()
+    renderSendable()
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+    fireEvent.click(screen.getByRole("button", { name: "Sign (PGP)" }))
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    const dialog = await screen.findByRole("dialog")
+    expect(within(dialog).getByText("PGP passphrase")).toBeTruthy()
+
+    typeInto(within(dialog).getByLabelText("PGP passphrase"), "secret-pass")
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Sign and send" })
+    )
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+    expect(sendComposerDraftMock.mock.calls[0][0].pgp).toEqual({
+      mode: "sign",
+      passphrase: "secret-pass",
+    })
+  })
+
+  it("cancelling the passphrase prompt aborts the attempt without sending", async () => {
+    await seedDefaultPrivateKey()
+    renderSendable()
+    fireEvent.click(screen.getByRole("button", { name: "Sign (PGP)" }))
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: "Cancel",
+      })
+    )
+    expect(screen.queryByRole("dialog")).toBeNull()
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+    expect(useComposerStore.getState().open).toBe(true)
+    // The draft keeps the sign intent for the next attempt.
+    expect(useComposerStore.getState().pgpSign).toBe(true)
+  })
+
+  it("sign without a private key surfaces an inline error and does not send", async () => {
+    renderSendable()
+    fireEvent.click(screen.getByRole("button", { name: "Sign (PGP)" }))
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }))
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("Add a PGP private key")
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+  })
+
+  it("scheduling is refused while a PGP mode is active", async () => {
+    renderSendable()
+    fireEvent.click(screen.getByRole("button", { name: "Encrypt (PGP)" }))
+
+    fireEvent.click(screen.getByRole("button", { name: "Schedule send" }))
+    fireEvent.click(
+      await screen.findByRole("menuitem", {
+        name: getScheduleSendPresets().presets[0]!.label,
+      })
+    )
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("Scheduled sends don't support PGP")
+    expect(useComposerStore.getState().open).toBe(true)
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
   })
 })

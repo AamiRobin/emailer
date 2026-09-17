@@ -12,21 +12,29 @@ function PopoverTrigger({ ...props }: PopoverPrimitive.Trigger.Props) {
   return <PopoverPrimitive.Trigger data-slot="popover-trigger" {...props} />
 }
 
+/**
+ * Popover content. In @base-ui/react the `anchor` element is a
+ * Positioner prop (part of the shared anchor-positioning parameters), NOT
+ * a Root prop — trigger-less popovers (open via the `open` prop) pass the
+ * element they should be positioned against here.
+ */
 function PopoverContent({
   className,
   align = "center",
   alignOffset = 0,
   side = "bottom",
   sideOffset = 4,
+  anchor,
   ...props
 }: PopoverPrimitive.Popup.Props &
   Pick<
     PopoverPrimitive.Positioner.Props,
-    "align" | "alignOffset" | "side" | "sideOffset"
+    "align" | "alignOffset" | "side" | "sideOffset" | "anchor"
   >) {
   return (
     <PopoverPrimitive.Portal>
       <PopoverPrimitive.Positioner
+        anchor={anchor}
         align={align}
         alignOffset={alignOffset}
         side={side}

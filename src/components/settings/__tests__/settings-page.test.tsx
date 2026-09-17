@@ -91,12 +91,30 @@ vi.mock("@/components/accounts/reauth-dialog", () => ({
     ) : null,
 }))
 
+// Task 18.7: the encryption section pulls the key service through its
+// lazy boundary only when the account's opt-in is on — the mock keeps
+// openpgp (whose module init breaks under jsdom) out of this suite.
+vi.mock("@/services/crypto/pgp-keys", () => ({
+  listPrivateKeys: vi.fn(async () => []),
+  listPublicKeys: vi.fn(async () => []),
+  generateKey: vi.fn(),
+  importPrivateKey: vi.fn(),
+  importPublicKey: vi.fn(),
+  setDefaultPrivateKey: vi.fn(),
+  deletePrivateKey: vi.fn(),
+  deletePublicKey: vi.fn(),
+  getPublicKeyArmor: vi.fn(async () => null),
+}))
+
 import {
   getAccentPreference,
   getDensity,
   getFontScale,
   getReadingPanePreference,
   getThemeModePreference,
+  getPgpEnabled,
+  getMalwareLookupEnabled,
+  getMalwareLookupApiKey,
 } from "@/services/settings/preferences"
 import { setSetting } from "@/services/db/settings"
 import {
@@ -198,13 +216,23 @@ afterEach(() => {
 })
 
 describe("settings page navigation", () => {
-  it("renders the four sections in the nav and switches between them", () => {
+  it("renders the six sections in the nav and switches between them", () => {
     render(<SettingsPage />)
 
     const nav = screen.getByRole("navigation", {
       name: "Settings sections",
     })
-    for (const label of ["Accounts", "Appearance", "Reading", "Shortcuts"]) {
+    for (const label of [
+      "Accounts",
+      "Encryption",
+      "Attachment security",
+      "Appearance",
+      "Reading",
+      "Notifications",
+      "Auto-archive",
+      "Shortcuts",
+      "Snippets",
+    ]) {
       expect(nav.textContent).toContain(label)
     }
 
@@ -219,8 +247,14 @@ describe("settings page navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reading" }))
     expect(screen.getByRole("heading", { name: "Reading" })).toBeTruthy()
 
+    fireEvent.click(screen.getByRole("button", { name: "Auto-archive" }))
+    expect(screen.getByRole("heading", { name: "Auto-archive" })).toBeTruthy()
+
     fireEvent.click(screen.getByRole("button", { name: "Shortcuts" }))
     expect(screen.getByRole("heading", { name: "Shortcuts" })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "Snippets" }))
+    expect(screen.getByRole("heading", { name: "Snippets" })).toBeTruthy()
   })
 
   it("the back control restores the mailbox view from previousView", () => {
@@ -405,6 +439,97 @@ describe("reading section", () => {
           .getByRole("switch", { name: "New-mail notifications" })
           .getAttribute("aria-checked")
       ).toBe("true")
+    })
+  })
+})
+
+describe("encryption section", () => {
+  function openEncryption(): void {
+    fireEvent.click(screen.getByRole("button", { name: "Encryption" }))
+  }
+
+  function seedActiveAccount(): void {
+    seedAccount({ id: "acc-1", email: "one@example.com" })
+    // The section scopes itself to the ACTIVE account (the key rows are
+    // per account), unlike the accounts list.
+    useAccountStore.setState({ activeAccountId: "acc-1" })
+  }
+
+  it("mounts the per-account toggle and reveals the key manager when enabled", async () => {
+    seedActiveAccount()
+    render(<SettingsPage />)
+    openEncryption()
+
+    expect(screen.getByRole("heading", { name: "Encryption" })).toBeTruthy()
+    const toggle = screen.getByRole("switch", { name: "Enable OpenPGP" })
+    // Off by default: no key manager, and the PGP module stays unloaded
+    // (the lazy boundary — the section shows the toggle alone).
+    expect(toggle.getAttribute("aria-checked")).toBe("false")
+    expect(screen.queryByText(/No keys yet/)).toBeNull()
+
+    fireEvent.click(toggle)
+    expect(await screen.findByText(/No keys yet/)).toBeTruthy()
+    await waitFor(async () => {
+      expect(await getPgpEnabled(executor, "acc-1")).toBe(true)
+    })
+  })
+
+  it("shows the manager immediately for an account that opted in earlier", async () => {
+    seedActiveAccount()
+    await setSetting(executor, "mail.pgpEnabled:acc-1", true)
+    render(<SettingsPage />)
+    openEncryption()
+
+    expect(await screen.findByText(/No keys yet/)).toBeTruthy()
+    expect(
+      screen
+        .getByRole("switch", { name: "Enable OpenPGP" })
+        .getAttribute("aria-checked")
+    ).toBe("true")
+  })
+})
+
+describe("attachment security section (task 18.9)", () => {
+  function openAttachmentSecurity(): void {
+    fireEvent.click(screen.getByRole("button", { name: "Attachment security" }))
+  }
+
+  it("shows the persisted global toggle and API key", async () => {
+    await setSetting(executor, "mail.malwareLookupEnabled", true)
+    await setSetting(executor, "mail.malwareLookupApiKey", "vt-key")
+
+    render(<SettingsPage />)
+    openAttachmentSecurity()
+
+    const toggle = await screen.findByRole("switch", {
+      name: "Check attachments with a malware lookup",
+    })
+    await waitFor(() => {
+      expect(toggle.getAttribute("aria-checked")).toBe("true")
+    })
+    const key = screen.getByLabelText("VirusTotal API key") as HTMLInputElement
+    expect(key.value).toBe("vt-key")
+    // The privacy posture is spelled out where the key is entered.
+    expect(screen.getByText(/sha-256 hash is ever sent/i)).toBeTruthy()
+  })
+
+  it("persists the toggle flip and the trimmed key on blur", async () => {
+    render(<SettingsPage />)
+    openAttachmentSecurity()
+
+    const toggle = await screen.findByRole("switch", {
+      name: "Check attachments with a malware lookup",
+    })
+    fireEvent.click(toggle)
+    await waitFor(async () => {
+      expect(await getMalwareLookupEnabled(executor)).toBe(true)
+    })
+
+    const key = screen.getByLabelText("VirusTotal API key") as HTMLInputElement
+    fireEvent.change(key, { target: { value: "  key-123  " } })
+    fireEvent.blur(key)
+    await waitFor(async () => {
+      expect(await getMalwareLookupApiKey(executor)).toBe("key-123")
     })
   })
 })

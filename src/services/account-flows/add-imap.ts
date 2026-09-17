@@ -12,6 +12,7 @@ import { encryptCredentials } from "../crypto/credentials"
 import { useAccountStore } from "../../stores/account-store"
 import { triggerRefresh } from "../sync/scheduler"
 import { discoverByEmail } from "./provider-discovery"
+import { fetchDraftsOnConnect } from "./fetch-drafts"
 
 /**
  * Add-IMAP/SMTP account orchestrator (task 5.4).
@@ -174,6 +175,15 @@ export async function addImapAccount(
   void triggerRefresh(row.id).catch((error: unknown) => {
     console.warn(`[add-imap] initial sync for ${row.id} failed to start`, error)
   })
+
+  // Task 17.3 (design D9): pull drafts authored elsewhere (from the mapped
+  // Drafts folder, override, or "Drafts" fallback) into the Drafts view.
+  // Best-effort and background — a failed fetch never fails the connect.
+  void fetchDraftsOnConnect(options.executor ?? getExecutor(), row.id).catch(
+    (error: unknown) => {
+      console.warn(`[add-imap] draft fetch for ${row.id} failed`, error)
+    }
+  )
 
   return { accountId: row.id, imapTest, smtpTest }
 }

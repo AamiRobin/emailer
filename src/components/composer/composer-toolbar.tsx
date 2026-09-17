@@ -6,14 +6,17 @@ import {
   AlignLeft,
   AlignRight,
   Bold,
+  FileSignature,
   Italic,
   Link2,
   List,
   ListOrdered,
+  Lock,
   Underline as UnderlineIcon,
 } from "lucide-react"
 import type { ReactNode } from "react"
 
+import type { SnippetRow } from "@/services/db/snippets"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import {
@@ -28,6 +31,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
+import { SnippetPicker } from "./snippet-picker"
 
 /**
  * Formatting toolbar for the TipTap composer body (task 8.2). Buttons are
@@ -37,10 +41,25 @@ import {
  * popover prompting for the URL (with unlink when a link is active).
  * The editor routes the resulting HTML into composer-store (task 8.2:
  * "applies and serializes into the sent HTML").
+ *
+ * Task 6.2: a trailing "Snippet" entry opens the snippet picker; picking
+ * a snippet inserts its body at the cursor (snippet-picker.tsx).
+ *
+ * Task 18.5: trailing "Sign (PGP)" / "Encrypt (PGP)" toggles set the
+ * PER-MESSAGE PGP intent (composer store, not an account setting); the
+ * send flow turns them into RFC 3156 PGP/MIME. Unlike the formatting
+ * toggles they do not depend on the editor state.
  */
 
 interface ComposerToolbarProps {
   editor: Editor | null
+  /** Global snippets for the picker (loaded by the composer view). */
+  snippets: SnippetRow[]
+  /** Per-message PGP toggles (task 18.5) and their store flips. */
+  pgpSign: boolean
+  pgpEncrypt: boolean
+  onTogglePgpSign: () => void
+  onTogglePgpEncrypt: () => void
 }
 
 /** Prepend https:// to scheme-less URLs; empty stays empty. */
@@ -84,7 +103,14 @@ function ToolbarToggle({
   )
 }
 
-export function ComposerToolbar({ editor }: ComposerToolbarProps) {
+export function ComposerToolbar({
+  editor,
+  snippets,
+  pgpSign,
+  pgpEncrypt,
+  onTogglePgpSign,
+  onTogglePgpEncrypt,
+}: ComposerToolbarProps) {
   const [linkOpen, setLinkOpen] = useState(false)
   const [linkUrl, setLinkUrl] = useState("")
 
@@ -250,6 +276,30 @@ export function ComposerToolbar({ editor }: ComposerToolbarProps) {
       >
         <AlignRight />
       </ToolbarToggle>
+
+      <Separator orientation="vertical" className="mx-1 h-5" />
+
+      {/* Task 18.5: per-message PGP intent. Editor-independent — the
+          toggles write composer-store, the send flow applies them. */}
+      <ToolbarToggle
+        label="Sign (PGP)"
+        pressed={pgpSign}
+        disabled={false}
+        onToggle={onTogglePgpSign}
+      >
+        <FileSignature />
+      </ToolbarToggle>
+      <ToolbarToggle
+        label="Encrypt (PGP)"
+        pressed={pgpEncrypt}
+        disabled={false}
+        onToggle={onTogglePgpEncrypt}
+      >
+        <Lock />
+      </ToolbarToggle>
+
+      {/* Task 6.2: at-cursor snippet insertion. */}
+      <SnippetPicker editor={editor} snippets={snippets} disabled={disabled} />
     </div>
   )
 }

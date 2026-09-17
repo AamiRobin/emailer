@@ -1,4 +1,11 @@
+import type * as OpenPGP from "openpgp"
+
 import type { ComposerSendPayload } from "../../stores/composer-store"
+import {
+  findEncryptionKeysByEmails,
+  getDecryptedPrivateKey,
+  getDefaultPrivateKey,
+} from "../crypto/pgp-keys"
 import { getAccount, type AccountRow } from "../db/accounts"
 import { recordContactInteraction } from "../db/contacts"
 import type { SqlExecutor } from "../db/executor"
@@ -16,8 +23,14 @@ import {
   setThreadFolder,
   setThreadLabels,
 } from "../db/threads"
-import { generateMessageId, htmlToText } from "../email/mime-builder"
+import {
+  buildMimeMessagePgp,
+  generateMessageId,
+  htmlToText,
+  type PgpMimeOptions,
+} from "../email/mime-builder"
 import type { EmailAddress, SendEmailInput } from "../email/types"
+import { attachReplyFollowUp } from "../email-actions/followups"
 import { isOnline } from "../online"
 import { enqueueSend, operationFromRow } from "../queue/operation"
 import { deleteDraft, deleteDraftByKey } from "./drafts"
@@ -35,6 +48,11 @@ import { deleteDraft, deleteDraftByKey } from "./drafts"
  *      caller-supplied Message-ID (mime-builder stamps it into the MIME;
  *      the queue replay stays idempotent and the sent copy's Message-ID
  *      header matches the provisional local row — see reconciliation).
+ *      Task 18.5: when the caller passes `pgp`, the built input is also
+ *      transformed into RFC 3156 PGP/MIME at this point (the passphrase
+ *      exists only in this call's scope) and the queued op carries the
+ *      finished message for verbatim transmission; the LOCAL Sent row is
+ *      filed from the plaintext payload so the user's copy stays readable.
  *   3. enqueueSend — the durable op the processor replays when online.
  *   4. recordContactInteraction for every recipient (autocomplete ranking).
  *   5. File the message into the account's Sent view locally: a
@@ -145,6 +163,73 @@ export class FailedSendNotRetryableError extends Error {
   }
 }
 
+// ---- PGP send (task 18.5, spec mail-security "PGP send (sign and encrypt)") ----
+
+/**
+ * Per-message PGP options (the composer's Sign/Encrypt toggles): what the
+ * send flow should do to the MIME after building it. NOT persisted
+ * settings — they ride the single send attempt. `passphrase` unlocks the
+ * account's default private key for the sign modes; per the pgp-keys.ts
+ * discipline it is per-use and never persisted, which is why the
+ * transform runs HERE and the queued op carries the finished PGP/MIME
+ * (see sendComposerDraft).
+ */
+export interface PgpSendOptions {
+  mode: PgpMimeOptions["mode"]
+  /** The signing key's passphrase (sign modes only); optional for
+   * encrypt-only sends. */
+  passphrase?: string
+}
+
+/** Sign requested but the account has no default private key (18.4's
+ * key management). The composer surfaces this as a send error. */
+export class PgpSigningKeyMissingError extends SendValidationError {
+  constructor() {
+    super("Add a PGP private key for this account before signing messages")
+    this.name = "PgpSigningKeyMissingError"
+  }
+}
+
+/**
+ * Encrypt requested but these recipients have no known public key. Unlike
+ * the count-only InvalidRecipientError, the spec (mail-security, "Missing
+ * recipient key" scenario) requires NAMING the recipients in the
+ * message — that is what lets the user remove them or import their keys.
+ */
+export class MissingPgpKeysError extends SendValidationError {
+  /** The blocked addresses, lowercased, in first-appearance order. */
+  readonly emails: string[]
+
+  constructor(emails: string[]) {
+    super(`No PGP public key for: ${emails.join(", ")}`)
+    this.name = "MissingPgpKeysError"
+    this.emails = emails
+  }
+}
+
+/**
+ * Which of `addresses` (recipients only — the sender's own key is
+ * best-effort) have no stored encryption-capable public key. The
+ * composer's missing-key guard and the send path's backstop share this so
+ * both name the same set.
+ */
+export async function resolveMissingPgpRecipients(
+  executor: SqlExecutor,
+  accountId: string,
+  addresses: readonly string[]
+): Promise<string[]> {
+  const normalized = [
+    ...new Set(
+      addresses
+        .map((address) => address.trim().toLowerCase())
+        .filter((address) => address !== "")
+    ),
+  ]
+  if (normalized.length === 0) return []
+  const keys = await findEncryptionKeysByEmails(executor, accountId, normalized)
+  return normalized.filter((address) => !keys.has(address))
+}
+
 // ---- Change notification (same listener pattern as email-actions) ----
 
 export interface SendCompletedEvent {
@@ -246,6 +331,17 @@ export interface SendComposerDraftArgs {
   draftKey?: string
   /** Reply/forward context supplying In-Reply-To/References headers. */
   mode?: SendComposerMode
+  /**
+   * The From-picker alias (task 16.2, design D10): the MIME From HEADER
+   * carries this identity while `input.from` remains the envelope. Null/
+   * absent = the bare account identity.
+   */
+  fromAlias?: { email: string; name?: string } | null
+  /**
+   * PGP send (task 18.5): sign and/or encrypt the message. Absent = a
+   * plain send, byte-identical to before this task.
+   */
+  pgp?: PgpSendOptions
 }
 
 export type SendComposerDraftResult =
@@ -263,14 +359,51 @@ export async function sendComposerDraft(
   args: SendComposerDraftArgs
 ): Promise<SendComposerDraftResult> {
   const { accountId, payload, mode } = args
-  validatePayload(payload)
+  validateComposerPayload(payload)
 
   const executor = args.executor ?? getExecutor()
   const account = await getAccount(executor, accountId)
   if (!account) throw new SendAccountNotFoundError(accountId)
 
+  // Shape-sanitized here, then VERIFIED against the account's aliases
+  // table (resolveSendableFromAlias below): the selection came from the
+  // From picker, but the row it pointed at can be deleted from settings
+  // while still selected — sending a removed From would have Gmail reject
+  // the queued send at replay (terminal failed).
+  const fromAlias = await resolveSendableFromAlias(
+    executor,
+    accountId,
+    args.fromAlias
+  )
   const messageId = generateMessageId(account.email)
-  const input = buildSendEmailInput(account, payload, mode, messageId)
+  const input = buildSendEmailInput(
+    account,
+    payload,
+    mode,
+    messageId,
+    fromAlias
+  )
+
+  // PGP send (task 18.5, design D11): the sign/encrypt transform runs HERE
+  // — after the composer's guards and undo-window decisions, before
+  // anything is queued — because the passphrase exists only in this call's
+  // scope (pgp-keys.ts: per-use, never persisted), so the queued op must
+  // carry the FINISHED PGP/MIME for the processor to transmit verbatim
+  // (gmail via messages.send raw; imap via the raw SMTP command). Every
+  // provider type carries the prebuilt bytes — a PGP send is never
+  // silently downgraded to plaintext. Validation-order like the gates
+  // above: key/recipient resolution throws BEFORE any mutation, keeping
+  // the draft untouched.
+  if (args.pgp) {
+    const pgpOptions = await preparePgpOptions(
+      executor,
+      accountId,
+      input,
+      args.pgp
+    )
+    const built = await buildMimeMessagePgp(input, pgpOptions)
+    input.pgpMime = built.mime
+  }
 
   try {
     // D10 ordering: the queue op first (the user's intent, durably held),
@@ -286,9 +419,20 @@ export async function sendComposerDraft(
       account,
       payload,
       mode,
-      messageId
+      messageId,
+      fromAlias
     )
     await deleteComposedDraft(executor, accountId, args)
+
+    // Follow-up reminders (task 14.2, design D8): attach at ACCEPT time —
+    // this line runs for queued-offline sends exactly like online ones,
+    // and the undo-send window's real send re-enters through here at
+    // expiry, so it is covered too. Replies carry the source thread (the
+    // conversation being answered); a reminder due in `mail.followUpDays`
+    // attaches there. Fresh composes and forwards attach nothing (the
+    // provisional Sent thread is not stable linkage). attachReplyFollowUp
+    // never throws — a failed attach must never fail the send.
+    await attachReplyFollowUp(executor, accountId, mode)
 
     const event: SendCompletedEvent = {
       accountId,
@@ -303,6 +447,81 @@ export async function sendComposerDraft(
     const message = sanitizeError(error)
     emitFailed({ accountId, error: message })
     return { status: "failed", error: message }
+  }
+}
+
+// ---- PGP transform options (task 18.5) ----
+
+/**
+ * Resolve the PGP/MIME options for one send: unlock the account's default
+ * private key for the sign modes (the passphrase is per-use — a wrong one
+ * surfaces as PgpKeyError before anything is queued) and collect the
+ * recipients' public keys for the encrypt modes, throwing
+ * MissingPgpKeysError naming whoever lacks one. The SENDER's key is
+ * best-effort: when known (18.4 stores the public half of every private
+ * key under the account's identity), it is added so the transmitted copy
+ * is readable by the user too (encrypt-to-self); the LOCAL sent row is
+ * plaintext either way (fileIntoSent stores the composer payload).
+ */
+async function preparePgpOptions(
+  executor: SqlExecutor,
+  accountId: string,
+  input: SendEmailInput,
+  pgp: PgpSendOptions
+): Promise<PgpMimeOptions> {
+  const wantsSign = pgp.mode === "sign" || pgp.mode === "sign+encrypt"
+  const wantsEncrypt = pgp.mode === "encrypt" || pgp.mode === "sign+encrypt"
+
+  let signingKey: OpenPGP.PrivateKey | undefined
+  if (wantsSign) {
+    if (!pgp.passphrase) {
+      throw new SendValidationError(
+        "Enter your PGP passphrase to sign this message"
+      )
+    }
+    const key = await getDefaultPrivateKey(executor, accountId)
+    if (!key) throw new PgpSigningKeyMissingError()
+    signingKey = await getDecryptedPrivateKey(
+      executor,
+      accountId,
+      key.id,
+      pgp.passphrase
+    )
+  }
+
+  let encryptionArmors: string[] | undefined
+  if (wantsEncrypt) {
+    const recipientAddresses = [
+      ...input.to,
+      ...(input.cc ?? []),
+      ...(input.bcc ?? []),
+    ]
+      .map((address) => address.email?.trim() ?? "")
+      .filter((address) => address !== "")
+    const senderAddress = (input.fromAlias ?? input.from).email
+      .trim()
+      .toLowerCase()
+    const keys = await findEncryptionKeysByEmails(executor, accountId, [
+      ...recipientAddresses,
+      senderAddress,
+    ])
+    const missing = await resolveMissingPgpRecipients(
+      executor,
+      accountId,
+      recipientAddresses
+    )
+    if (missing.length > 0) throw new MissingPgpKeysError(missing)
+    encryptionArmors = recipientAddresses.map(
+      (address) => keys.get(address.toLowerCase())!.armor
+    )
+    const selfKey = keys.get(senderAddress)
+    if (selfKey) encryptionArmors.push(selfKey.armor)
+  }
+
+  return {
+    mode: pgp.mode,
+    ...(signingKey !== undefined ? { signingKey } : {}),
+    ...(encryptionArmors !== undefined ? { encryptionArmors } : {}),
   }
 }
 
@@ -323,10 +542,17 @@ function isSendableAddress(address: string): boolean {
 
 /**
  * Send gates, in spec order: at least one recipient across To/Cc/Bcc,
- * every address sendable, and non-empty subject-or-body. Throws the typed
- * SendValidationError subclasses; nothing has been mutated when they fly.
+ * every address sendable, and non-empty subject-or-body-or-attachment.
+ * Throws the typed SendValidationError subclasses; nothing has been
+ * mutated when they fly. An attachment-only payload is sendable —
+ * drafts.ts deliberately keeps attachment-only drafts, so requiring a
+ * body here would make them un-sendable.
+ *
+ * Exported for the schedule-send flow (task 10.1), which runs the exact
+ * same gates before it stores the built MIME payload — a scheduled send
+ * must never be one a plain Send would have rejected.
  */
-function validatePayload(payload: ComposerSendPayload): void {
+export function validateComposerPayload(payload: ComposerSendPayload): void {
   const recipients = payload.to.concat(payload.cc, payload.bcc)
   if (recipients.length === 0) throw new MissingRecipientsError()
 
@@ -335,13 +561,12 @@ function validatePayload(payload: ComposerSendPayload): void {
   ).length
   if (invalidCount > 0) throw new InvalidRecipientError(invalidCount)
 
-  if (
-    payload.subject.trim() === "" &&
-    payload.htmlBody.trim() === "" &&
-    (payload.textBody ?? "").trim() === ""
-  ) {
-    throw new EmptyMessageError()
-  }
+  const hasBody =
+    payload.subject.trim() !== "" ||
+    payload.htmlBody.trim() !== "" ||
+    (payload.textBody ?? "").trim() !== ""
+  const hasAttachment = (payload.attachments?.length ?? 0) > 0
+  if (!hasBody && !hasAttachment) throw new EmptyMessageError()
 }
 
 // ---- SendEmailInput construction ----
@@ -356,11 +581,65 @@ function toEmailAddresses(
   }))
 }
 
-function buildSendEmailInput(
+/**
+ * Normalize the From-picker selection: trim + lowercase the address, and
+ * drop anything without a usable one (a stale store value must not send a
+ * headerless From). Shape only — membership is resolveSendableFromAlias's
+ * job.
+ */
+function sanitizeFromAlias(
+  fromAlias: { email: string; name?: string } | null | undefined
+): { email: string; name?: string } | null {
+  const email = fromAlias?.email.trim().toLowerCase() ?? ""
+  if (!email) return null
+  return {
+    email,
+    ...(fromAlias?.name !== undefined ? { name: fromAlias.name } : {}),
+  }
+}
+
+/**
+ * The send-build-time alias gate (sanitizeFromAlias's caller-side
+ * wrapper): one SELECT verifies the (lowercased) address is still a row
+ * in the account's aliases table. An alias deleted from settings while it
+ * was selected falls back to the bare account identity — sending the
+ * removed From would fail at the provider (Gmail rejects the send-as at
+ * replay → the queued op parks terminal 'failed'). Alias emails are
+ * stored lowercase (aliases.ts normalizeAliasEmail), matching the
+ * sanitized shape exactly; the executor is at hand so this is a single
+ * indexed lookup on the UNIQUE (account_id, email) pair.
+ */
+async function resolveSendableFromAlias(
+  executor: SqlExecutor,
+  accountId: string,
+  fromAlias: { email: string; name?: string } | null | undefined
+): Promise<{ email: string; name?: string } | null> {
+  const sanitized = sanitizeFromAlias(fromAlias)
+  if (!sanitized) return null
+  const rows = await executor.select<{ id: string }>(
+    "SELECT id FROM aliases WHERE account_id = $1 AND email = $2 LIMIT 1",
+    [accountId, sanitized.email]
+  )
+  return rows.length > 0 ? sanitized : null
+}
+
+/**
+ * Build the provider-agnostic SendEmailInput for a composed message:
+ * from = the account identity (the ENVELOPE — design D10: MAIL FROM and
+ * the Gmail API user stay the authenticated account even when an alias
+ * sends), the optional `fromAlias` rides along as the header-only From
+ * override, recipients come from the payload, reply headers from the
+ * mode, and the caller-supplied Message-ID. Pure and shared with the
+ * schedule-send flow (task 10.1), which builds the same input before
+ * storing its MIME — the stored payload is byte-identical to what a Send
+ * would have transmitted.
+ */
+export function buildSendEmailInput(
   account: AccountRow,
   payload: ComposerSendPayload,
   mode: SendComposerMode | undefined,
-  messageId: string
+  messageId: string,
+  fromAlias?: { email: string; name?: string } | null
 ): SendEmailInput {
   const input: SendEmailInput = {
     from: {
@@ -372,6 +651,12 @@ function buildSendEmailInput(
     // Caller-supplied Message-ID (operation.ts): makes a replayed queued
     // send deduplicateable and lets reconciliation match the server copy.
     messageId,
+  }
+  if (fromAlias) {
+    input.fromAlias = {
+      email: fromAlias.email,
+      ...(fromAlias.name !== undefined ? { name: fromAlias.name } : {}),
+    }
   }
   if (payload.cc.length > 0) input.cc = toEmailAddresses(payload.cc)
   if (payload.bcc.length > 0) input.bcc = toEmailAddresses(payload.bcc)
@@ -419,17 +704,29 @@ function buildSnippet(text: string): string | undefined {
  * When the account has no synced sent-role label yet (labels never
  * synced), the message still files — it surfaces in Sent after the next
  * label+folder sync rebuilds membership.
+ *
+ * Also the filing helper the scheduled-send runner reuses (task 10.2): a
+ * due row files the same provisional copy at claim time, so a fired
+ * scheduled send is readable in Sent exactly like an immediate one.
  */
-async function fileIntoSent(
+export async function fileIntoSent(
   executor: SqlExecutor,
   account: AccountRow,
   payload: ComposerSendPayload,
   mode: SendComposerMode | undefined,
-  messageId: string
+  messageId: string,
+  fromAlias?: { email: string; name?: string } | null
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000)
   const sentLabels = await findLabelsBySpecialUse(executor, account.id, "sent")
   const sentLabel = sentLabels[0] ?? null
+
+  // The provisional row shows the identity the message was SENT with
+  // (the alias's From header, task 16.2) — the server copy that replaces
+  // it parses the same header, so the fallback reconciliation branch
+  // (sender + subject) keeps matching too.
+  const senderAddress = fromAlias?.email ?? account.email
+  const senderName = fromAlias?.name ?? account.display_name ?? undefined
 
   const text = plainTextBody(payload)
   const subject = payload.subject
@@ -457,8 +754,8 @@ async function fileIntoSent(
     inReplyTo: mode?.kind === "reply" ? mode.inReplyTo : undefined,
     referencesHeader: mode?.kind === "reply" ? mode.references : undefined,
     subject: subject === "" ? undefined : subject,
-    fromName: account.display_name ?? undefined,
-    fromAddress: account.email,
+    fromName: senderName,
+    fromAddress: senderAddress,
     to: payload.to,
     cc: payload.cc,
     bcc: payload.bcc,

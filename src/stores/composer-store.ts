@@ -1,4 +1,5 @@
 import { create } from "zustand"
+import { toast } from "sonner"
 
 import {
   clearAttachmentBytes,
@@ -7,6 +8,12 @@ import {
 } from "@/components/composer/attachment-bytes"
 import { bytesToBase64, htmlToText } from "@/services/email/mime-builder"
 import type { OutgoingAttachment } from "@/services/email/types"
+import type { SendComposerDraftArgs } from "@/services/composer/send"
+import {
+  clampSendDelaySeconds,
+  sendWithUndoDelay,
+  type UndoSendController,
+} from "@/services/composer/undo-send"
 
 /**
  * Composer draft state (design D5/D8): pure in-memory state for the
@@ -55,6 +62,18 @@ import type { OutgoingAttachment } from "@/services/email/types"
  *   only, so attachments survive within the session (see drafts.ts).
  * - 8.7 (send) reads the payload via getComposerPayload and hands it to
  *   sendComposerDraft from the composer component.
+ * - 16.2 (send-as, design D10): `fromAlias` holds the From-picker
+ *   selection (one of the account's aliases, or null = the bare account
+ *   identity). The send service splits it: the alias shapes the MIME
+ *   From HEADER while the envelope stays on the account address.
+ * - Undo send (design D3, tasks 5.1/5.2): a send with undo enabled does
+ *   NOT send immediately — `beginUndoWindow` closes the composer and runs
+ *   a cancellable countdown (sendWithUndoDelay in undo-send.ts owns the
+ *   timer and the provider send); the shell-level banner shows it and
+ *   `cancelUndoSend` restores the snapshot below into an editable draft.
+ *   The window is pre-send: nothing is transmitted or queued until it
+ *   expires. `undoWindow` lives here (not in the composer pane) so the
+ *   banner survives navigation.
  */
 
 /** A composer recipient, exactly as meant by the user. `{name?, email}`
@@ -76,6 +95,17 @@ export interface ComposerAttachment {
   size: number
   /** MIME type when known; absent → application/octet-stream on send. */
   mimeType?: string
+}
+
+/**
+ * A selected send-as identity (task 16.2, design D10): one of the
+ * account's aliases, shown in the From picker. `null` means the bare
+ * account identity — the send path keeps the ENVELOPE on the account
+ * address either way; this only shapes the From HEADER.
+ */
+export interface FromAliasSelection {
+  email: string
+  name?: string
 }
 
 /**
@@ -122,6 +152,45 @@ export interface ComposerSendPayload {
   attachments?: OutgoingAttachment[]
 }
 
+/**
+ * The draft state an undo send holds onto for the window (design D3):
+ * everything `cancelUndoSend` needs to put the user back into the
+ * composer with the message intact. `mode` carries the reply/forward
+ * context, `draftKey` addresses the still-existing autosaved row (the
+ * real send deletes it; a cancel leaves it for continued editing).
+ * Attachment metadata only — the bytes stay in the registry untouched
+ * during the window (an intervening openNew clears them; a restore from
+ * after that drops the ghosted descriptors with a warning toast, so the
+ * restored draft never shows chips it cannot send).
+ */
+export interface UndoSendSnapshot {
+  accountId: string
+  mode: ComposerMode
+  draftKey: string | null
+  to: Recipient[]
+  cc: Recipient[]
+  bcc: Recipient[]
+  showCc: boolean
+  showBcc: boolean
+  subject: string
+  html: string
+  attachments: ComposerAttachment[]
+  /** From-picker selection at window start (task 16.2); a cancel
+   * restores it with the rest of the draft. */
+  fromAlias: FromAliasSelection | null
+  /** Per-message PGP toggles at window start (task 18.5); optional so
+   * older snapshots (and tests) stay valid — a cancel restores them,
+   * defaulting to off. */
+  pgpSign?: boolean
+  pgpEncrypt?: boolean
+}
+
+/** The live window state the banner reads: the snapshot plus countdown. */
+export interface UndoWindowState extends UndoSendSnapshot {
+  totalSeconds: number
+  remainingSeconds: number
+}
+
 interface ComposerState {
   /** Composer visibility once mounted; the shell mounts it via
    * ui-store.composerOpen (see module docstring). */
@@ -151,6 +220,28 @@ interface ComposerState {
    * (task 8.5). Cap enforcement happens at add time in the component. */
   attachments: ComposerAttachment[]
 
+  /**
+   * The chosen send-as identity (task 16.2): null = the bare account
+   * identity. Reset on openNew/openWith/reset like every draft field;
+   * the From picker and the reply-alias preselection write it.
+   */
+  fromAlias: FromAliasSelection | null
+
+  /**
+   * Per-message PGP toggles (task 18.5): sign and/or encrypt THIS draft.
+   * Composer-level intent only — not persisted account settings (18.7
+   * owns the settings surface) and not serialized into local_drafts, so
+   * they apply to the current draft only. The send service turns them
+   * into RFC 3156 PGP/MIME (missing-key guard included).
+   */
+  pgpSign: boolean
+  pgpEncrypt: boolean
+
+  /** The active undo-send window (design D3): null when no send is
+   * pending. The shell-level banner renders from this wherever the user
+   * has navigated. */
+  undoWindow: UndoWindowState | null
+
   /** Open a blank message composed from the given account. */
   openNew: (accountId: string | null) => void
   /** Open with a reply/forward mode (8.4); pre-fills arrive via setters. */
@@ -172,6 +263,31 @@ interface ComposerState {
   addAttachments: (attachments: ComposerAttachment[]) => void
   /** Remove one attachment and its registered bytes. */
   removeAttachment: (id: string) => void
+  /** Select the send-as identity for this draft (task 16.2); null
+   * selects the bare account identity. */
+  setFromAlias: (fromAlias: FromAliasSelection | null) => void
+  /** Flip the per-message PGP sign / encrypt toggles (task 18.5). */
+  togglePgpSign: () => void
+  togglePgpEncrypt: () => void
+  /**
+   * Start the pre-send undo window (design D3): stores the snapshot, arms
+   * the cancellable countdown via sendWithUndoDelay and closes the
+   * composer — the banner replaces it. `delaySeconds` is clamped (0 = no
+   * window, no-op; the caller sends immediately); expiry fires the real
+   * provider send and closes the window. The frozen `sendArgs` (not the
+   * live fields) are what expiry transmits.
+   */
+  beginUndoWindow: (args: {
+    snapshot: UndoSendSnapshot
+    sendArgs: SendComposerDraftArgs
+    delaySeconds: number
+  }) => void
+  /**
+   * Cancel the pending send: stops the timer before the provider is
+   * invoked and restores the snapshot into an open, editable composer.
+   * False when no window is active.
+   */
+  cancelUndoSend: () => boolean
 }
 
 interface InitialDraft {
@@ -187,6 +303,9 @@ interface InitialDraft {
   subject: string
   html: string
   attachments: ComposerAttachment[]
+  fromAlias: FromAliasSelection | null
+  pgpSign: boolean
+  pgpEncrypt: boolean
 }
 
 const INITIAL: InitialDraft = {
@@ -202,6 +321,9 @@ const INITIAL: InitialDraft = {
   subject: "",
   html: "",
   attachments: [] as ComposerAttachment[],
+  fromAlias: null,
+  pgpSign: false,
+  pgpEncrypt: false,
 }
 
 /** The draft-dropping actions also clear the bytes registry so dropped
@@ -211,8 +333,65 @@ function dropDraft(): InitialDraft {
   return { ...INITIAL }
 }
 
-export const useComposerStore = create<ComposerState>((set) => ({
+// ---- Undo send runtime (outside the store state: timers + generation) ----
+
+interface ActiveUndoWindow {
+  controller: UndoSendController
+  countdown: ReturnType<typeof setInterval>
+  generation: number
+}
+
+let activeUndoWindow: ActiveUndoWindow | null = null
+/** Bumped by every cancel/supersede so a stale expiry callback (the send
+ * promise resolving after its window was torn down) cannot touch state. */
+let undoGeneration = 0
+
+function stopUndoWindow(): void {
+  if (!activeUndoWindow) return
+  activeUndoWindow.controller.cancel()
+  clearInterval(activeUndoWindow.countdown)
+  activeUndoWindow = null
+}
+
+/** The set() partial that puts a window snapshot back into an open,
+ * editable composer (cancelUndoSend and the expiry-failure path).
+ * Attachment descriptors whose bytes are no longer registered (an
+ * intervening openNew/openWith cleared the registry) are FILTERED out —
+ * left in, they would render as chips while getComposerPayload silently
+ * dropped them, so the user's next Send would transmit without files.
+ * When any were dropped, a warning says so. */
+function restoreSnapshot(snapshot: UndoSendSnapshot): Partial<ComposerState> {
+  const restorable = snapshot.attachments.filter(
+    (attachment) => getAttachmentBytes(attachment.id) !== undefined
+  )
+  if (restorable.length < snapshot.attachments.length) {
+    toast.warning("Some attachments were no longer available and were removed")
+  }
+  return {
+    open: true,
+    mode: snapshot.mode,
+    activeAccountId: snapshot.accountId,
+    draftKey: snapshot.draftKey,
+    to: [...snapshot.to],
+    cc: [...snapshot.cc],
+    bcc: [...snapshot.bcc],
+    showCc: snapshot.showCc,
+    showBcc: snapshot.showBcc,
+    subject: snapshot.subject,
+    html: snapshot.html,
+    attachments: restorable.map((attachment) => ({ ...attachment })),
+    fromAlias: snapshot.fromAlias,
+    pgpSign: snapshot.pgpSign ?? false,
+    pgpEncrypt: snapshot.pgpEncrypt ?? false,
+  }
+}
+
+export const useComposerStore = create<ComposerState>((set, get) => ({
   ...INITIAL,
+  // undoWindow sits outside INITIAL/dropDraft on purpose: an active
+  // window must survive navigation (a mid-window openNew drops the
+  // composer fields but keeps the banner and the pending send).
+  undoWindow: null,
 
   openNew: (accountId) =>
     set({
@@ -254,6 +433,121 @@ export const useComposerStore = create<ComposerState>((set) => ({
         (attachment) => attachment.id !== id
       ),
     }))
+  },
+
+  setFromAlias: (fromAlias) => set({ fromAlias }),
+
+  togglePgpSign: () => set((state) => ({ pgpSign: !state.pgpSign })),
+  togglePgpEncrypt: () => set((state) => ({ pgpEncrypt: !state.pgpEncrypt })),
+
+  beginUndoWindow: ({ snapshot, sendArgs, delaySeconds }) => {
+    const totalSeconds = clampSendDelaySeconds(delaySeconds)
+    // 0 = undo send disabled: no window, the caller sends immediately.
+    if (totalSeconds <= 0) return
+    // Supersede an active window: bump the generation FIRST so the old
+    // window's .then handler below is inert and cannot clobber the new
+    // window's state, then FLUSH the superseded controller — its pending
+    // send transmits NOW (the same invoke path as expiry) instead of the
+    // old stopUndoWindow() behavior that silently cancelled it (no send,
+    // no toast, no restore).
+    const generation = ++undoGeneration
+    const superseded = activeUndoWindow
+    if (superseded) {
+      clearInterval(superseded.countdown)
+      activeUndoWindow = null
+      // Fire-and-forget outcome toast for the superseded message: its
+      // window state is already gone (stale generation), so only the
+      // result is still ours to surface.
+      void superseded.controller.result.then((result) => {
+        if (result === null) {
+          toast.error("Sending failed")
+        } else if (result.status === "queued") {
+          if (result.queuedOffline) {
+            toast.info("Message queued")
+          } else {
+            toast.success("Message sent")
+          }
+        } else {
+          toast.error(result.error)
+        }
+      })
+      superseded.controller.flush()
+    }
+    const controller = sendWithUndoDelay({
+      ...sendArgs,
+      delaySeconds: totalSeconds,
+    })
+    const countdown = setInterval(() => {
+      set((state) =>
+        state.undoWindow && state.undoWindow.remainingSeconds > 1
+          ? {
+              undoWindow: {
+                ...state.undoWindow,
+                remainingSeconds: state.undoWindow.remainingSeconds - 1,
+              },
+            }
+          : {}
+      )
+    }, 1000)
+    activeUndoWindow = { controller, countdown, generation }
+    set({
+      undoWindow: {
+        ...snapshot,
+        totalSeconds,
+        remainingSeconds: totalSeconds,
+      },
+      // The banner replaces the composer for the window (design D3:
+      // pre-send — the draft row and its bytes are left exactly as they
+      // were, so a cancel or an app restart still finds the content).
+      open: false,
+    })
+
+    void controller.result.then((result) => {
+      if (generation !== undoGeneration) return // cancelled/superseded
+      stopUndoWindow()
+      set({ undoWindow: null })
+      if (!result) {
+        // Null here means the send impl REJECTED — a crash, not a cancel
+        // (cancels resolve through the generation path above). Nothing
+        // was transmitted: put the draft back into the composer and say
+        // so, unless the user already started a new compose.
+        if (!get().open) set(restoreSnapshot(snapshot))
+        toast.error("Sending failed — your draft was restored")
+        return
+      }
+      if (result.status === "queued") {
+        // The send is real now (sendComposerDraft already deleted the
+        // local_drafts row): clear the stale fields and attachment bytes,
+        // unless the user started a new compose mid-window — those fields
+        // are theirs.
+        if (!get().open) set(dropDraft())
+        if (result.queuedOffline) {
+          toast.info("Message queued")
+        } else {
+          toast.success("Message sent")
+        }
+      } else {
+        // The local enqueue path failed — nothing was transmitted, so
+        // the draft goes back into the composer with the error surfaced
+        // (an in-progress new compose is left alone, like the queued
+        // branch above).
+        if (!get().open) set(restoreSnapshot(snapshot))
+        toast.error(result.error)
+      }
+    })
+  },
+
+  cancelUndoSend: () => {
+    const undoWindow = get().undoWindow
+    if (!undoWindow || !activeUndoWindow) return false
+    // The expiry timer already fired: the provider send is in flight and
+    // WILL commit — restoring the snapshot here would have the user's
+    // next Send duplicate it. The window closes via its own .then.
+    if (activeUndoWindow.controller.hasFired()) return false
+    stopUndoWindow()
+    undoGeneration += 1
+    set({ undoWindow: null, ...restoreSnapshot(undoWindow) })
+    return true
   },
 }))
 

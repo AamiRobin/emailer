@@ -54,6 +54,8 @@ export interface GmailMessage {
   internalDate?: string
   sizeEstimate?: number
   payload?: GmailMessagePart
+  /** Full RFC 822 message (base64url) — present only when fetched with format=raw. */
+  raw?: string
 }
 
 export interface GmailThread {
@@ -89,12 +91,59 @@ export interface GmailMessagesPage {
   resultSizeEstimate?: number
 }
 
+/**
+ * The Drafts API resource (task 17.1, design D9). `message.raw` (base64url
+ * RFC 822) is present on create/update responses and on drafts.get with
+ * format=raw; listDrafts returns the light `{id, message:{id, threadId}}`
+ * shape unless format is requested.
+ */
+export interface GmailDraft {
+  id: string
+  message?: GmailMessage
+}
+
+export interface GmailDraftsPage {
+  drafts?: GmailDraft[]
+  nextPageToken?: string
+  resultSizeEstimate?: number
+}
+
 export interface GmailProfile {
   emailAddress: string
   /** int64 decimal string — the initial delta-sync cursor. */
   historyId?: string
   messagesTotal?: number
   threadsTotal?: number
+}
+
+/**
+ * GET .../settings/sendAs entry (task 16.1, design D10 — alias listing
+ * rides the full mail.google.com scope). `isPrimary` marks the account's
+ * own address; `isDefault` marks the one alias Gmail preselects as From.
+ */
+export interface GmailSendAs {
+  /** The alias address — the primary entry carries the account email. */
+  sendAsEmail: string
+  displayName?: string | null
+  replyToAddress?: string | null
+  signature?: string | null
+  isDefault?: boolean
+  isPrimary?: boolean
+  /** "accepted" | "pending" — unverified aliases must not send. */
+  verificationStatus?: "accepted" | "pending"
+  treatAsAlias?: string | null
+}
+
+/**
+ * GET .../settings/sendAs list response (ListSendAsResponse). The
+ * documented shape is a plain collection with NO nextPageToken (unlike
+ * messages/drafts/history), so listSendAs normally issues a single
+ * request; the client still follows a token when one appears so a
+ * paginating server can never hand the reconcile sweep a truncated list.
+ */
+export interface GmailSendAsPage {
+  sendAs?: GmailSendAs[]
+  nextPageToken?: string
 }
 
 /** GET .../messages/{id}/attachments/{attachmentId} response. */
@@ -157,6 +206,11 @@ export interface GmailClient {
   untrashMessage(id: string): Promise<GmailMessage>
   deleteMessage(id: string): Promise<void>
   getProfile(): Promise<GmailProfile>
+  /** List the account's send-as addresses (GET settings/sendAs, task 16.1).
+   * The response includes the primary entry (isPrimary) — callers filter.
+   * Follows nextPageToken until exhausted (a no-op on the documented
+   * single-page shape). */
+  listSendAs(): Promise<GmailSendAs[]>
   /** Attachment content (base64url `data`) by message + attachment id. */
   getAttachment(
     messageId: string,
@@ -176,6 +230,29 @@ export interface GmailClient {
   ): Promise<GmailLabel>
   /** Permanently delete a label (DELETE labels/{id}); messages survive. */
   deleteLabel(id: string): Promise<void>
+  /** Create a server draft (POST drafts; raw = base64url RFC 822). Task 17.1. */
+  createDraft(rawBase64Url: string): Promise<GmailDraft>
+  /** Overwrite a server draft's message (PUT drafts/{id}). Task 17.1. */
+  updateDraft(id: string, rawBase64Url: string): Promise<GmailDraft>
+  /** Permanently delete a server draft (DELETE drafts/{id}). Task 17.1. */
+  deleteDraft(id: string): Promise<void>
+  /**
+   * Send an existing server draft (POST drafts/send with its id). Task
+   * 17.1 implements the client surface per design D9; the app's send flow
+   * sends via messages.send and deletes the draft afterwards, so this
+   * method is currently unwired (kept for completeness/future use).
+   */
+  sendDraft(id: string): Promise<GmailMessage>
+  /** One server draft; format=raw carries `message.raw` (base64url). */
+  getDraft(
+    id: string,
+    format?: "full" | "metadata" | "raw"
+  ): Promise<GmailDraft>
+  /** List server drafts (newest first server-side); page cap via maxResults. */
+  listDrafts(query?: {
+    maxResults?: number
+    pageToken?: string
+  }): Promise<GmailDraftsPage>
 }
 
 export function createGmailClient(deps: GmailClientDeps): GmailClient {
@@ -351,6 +428,28 @@ export function createGmailClient(deps: GmailClientDeps): GmailClient {
       return request<GmailProfile>("GET", "profile")
     },
 
+    async listSendAs() {
+      // Follow nextPageToken until exhausted: the alias reconcile sweep
+      // deletes every stored gmail row missing from this list, so a
+      // truncated read would delete real aliases (they would then be
+      // re-inserted on the next sync). When the response carries no token
+      // — the documented shape today, ListSendAsResponse being a plain
+      // non-paginated collection — this stays a single request with the
+      // same bare URL as before.
+      const sendAs: GmailSendAs[] = []
+      let pageToken: string | undefined
+      do {
+        const page = await request<GmailSendAsPage>(
+          "GET",
+          "settings/sendAs",
+          pageToken ? { query: queryOf({ pageToken }) } : {}
+        )
+        sendAs.push(...(page.sendAs ?? []))
+        pageToken = page.nextPageToken
+      } while (pageToken)
+      return sendAs
+    },
+
     getAttachment(messageId: string, attachmentId: string) {
       return request<GmailAttachment>(
         "GET",
@@ -383,6 +482,41 @@ export function createGmailClient(deps: GmailClientDeps): GmailClient {
 
     async deleteLabel(id: string) {
       await request<void>("DELETE", `labels/${encodeURIComponent(id)}`)
+    },
+
+    createDraft(rawBase64Url: string) {
+      return request<GmailDraft>("POST", "drafts", {
+        json: { message: { raw: rawBase64Url } },
+      })
+    },
+
+    updateDraft(id: string, rawBase64Url: string) {
+      return request<GmailDraft>("PUT", `drafts/${encodeURIComponent(id)}`, {
+        json: { id, message: { raw: rawBase64Url } },
+      })
+    },
+
+    async deleteDraft(id: string) {
+      await request<void>("DELETE", `drafts/${encodeURIComponent(id)}`)
+    },
+
+    sendDraft(id: string) {
+      return request<GmailMessage>("POST", "drafts/send", { json: { id } })
+    },
+
+    getDraft(id: string, format: "full" | "metadata" | "raw" = "full") {
+      return request<GmailDraft>("GET", `drafts/${encodeURIComponent(id)}`, {
+        query: queryOf({ format }),
+      })
+    },
+
+    listDrafts(query?: { maxResults?: number; pageToken?: string }) {
+      return request<GmailDraftsPage>("GET", "drafts", {
+        query: queryOf({
+          maxResults: query?.maxResults,
+          pageToken: query?.pageToken,
+        }),
+      })
     },
   }
 }

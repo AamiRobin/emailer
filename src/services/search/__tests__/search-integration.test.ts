@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
-import { searchThreadsQuery } from "../index"
+import { searchThreadsAcrossAccounts, searchThreadsQuery } from "../index"
 import {
   recomputeThreadCaches,
   setThreadLabels,
   setThreadStarred,
 } from "../../db/threads"
+import { pinThread } from "../../email-actions/thread-states"
 import {
   at,
   createAccount,
@@ -544,5 +545,166 @@ describe("searchThreadsQuery", () => {
     expect(await searchThreadsQuery(executor, accountId, "")).toEqual([])
     expect(await searchThreadsQuery(executor, accountId, "   ")).toEqual([])
     expect(await searchThreadsQuery(executor, accountId, "from:")).toEqual([])
+  })
+})
+
+describe("searchThreadsQuery sort option (task 4.1)", () => {
+  let executor: TestExecutor
+  let accountId: string
+
+  /** Seed a searchable thread with its own sender and date. */
+  async function seedSorted(options: {
+    subject: string
+    fromName?: string
+    fromAddress?: string
+    date: number
+  }): Promise<string> {
+    const threadId = await createThread(executor, accountId, {
+      subject: options.subject,
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: options.date,
+      subject: options.subject,
+      snippet: "s",
+      bodyText: options.subject,
+      fromName: options.fromName,
+      fromAddress: options.fromAddress,
+      isRead: true,
+    })
+    await recomputeThreadCaches(executor, threadId)
+    return threadId
+  }
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("sender sort applies to search results and pinned still leads", async () => {
+    const zed = await seedSorted({
+      subject: "roadmap zed",
+      fromName: "Zed",
+      fromAddress: "zed@x.com",
+      date: at(300),
+    })
+    const alice = await seedSorted({
+      subject: "roadmap alice",
+      fromName: "alice",
+      fromAddress: "alice@x.com",
+      date: at(100),
+    })
+    const pinned = await seedSorted({
+      subject: "roadmap pin",
+      fromName: "martha",
+      fromAddress: "martha@x.com",
+      date: at(200),
+    })
+    await pinThread(executor, pinned)
+
+    const hits = await searchThreadsQuery(executor, accountId, "roadmap", {
+      sort: "sender",
+    })
+    // martha is pinned into first place regardless of its sender; the rest
+    // order alice → zed (NOT date order, which would be zed first).
+    expect(hits.map((thread) => thread.id)).toEqual([pinned, alice, zed])
+
+    // Default stays date-desc (pinned-first still leads it).
+    const byDate = await searchThreadsQuery(executor, accountId, "roadmap")
+    expect(byDate.map((thread) => thread.id)).toEqual([pinned, zed, alice])
+  })
+})
+
+describe("searchThreadsAcrossAccounts (task 9.1)", () => {
+  let executor: TestExecutor
+  let accountA: string
+  let accountB: string
+
+  /** Seed a matching thread + message on a specific account. */
+  async function seed(
+    accountId: string,
+    subject: string,
+    date: number
+  ): Promise<string> {
+    const threadId = await createThread(executor, accountId, { subject })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date,
+      subject,
+      bodyText: "roadmap notes attached.",
+      snippet: "roadmap notes attached.",
+      fromName: "Biz",
+      fromAddress: "biz@corp.example",
+    })
+    await recomputeThreadCaches(executor, threadId)
+    return threadId
+  }
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountA = await createAccount(executor, "gmail")
+    accountB = await createAccount(executor, "imap")
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("merges matches from every account in the set, sorted across the merge", async () => {
+    const olderA = await seed(accountA, "A roadmap", at(100))
+    const newerB = await seed(accountB, "B roadmap", at(300))
+    const midA = await seed(accountA, "A2 roadmap", at(200))
+
+    const hits = await searchThreadsAcrossAccounts(
+      executor,
+      [accountA, accountB],
+      "roadmap"
+    )
+    // One merged, date-desc list — NOT per-account runs concatenated.
+    expect(hits.map((thread) => thread.id)).toEqual([newerB, midA, olderA])
+    expect(hits.map((thread) => thread.account_id)).toEqual([
+      accountB,
+      accountA,
+      accountA,
+    ])
+  })
+
+  it("applies limit after the merge, never per account", async () => {
+    await seed(accountA, "A roadmap", at(100))
+    const newerB = await seed(accountB, "B roadmap", at(300))
+    const midA = await seed(accountA, "A2 roadmap", at(200))
+
+    const hits = await searchThreadsAcrossAccounts(
+      executor,
+      [accountA, accountB],
+      "roadmap",
+      { limit: 2 }
+    )
+    expect(hits.map((thread) => thread.id)).toEqual([newerB, midA])
+  })
+
+  it("restricts the search to the requested account subset", async () => {
+    await seed(accountA, "A roadmap", at(100))
+    await seed(accountB, "B roadmap", at(300))
+
+    const hits = await searchThreadsAcrossAccounts(
+      executor,
+      [accountB],
+      "roadmap"
+    )
+    expect(hits.map((thread) => thread.account_id)).toEqual([accountB])
+  })
+
+  it("returns [] for an empty account set", async () => {
+    await seed(accountA, "A roadmap", at(100))
+    expect(await searchThreadsAcrossAccounts(executor, [], "roadmap")).toEqual(
+      []
+    )
   })
 })

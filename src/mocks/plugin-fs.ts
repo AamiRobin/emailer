@@ -158,3 +158,35 @@ export async function rename(
   files.set(resolvePath(newPath, options?.newPathBaseDir), stored)
   files.delete(key)
 }
+
+export interface FileHandle {
+  write(data: Uint8Array): Promise<number>
+  close(): Promise<void>
+}
+
+export async function open(
+  path: string,
+  options?: WriteFileOptions & { read?: boolean }
+): Promise<FileHandle> {
+  installMockHarness()
+  const key = resolvePath(path, options?.baseDir)
+  let buffer = options?.read ? files.get(key) : undefined
+  if (options?.read && !buffer) {
+    throw new Error(`[mock] fs: file not found: ${path}`)
+  }
+  return {
+    async write(data) {
+      const merged = buffer
+        ? new Uint8Array(buffer.length + data.length)
+        : data.slice()
+      if (buffer) merged.set(buffer)
+      if (buffer) merged.set(data, buffer.length)
+      buffer = merged
+      files.set(key, merged)
+      return data.length
+    },
+    async close() {
+      // Writes are already visible in the in-memory store; nothing to flush.
+    },
+  }
+}

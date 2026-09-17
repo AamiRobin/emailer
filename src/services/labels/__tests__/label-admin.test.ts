@@ -439,6 +439,7 @@ function fakeGmailClient(): GmailClient {
     untrashMessage: vi.fn(async () => ({}) as never),
     deleteMessage: vi.fn(async () => {}),
     getProfile: vi.fn(async () => ({ emailAddress: "x@y.z" })),
+    listSendAs: vi.fn(async () => [{ sendAsEmail: "x@y.z", isPrimary: true }]),
     getAttachment: vi.fn(async () => ({}) as never),
     createLabel: vi.fn(async (input: { name: string }) => ({
       id: "Label_new",
@@ -446,6 +447,12 @@ function fakeGmailClient(): GmailClient {
     })),
     updateLabel: vi.fn(async (id: string) => ({ id, name: "" })),
     deleteLabel: vi.fn(async () => {}),
+    createDraft: vi.fn(async () => ({}) as never),
+    updateDraft: vi.fn(async () => ({}) as never),
+    deleteDraft: vi.fn(async () => {}),
+    sendDraft: vi.fn(async () => ({}) as never),
+    getDraft: vi.fn(async () => ({}) as never),
+    listDrafts: vi.fn(async () => ({}) as never),
   }
 }
 

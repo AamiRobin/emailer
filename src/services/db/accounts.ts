@@ -50,16 +50,21 @@ export async function listAccounts(
 }
 
 /**
- * Accounts eligible for background sync: status "active" (5.6 marks
- * failing accounts "auth-error", which pauses only that account) and not
- * disabled via is_active.
+ * Accounts eligible for background sync AND for the cross-account
+ * aggregations (unified/priority/nudges/split scopes, split-tab counts,
+ * nudge badge): status "active" (5.6 marks failing accounts "auth-error",
+ * which pauses only that account). Deliberately NOT filtered on
+ * `is_active` — that column is the account switcher's "last selected"
+ * persistence flag (account-store.ts persistActiveAccount), not an
+ * enable/disable switch: switching to account B must never stop account A
+ * syncing or vanish it from the unified inbox.
  */
 export async function listActiveAccounts(
   executor: SqlExecutor
 ): Promise<AccountRow[]> {
   return executor.select<AccountRow>(
-    "SELECT * FROM accounts WHERE status = $1 AND is_active = $2 ORDER BY created_at ASC, id ASC",
-    ["active", 1]
+    "SELECT * FROM accounts WHERE status = $1 ORDER BY created_at ASC, id ASC",
+    ["active"]
   )
 }
 
@@ -75,17 +80,40 @@ export async function getAccount(
 }
 
 /**
+ * The unread-badge exclusion for thread-local states, shared by
+ * getTotalUnreadCount() and the per-account switcher counts
+ * (account-store.ts) so every badge agrees: unread messages in SNOOZED
+ * threads (snoozed_until — the same query-level predicate the inbox list
+ * and inbox badge use, see email-actions/snooze.ts), MUTED threads
+ * (muted_at — spec: muted is excluded from unread counts, see
+ * email-actions/thread-states.ts) and HELD threads (held_until — a
+ * delivery-schedule hold; the spec excludes held mail from unread counts
+ * until its window opens, see email-actions/holds.ts) do not count. Read
+ * state itself is never mutated by those states, so the messages simply
+ * reappear in the counts when the flag is cleared. Correlated: the
+ * surrounding query's FROM must be `messages`.
+ */
+export const UNREAD_BADGE_THREAD_EXCLUSION = `NOT EXISTS (
+  SELECT 1 FROM threads
+  WHERE threads.id = messages.thread_id
+    AND (threads.snoozed_until IS NOT NULL OR threads.muted_at IS NOT NULL
+         OR threads.held_until IS NOT NULL)
+)`
+
+/**
  * Total unread messages across every account — the number the OS unread
  * badge shows (task 4.6). Deliberately a fresh COUNT on every call so the
  * badge reflects mark-read changes that happened outside the sync pass
  * too; per-account counts for the switcher live in account-store's
- * refreshUnreadCounts().
+ * refreshUnreadCounts() and share UNREAD_BADGE_THREAD_EXCLUSION above.
  */
 export async function getTotalUnreadCount(
   executor: SqlExecutor
 ): Promise<number> {
   const rows = await executor.select<{ total: number }>(
-    "SELECT COUNT(*) AS total FROM messages WHERE is_read = 0"
+    `SELECT COUNT(*) AS total FROM messages
+     WHERE is_read = 0
+       AND ${UNREAD_BADGE_THREAD_EXCLUSION}`
   )
   return rows[0]?.total ?? 0
 }

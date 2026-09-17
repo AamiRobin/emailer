@@ -48,6 +48,8 @@ function fullImapMessage() {
     messageId: "<m-1@example.com>",
     inReplyTo: null,
     references: "<m-0@example.com>",
+    listUnsubscribe: "<https://a/u>, <mailto:b@c>",
+    listUnsubscribePost: null,
     subject: "Hello",
     from: [
       { name: "Ada", email: "ada@example.com" },
@@ -150,6 +152,9 @@ describe("message fetching and mapping", () => {
       messageId: "<m-1@example.com>",
       inReplyTo: undefined, // Rust null → undefined
       references: "<m-0@example.com>",
+      // Task 18.3: the header pair rides the wire verbatim; absent → undefined
+      listUnsubscribe: "<https://a/u>, <mailto:b@c>",
+      listUnsubscribePost: undefined,
       subject: "Hello",
       from: [
         { name: "Ada", email: "ada@example.com" },
@@ -446,6 +451,97 @@ describe("sending", () => {
           ],
         }),
       })
+    )
+  })
+
+  // Design D10 (task 16.2): an alias only ever shapes the From HEADER.
+  // The Rust command builds the lettre message from `email.from` (so the
+  // header must carry the alias) while `envelopeFrom` pins MAIL FROM to
+  // the authenticated account — together they prove the invariant
+  // end-to-end at the wire boundary.
+  it("sends from an alias with the header carrying it and the envelope pinned to the account (D10)", async () => {
+    mockCommands({ smtp_send_email: { messageId: "<gen@example.com>" } })
+    await provider().sendMessage({
+      from: { name: "User", email: "user@example.com" },
+      fromAlias: { name: "User Work", email: "work@example.com" },
+      to: [{ email: "ada@example.com" }],
+      subject: "Hi",
+      htmlBody: "<p>Hi</p>",
+    })
+
+    expect(invokeMock).toHaveBeenCalledWith("smtp_send_email", {
+      params: expectedSmtpParams,
+      // The MIME From header = the alias (Rust build_message uses this
+      // identity verbatim for the From header).
+      email: expect.objectContaining({
+        from: { name: "User Work", email: "work@example.com" },
+      }),
+      // MAIL FROM = the primary account address (raw-envelope path).
+      envelopeFrom: "user@example.com",
+    })
+  })
+
+  it("omits envelopeFrom when no alias is set (header-derived envelope)", async () => {
+    mockCommands({ smtp_send_email: { messageId: "<gen@example.com>" } })
+    await provider().sendMessage({
+      from: { email: "user@example.com" },
+      to: [{ email: "ada@example.com" }],
+      subject: "Hi",
+      htmlBody: "<p>Hi</p>",
+    })
+
+    const [, payload] = invokeMock.mock.calls.find(
+      (call) => call[0] === "smtp_send_email"
+    ) as unknown as [string, { envelopeFrom?: string }]
+    expect(payload.envelopeFrom).toBeUndefined()
+  })
+
+  // Task 18.5 (design D11): the PGP/MIME built and signed/encrypted at
+  // enqueue time arrives FULLY BUILT and goes out verbatim through the raw
+  // command — letting Rust rebuild the MIME from the structured fields
+  // would unwrap the protection. The envelope mirrors the alias send
+  // above (D10): MAIL FROM stays the primary account address and RCPT TO
+  // comes from the structured recipients; the fields ride for bookkeeping
+  // only.
+  it("transmits a prebuilt pgpMime verbatim via smtp_send_raw_email (task 18.5)", async () => {
+    mockCommands({ smtp_send_raw_email: undefined })
+    const result = await provider().sendMessage({
+      from: { name: "User", email: "user@example.com" },
+      fromAlias: { name: "User Work", email: "work@example.com" },
+      to: [{ email: "ada@example.com" }],
+      cc: [{ email: "bob@example.com" }],
+      bcc: [{ email: "carol@example.com" }],
+      subject: "Hi",
+      htmlBody: "<p>Hi</p>",
+      messageId: "<m-1@example.com>",
+      pgpMime: "-----BEGIN PGP MESSAGE-----",
+    })
+
+    expect(invokeMock).toHaveBeenCalledTimes(1)
+    expect(invokeMock).toHaveBeenCalledWith("smtp_send_raw_email", {
+      params: expectedSmtpParams,
+      raw: "-----BEGIN PGP MESSAGE-----",
+      recipients: ["ada@example.com", "bob@example.com", "carol@example.com"],
+      // MAIL FROM = the primary account address, never the alias (D10).
+      envelopeFrom: "user@example.com",
+    })
+    // The composer's Message-ID (stamped into the raw message).
+    expect(result).toEqual({ messageId: "<m-1@example.com>" })
+  })
+
+  it("never routes a plain send through the raw command", async () => {
+    mockCommands({ smtp_send_email: { messageId: "<gen@example.com>" } })
+    await provider().sendMessage({
+      from: { email: "user@example.com" },
+      to: [{ email: "ada@example.com" }],
+      subject: "Hi",
+      htmlBody: "<p>Hi</p>",
+    })
+
+    expect(invokeMock).toHaveBeenCalledTimes(1)
+    expect(invokeMock).toHaveBeenCalledWith(
+      "smtp_send_email",
+      expect.anything()
     )
   })
 })

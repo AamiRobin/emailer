@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { createAccount, uid } from "../../db/__tests__/fixtures"
+import { upsertManualAlias } from "../../db/aliases"
+import { createAccount, createThread, uid } from "../../db/__tests__/fixtures"
 import {
   createTestExecutor,
   type TestExecutor,
@@ -16,6 +17,7 @@ import {
   type PendingOperationRow,
 } from "../../db/pending-operations"
 import { getMessage, insertMessage } from "../../db/messages"
+import { getSetting, setSetting } from "../../db/settings"
 import { getThread, insertThread, listThreadsByFolder } from "../../db/threads"
 import type {
   DeltaSyncResult,
@@ -25,21 +27,63 @@ import type {
   MessageFlags,
   NormalizedMessage,
 } from "../../email/types"
+import type { BuiltMime } from "../../email/mime-builder"
 import { operationFromRow } from "../../queue/operation"
 import { syncGmailAccount } from "../../sync/gmail-sync"
 import { syncImapAccount } from "../../sync/imap-sync"
 import { useOnlineStore } from "../../../stores/online-store"
-import { saveDraft } from "../drafts"
+
+// PGP send (task 18.5): the transforms are canned (the RFC 3156 crypto
+// round-trips are pgp-transform.test.ts's job, and openpgp cannot
+// initialize under jsdom); pgp-keys is PARTIALLY mocked — the pure-DB
+// lookup functions stay real (they run against the seeded settings rows),
+// only the unlock is substituted, since it would load openpgp.
+vi.mock("../../crypto/pgp-transform", () => ({
+  signMime: vi.fn(async ({ built }: { built: BuiltMime }) => ({
+    mime: `SIGNED:${built.mime}`,
+    messageId: built.messageId,
+  })),
+  encryptMime: vi.fn(async ({ built }: { built: BuiltMime }) => ({
+    mime: `ENCRYPTED:${built.mime}`,
+    messageId: built.messageId,
+  })),
+  signAndEncryptMime: vi.fn(async ({ built }: { built: BuiltMime }) => ({
+    mime: `SIGN+ENCRYPTED:${built.mime}`,
+    messageId: built.messageId,
+  })),
+}))
+vi.mock("../../crypto/pgp-keys", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  getDecryptedPrivateKey: vi.fn(async () => ({
+    isDecrypted: () => true,
+  })),
+}))
+
+import {
+  encryptMime,
+  signAndEncryptMime,
+  signMime,
+} from "../../crypto/pgp-transform"
+import {
+  getDecryptedPrivateKey,
+  privateKeysSettingKey,
+  PgpKeyError,
+  publicKeysSettingKey,
+} from "../../crypto/pgp-keys"
+import { getDraft, saveDraft } from "../drafts"
 import {
   EmptyMessageError,
   FailedSendNotFoundError,
   FailedSendNotRetryableError,
   InvalidRecipientError,
   listFailedSends,
+  MissingPgpKeysError,
   MissingRecipientsError,
   onSendCompleted,
   onSendFailed,
+  PgpSigningKeyMissingError,
   reconcileProvisionalSent,
+  resolveMissingPgpRecipients,
   retryFailedSend,
   SendAccountNotFoundError,
   sendComposerDraft,
@@ -353,6 +397,39 @@ describe("sendComposerDraft", () => {
       ).rejects.toBeInstanceOf(EmptyMessageError)
     })
 
+    it("sends an attachment-only payload (no EmptyMessageError)", async () => {
+      const accountId = await createAccount(executor)
+      // drafts.ts deliberately keeps attachment-only drafts — the body
+      // gate must pass when ≥1 attachment rides along.
+      const result = await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload({
+          subject: "",
+          htmlBody: "",
+          textBody: "",
+          attachments: [
+            {
+              filename: "report.pdf",
+              mimeType: "application/pdf",
+              contentBase64: btoa("%PDF-1.4"),
+            },
+          ],
+        }),
+      })
+      if (result.status !== "queued") throw new Error("expected a queued send")
+
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      expect(op.input.attachments).toEqual([
+        {
+          filename: "report.pdf",
+          mimeType: "application/pdf",
+          contentBase64: btoa("%PDF-1.4"),
+        },
+      ])
+    })
+
     it("throws SendAccountNotFoundError for an unknown account", async () => {
       await expect(
         sendComposerDraft({
@@ -567,6 +644,384 @@ describe("sendComposerDraft", () => {
     })
   })
 
+  describe("from alias (task 16.2, design D10)", () => {
+    it("keeps the envelope on the primary account and rides the alias as a header override", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedSentLabel(executor, accountId, "gmail")
+      // The send-build gate verifies the selection against the aliases
+      // table, so the row must exist for the alias to ride.
+      await upsertManualAlias(executor, accountId, {
+        email: "work@example.com",
+        displayName: "Work Alias",
+      })
+
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        fromAlias: { email: "work@example.com", name: "Work Alias" },
+      })
+
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      // ENVELOPE: the SMTP provider maps input.from → MAIL FROM and the
+      // Gmail provider sends as the authenticated user — both must see
+      // the primary account here, never the alias.
+      expect(op.input.from).toEqual({ email: `${accountId}@example.com` })
+      // HEADER: the alias override travels with the queued payload, so an
+      // offline replay builds the alias From header (Gmail raw message).
+      expect(op.input.fromAlias).toEqual({
+        email: "work@example.com",
+        name: "Work Alias",
+      })
+    })
+
+    it("files the provisional Sent row under the alias identity", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedSentLabel(executor, accountId, "gmail")
+      await upsertManualAlias(executor, accountId, {
+        email: "work@example.com",
+      })
+
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        fromAlias: { email: "WORK@example.com" },
+      })
+
+      const messageRows = await executor.select<{
+        from_address: string
+        from_name: string | null
+      }>("SELECT from_address, from_name FROM messages", [])
+      expect(messageRows).toEqual([
+        { from_address: "work@example.com", from_name: null },
+      ])
+    })
+
+    it("an empty alias address degrades to the bare account identity", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedSentLabel(executor, accountId, "gmail")
+
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        fromAlias: { email: "   " },
+      })
+
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      expect(op.input.from.email).toBe(`${accountId}@example.com`)
+      expect(op.input.fromAlias).toBeUndefined()
+    })
+
+    it("a stale (deleted) alias selection falls back to the bare identity", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedSentLabel(executor, accountId, "gmail")
+      await upsertManualAlias(executor, accountId, {
+        email: "work@example.com",
+        displayName: "Work Alias",
+      })
+
+      // While the alias row exists, the send rides it…
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        fromAlias: { email: "work@example.com", name: "Work Alias" },
+      })
+      const first = (await queuedOps(executor, accountId))[0]
+      if (first?.kind !== "send") throw new Error("expected a send op")
+      expect(first.input.fromAlias).toEqual({
+        email: "work@example.com",
+        name: "Work Alias",
+      })
+
+      // …and once the alias is deleted from settings, the SAME selection
+      // (the composer store can keep a stale value) sends as the bare
+      // identity instead of a removed From the provider would reject at
+      // replay.
+      await executor.execute("DELETE FROM aliases WHERE account_id = $1", [
+        accountId,
+      ])
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        fromAlias: { email: "work@example.com", name: "Work Alias" },
+      })
+      const ops = await queuedOps(executor, accountId)
+      const second = ops[1]
+      if (second?.kind !== "send") throw new Error("expected a send op")
+      expect(second.input.fromAlias).toBeUndefined()
+      expect(second.input.from.email).toBe(`${accountId}@example.com`)
+    })
+
+    it("no alias selection omits the fromAlias key entirely", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedSentLabel(executor, accountId, "gmail")
+
+      await sendThroughService(executor, accountId)
+
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      expect(op.input.fromAlias).toBeUndefined()
+    })
+  })
+
+  describe("PGP send (task 18.5)", () => {
+    const SENDER_FINGERPRINT = "a".repeat(40)
+    const RECIPIENT_FINGERPRINT = "b".repeat(40)
+
+    /** Seed one stored public-key entry (18.4's settings row shape) for
+     * `email` — armor strings only; no openpgp involved. */
+    async function seedPublicKey(
+      accountId: string,
+      email: string,
+      id: string
+    ): Promise<void> {
+      const key = publicKeysSettingKey(accountId)
+      const stored = await getSetting<Record<string, unknown>[]>(
+        executor,
+        key,
+        []
+      )
+      await setSetting(executor, key, [
+        ...stored,
+        {
+          id,
+          armor: `-----BEGIN PGP PUBLIC KEY BLOCK-----\n${id}\n-----END PGP PUBLIC KEY BLOCK-----`,
+          email,
+          source: "imported",
+          createdAt: Math.floor(Date.now() / 1000),
+        },
+      ])
+    }
+
+    /** Seed the account's default private key (18.4's settings row shape). */
+    async function seedDefaultPrivateKey(accountId: string): Promise<void> {
+      await setSetting(executor, privateKeysSettingKey(accountId), [
+        {
+          id: SENDER_FINGERPRINT,
+          armor: "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+          wrappedArmor: "v1.wrapped",
+          name: "Me User",
+          email: `${accountId}@example.com`,
+          createdAt: Math.floor(Date.now() / 1000),
+          isDefault: true,
+        },
+      ])
+    }
+
+    afterEach(() => {
+      vi.mocked(getDecryptedPrivateKey).mockReset()
+    })
+
+    it("encrypt: queues the transformed PGP/MIME verbatim, keeps the Sent copy plaintext", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedSentLabel(executor, accountId, "gmail")
+      await seedPublicKey(accountId, "alice@example.com", RECIPIENT_FINGERPRINT)
+      const draftId = await seedDraft(executor, accountId)
+
+      const result = await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        draftId,
+        pgp: { mode: "encrypt" },
+      })
+      expect(result.status).toBe("queued")
+
+      // The queued op carries the finished PGP/MIME plus the structured
+      // fields (failed-send display) unchanged.
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      expect(op.input.pgpMime).toMatch(/^ENCRYPTED:/)
+      expect(op.input.subject).toBe("Quarterly report")
+      // The transform received exactly the recipient's armor.
+      expect(vi.mocked(encryptMime).mock.calls[0][0].encryptionArmors).toEqual([
+        expect.stringContaining("BEGIN PGP PUBLIC KEY BLOCK"),
+      ])
+
+      // The LOCAL sent copy stays readable (plaintext payload filing).
+      const sentThreads = await listThreadsByFolder(executor, {
+        accountId,
+        folder: { kind: "specialUse", specialUse: "sent" },
+      })
+      expect(sentThreads).toHaveLength(1)
+      const messageRows = await executor.select<{ id: string }>(
+        "SELECT id FROM messages WHERE thread_id = $1",
+        [sentThreads[0]!.id]
+      )
+      const stored = await getMessage(executor, messageRows[0]!.id)
+      expect(stored?.body_text).toBe("Hi there")
+    })
+
+    it("encrypt: adds the sender's own key when known (encrypt-to-self)", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedPublicKey(accountId, "alice@example.com", RECIPIENT_FINGERPRINT)
+      await seedPublicKey(
+        accountId,
+        `${accountId}@example.com`,
+        SENDER_FINGERPRINT
+      )
+
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        pgp: { mode: "encrypt" },
+      })
+
+      const armors = vi.mocked(encryptMime).mock.calls[0][0]
+        .encryptionArmors as string[]
+      expect(armors).toHaveLength(2)
+      expect(armors[1]).toContain(SENDER_FINGERPRINT)
+    })
+
+    it("encrypt: blocks naming the recipients whose keys are missing, mutating nothing", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedPublicKey(accountId, "alice@example.com", RECIPIENT_FINGERPRINT)
+      const draftId = await seedDraft(executor, accountId)
+
+      const error = await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload({
+          cc: [{ email: "NoKey@Example.com" }],
+        }),
+        draftId,
+        pgp: { mode: "encrypt" },
+      }).catch((caught: unknown) => caught)
+
+      // The spec's missing-key scenario: blocked, NAMING the recipient.
+      expect(error).toBeInstanceOf(MissingPgpKeysError)
+      expect((error as MissingPgpKeysError).emails).toEqual([
+        "nokey@example.com",
+      ])
+      expect((error as Error).message).toContain("nokey@example.com")
+      // Validation-order: nothing was queued or filed, the draft survives.
+      expect(await queuedOps(executor, accountId)).toHaveLength(0)
+      expect(await sentThreadIds(executor, accountId)).toHaveLength(0)
+      expect(await getDraft(executor, draftId)).not.toBeNull()
+    })
+
+    it("sign: queues the signed message when the default key unlocks", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedDefaultPrivateKey(accountId)
+
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        pgp: { mode: "sign", passphrase: "pw" },
+      })
+
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      expect(op.input.pgpMime).toMatch(/^SIGNED:/)
+      const args = vi.mocked(signMime).mock.calls[0][0]
+      expect(args.signingKey).toMatchObject({ isDecrypted: expect.anything() })
+    })
+
+    it("sign: blocks when the account has no private key", async () => {
+      const accountId = await createAccount(executor, "gmail")
+
+      await expect(
+        sendComposerDraft({
+          executor,
+          accountId,
+          payload: composerPayload(),
+          pgp: { mode: "sign", passphrase: "pw" },
+        })
+      ).rejects.toBeInstanceOf(PgpSigningKeyMissingError)
+      expect(await queuedOps(executor, accountId)).toHaveLength(0)
+    })
+
+    it("sign: a wrong passphrase fails before anything is queued", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedDefaultPrivateKey(accountId)
+      vi.mocked(getDecryptedPrivateKey).mockRejectedValueOnce(
+        new PgpKeyError("the passphrase does not unlock this key")
+      )
+
+      await expect(
+        sendComposerDraft({
+          executor,
+          accountId,
+          payload: composerPayload(),
+          pgp: { mode: "sign", passphrase: "wrong" },
+        })
+      ).rejects.toThrow(/passphrase does not unlock/)
+      expect(await queuedOps(executor, accountId)).toHaveLength(0)
+    })
+
+    it("sign+encrypt: hands both the key and the armors to the transform", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedDefaultPrivateKey(accountId)
+      await seedPublicKey(accountId, "alice@example.com", RECIPIENT_FINGERPRINT)
+
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        pgp: { mode: "sign+encrypt", passphrase: "pw" },
+      })
+
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      expect(op.input.pgpMime).toMatch(/^SIGN\+ENCRYPTED:/)
+      expect(signAndEncryptMime).toHaveBeenCalledTimes(1)
+    })
+
+    it("queues the PGP/MIME for imap accounts exactly like gmail ones (task 18.5)", async () => {
+      const accountId = await createAccount(executor, "imap")
+      await seedPublicKey(accountId, "alice@example.com", RECIPIENT_FINGERPRINT)
+
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+        pgp: { mode: "encrypt" },
+      })
+
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      expect(op.input.pgpMime).toMatch(/^ENCRYPTED:/)
+      expect(encryptMime).toHaveBeenCalledTimes(1)
+    })
+
+    it("a plain send never sets pgpMime (byte-identical legacy path)", async () => {
+      const accountId = await createAccount(executor, "gmail")
+
+      await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+      })
+
+      const op = (await queuedOps(executor, accountId))[0]
+      if (op?.kind !== "send") throw new Error("expected a send op")
+      expect(op.input.pgpMime).toBeUndefined()
+      expect(signMime).not.toHaveBeenCalled()
+      expect(encryptMime).not.toHaveBeenCalled()
+    })
+
+    it("resolveMissingPgpRecipients names exactly the keyless addresses", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedPublicKey(accountId, "alice@example.com", RECIPIENT_FINGERPRINT)
+
+      await expect(
+        resolveMissingPgpRecipients(executor, accountId, [
+          "Alice@Example.com",
+          "nobody@example.com",
+          "also-missing@example.com",
+        ])
+      ).resolves.toEqual(["nobody@example.com", "also-missing@example.com"])
+    })
+  })
+
   describe("offline", () => {
     it("queues identically and reports queuedOffline", async () => {
       const accountId = await createAccount(executor, "gmail")
@@ -632,6 +1087,99 @@ describe("sendComposerDraft", () => {
       const threads = await executor.select("SELECT * FROM threads", [])
       expect(threads).toHaveLength(0)
     })
+  })
+})
+
+// ---- Follow-up reminders (task 14.2, design D8) ------------------------------
+
+describe("follow-up reminders attach at send acceptance", () => {
+  let executor: TestExecutor
+
+  beforeEach(() => {
+    executor = createTestExecutor()
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  async function reminderRows(threadId: string) {
+    return executor.select<{
+      thread_id: string
+      due_at: number
+      cancelled_at: number | null
+      created_at: number
+    }>(
+      "SELECT thread_id, due_at, cancelled_at, created_at FROM followup_reminders WHERE thread_id = $1",
+      [threadId]
+    )
+  }
+
+  it("sending a REPLY attaches a reminder to the source thread, due = accept + interval", async () => {
+    const accountId = await createAccount(executor, "gmail")
+    await seedSentLabel(executor, accountId, "gmail")
+    // The conversation being answered must exist (the reminder FKs it).
+    const sourceThreadId = await createThread(executor, accountId, {
+      subject: "Q3 numbers",
+    })
+
+    const result = await sendComposerDraft({
+      executor,
+      accountId,
+      payload: composerPayload(),
+      mode: {
+        kind: "reply",
+        inReplyTo: "<orig@example.com>",
+        sourceThreadId,
+      },
+    })
+    expect(result.status).toBe("queued")
+
+    const rows = await reminderRows(sourceThreadId)
+    expect(rows).toHaveLength(1)
+    const reminder = rows[0]!
+    expect(reminder.cancelled_at).toBeNull()
+    // The interval is the default `mail.followUpDays` = 3; the clock is
+    // the real one, so compare against the row's own created_at (±1s of
+    // second-boundary slack) rather than pinning Date.now().
+    expect(
+      Math.abs(reminder.due_at - reminder.created_at - 3 * 24 * 60 * 60)
+    ).toBeLessThanOrEqual(1)
+  })
+
+  it("a fresh compose (no thread linkage) attaches nothing", async () => {
+    const accountId = await createAccount(executor, "gmail")
+    await seedSentLabel(executor, accountId, "gmail")
+
+    const result = await sendComposerDraft({
+      executor,
+      accountId,
+      payload: composerPayload(),
+    })
+    expect(result.status).toBe("queued")
+    const rows = await executor.select("SELECT * FROM followup_reminders", [])
+    expect(rows).toEqual([])
+  })
+
+  it("a failed attach never fails the send (reply into a deleted thread still queues)", async () => {
+    const accountId = await createAccount(executor, "gmail")
+    await seedSentLabel(executor, accountId, "gmail")
+
+    const result = await sendComposerDraft({
+      executor,
+      accountId,
+      payload: composerPayload(),
+      mode: {
+        kind: "reply",
+        inReplyTo: "<orig@example.com>",
+        sourceThreadId: "thread-deleted-mid-compose",
+      },
+    })
+    // The send stands; only the reminder is skipped.
+    expect(result.status).toBe("queued")
+    expect(
+      await executor.select("SELECT * FROM followup_reminders", [])
+    ).toEqual([])
   })
 })
 

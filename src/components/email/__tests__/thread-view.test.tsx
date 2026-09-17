@@ -16,8 +16,10 @@ import {
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
 import { allowSender } from "@/services/db/image-allowlist"
+import { listBlockedSenders } from "@/services/db/blocked-senders"
 import type { ContactRef } from "@/services/db/messages"
 import { updateMessage } from "@/services/db/messages"
+import { recomputeThreadCaches } from "@/services/db/threads"
 import { setSignature } from "@/services/composer/signatures"
 import {
   setAccountStoreExecutor,
@@ -30,7 +32,10 @@ import {
 } from "@/stores/thread-list-store"
 import { DEFAULT_VIEW, useUiStore } from "@/stores/ui-store"
 import { useComposerStore } from "@/stores/composer-store"
+import { toast } from "sonner"
 import { ThreadView } from "../thread-view"
+
+const toastMock = vi.mocked(toast)
 
 /**
  * Thread-view render tests (tasks 7.1/7.3/7.4/7.5-UI). Data flows through
@@ -85,9 +90,41 @@ const threadActions = vi.hoisted(() => ({
         read: boolean
       ) => Promise<void>
     >(),
+  // snooze.ts reuses this error (index.ts star-exports both modules) and
+  // loads through the mock whenever ThreadView is imported.
+  ThreadNotFoundError: class ThreadNotFoundError extends Error {},
 }))
 
 vi.mock("@/services/email-actions/thread-actions", () => threadActions)
+
+// thread-states (task 3.3) is a separate module seam (mute/pin/done are
+// local-only SQL, but the toolbar tests assert calls, not columns).
+const threadStates = vi.hoisted(() => ({
+  muteThread: vi.fn<(executor: unknown, threadId: string) => Promise<void>>(),
+  unmuteThread: vi.fn<(executor: unknown, threadId: string) => Promise<void>>(),
+  pinThread: vi.fn<(executor: unknown, threadId: string) => Promise<void>>(),
+  unpinThread: vi.fn<(executor: unknown, threadId: string) => Promise<void>>(),
+  markThreadDone:
+    vi.fn<(executor: unknown, threadId: string) => Promise<void>>(),
+  unmarkThreadDone:
+    vi.fn<(executor: unknown, threadId: string) => Promise<void>>(),
+}))
+
+vi.mock("@/services/email-actions/thread-states", () => threadStates)
+
+// The shared state flow toasts on success (same boundary as
+// snooze.test.tsx); mocked so tests assert it directly.
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), {
+    success: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    error: vi.fn(),
+    message: vi.fn(),
+    loading: vi.fn(),
+    dismiss: vi.fn(),
+  }),
+}))
 
 const attachmentsService = vi.hoisted(() => ({
   ensureAttachmentCached: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
@@ -152,6 +189,12 @@ beforeEach(() => {
   threadActions.trashThread.mockResolvedValue()
   threadActions.setThreadStarred.mockResolvedValue()
   threadActions.setThreadRead.mockResolvedValue()
+  threadStates.muteThread.mockResolvedValue()
+  threadStates.unmuteThread.mockResolvedValue()
+  threadStates.pinThread.mockResolvedValue()
+  threadStates.unpinThread.mockResolvedValue()
+  threadStates.markThreadDone.mockResolvedValue()
+  threadStates.unmarkThreadDone.mockResolvedValue()
   attachmentsService.getAttachmentContent.mockResolvedValue(
     new Uint8Array([9, 9])
   )
@@ -712,6 +755,56 @@ describe("toolbar actions (task 7 wiring)", () => {
     )
   })
 
+  it("actions on a thread from another account target the owning account (task 9.2)", async () => {
+    // Unified-inbox scenario: the active account stays acc-1 while the
+    // open thread belongs to acc-2. The loaded thread's own account_id is
+    // authoritative — before the fix the pane refused the mismatch
+    // ("Message not found") and the toolbar would have acted as acc-1,
+    // which the account-scoped services refuse.
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      ["acc-2", "gmail", "acc-2@example.com"]
+    )
+    const threadId = await createThread(executor, "acc-2", {
+      subject: "Cross-account thread",
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId: "acc-2",
+      date: 1_700_000_000,
+      fromName: "Ada Lovelace",
+      fromAddress: "ada@example.com",
+      isRead: false,
+    })
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: "acc-1" })
+    await openThread(threadId)
+
+    // The foreign thread renders instead of the mismatch not-found state.
+    expect(screen.getByTestId("thread-subject").textContent).toContain(
+      "Cross-account thread"
+    )
+    // Mark-read-on-open runs as the owning account too.
+    await waitFor(() =>
+      expect(threadActions.setThreadRead).toHaveBeenCalledWith(
+        executor,
+        "acc-2",
+        threadId,
+        true
+      )
+    )
+    // And the toolbar archive.
+    fireEvent.click(screen.getByTestId("toolbar-archive"))
+    await waitFor(() =>
+      expect(threadActions.archiveThread).toHaveBeenCalledTimes(1)
+    )
+    expect(threadActions.archiveThread).toHaveBeenCalledWith(
+      executor,
+      "acc-2",
+      threadId
+    )
+  })
+
   it("toolbar buttons are disabled while an action is in flight", async () => {
     const threadId = await seedSimpleThread()
     // A never-settling archive keeps the mutation pending (once only).
@@ -732,6 +825,270 @@ describe("toolbar actions (task 7 wiring)", () => {
     expect(
       (screen.getByTestId("toolbar-reply") as HTMLButtonElement).disabled
     ).toBe(true)
+    // The task 3.3 state buttons share the same in-flight guard.
+    expect(
+      (screen.getByTestId("toolbar-mute") as HTMLButtonElement).disabled
+    ).toBe(true)
+    expect(
+      (screen.getByTestId("toolbar-pin") as HTMLButtonElement).disabled
+    ).toBe(true)
+    expect(
+      (screen.getByTestId("toolbar-done") as HTMLButtonElement).disabled
+    ).toBe(true)
+  })
+})
+
+describe("thread-state toolbar buttons (task 3.3)", () => {
+  async function seedStateThread(): Promise<string> {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    const threadId = await createThread(executor, accountId, {
+      subject: "Stateful",
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: 1_700_000_000,
+      fromName: "Ada Lovelace",
+      fromAddress: "ada@example.com",
+      isRead: true,
+    })
+    return threadId
+  }
+
+  /** Wait for the shared flow's pendingAction guard to release (the
+   * buttons re-enable only after the post-action refreshes settle), so a
+   * follow-up click is not swallowed. */
+  async function awaitIdle(testId: string): Promise<void> {
+    await waitFor(() =>
+      expect((screen.getByTestId(testId) as HTMLButtonElement).disabled).toBe(
+        false
+      )
+    )
+  }
+
+  it("mute, pin and done call the local-state services for the open thread", async () => {
+    const threadId = await seedStateThread()
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    fireEvent.click(screen.getByTestId("toolbar-mute"))
+    await waitFor(() =>
+      expect(threadStates.muteThread).toHaveBeenCalledTimes(1)
+    )
+    expect(threadStates.muteThread).toHaveBeenCalledWith(executor, threadId)
+    expect(toastMock.success).toHaveBeenCalledWith("Muted")
+    // Success flips the button to its inverse.
+    expect(screen.getByTitle("Unmute thread")).not.toBeNull()
+    await awaitIdle("toolbar-mute")
+
+    fireEvent.click(screen.getByTestId("toolbar-pin"))
+    await waitFor(() => expect(threadStates.pinThread).toHaveBeenCalledTimes(1))
+    expect(threadStates.pinThread).toHaveBeenCalledWith(executor, threadId)
+    await awaitIdle("toolbar-pin")
+
+    fireEvent.click(screen.getByTestId("toolbar-done"))
+    await waitFor(() =>
+      expect(threadStates.markThreadDone).toHaveBeenCalledTimes(1)
+    )
+    expect(threadStates.markThreadDone).toHaveBeenCalledWith(executor, threadId)
+  })
+
+  it("buttons reflect the stored state and their clicks clear it", async () => {
+    const threadId = await seedStateThread()
+    const now = Math.floor(Date.now() / 1000)
+    await executor.execute(
+      "UPDATE threads SET muted_at = $1, pinned_at = $2, done_at = $3 WHERE id = $4",
+      [now, now, now, threadId]
+    )
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    // Titles flip on the loaded thread's state columns.
+    expect(screen.getByTitle("Unmute thread")).not.toBeNull()
+    expect(screen.getByTitle("Unpin thread")).not.toBeNull()
+    expect(screen.getByTitle("Mark not done")).not.toBeNull()
+
+    fireEvent.click(screen.getByTestId("toolbar-mute"))
+    await waitFor(() =>
+      expect(threadStates.unmuteThread).toHaveBeenCalledWith(executor, threadId)
+    )
+    await awaitIdle("toolbar-mute")
+    fireEvent.click(screen.getByTestId("toolbar-pin"))
+    await waitFor(() =>
+      expect(threadStates.unpinThread).toHaveBeenCalledWith(executor, threadId)
+    )
+    await awaitIdle("toolbar-pin")
+    fireEvent.click(screen.getByTestId("toolbar-done"))
+    await waitFor(() =>
+      expect(threadStates.unmarkThreadDone).toHaveBeenCalledWith(
+        executor,
+        threadId
+      )
+    )
+  })
+})
+
+describe("thread notes editor (task 15.1)", () => {
+  async function seedNoteThread(): Promise<string> {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    const threadId = await createThread(executor, accountId, {
+      subject: "Noteworthy",
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: 1_700_000_000,
+      fromName: "Ada Lovelace",
+      fromAddress: "ada@example.com",
+      isRead: true,
+    })
+    return threadId
+  }
+
+  async function storedNote(threadId: string): Promise<string | null> {
+    const rows = await executor.select<{ note: string | null }>(
+      "SELECT note FROM threads WHERE id = $1",
+      [threadId]
+    )
+    return rows[0]?.note ?? null
+  }
+
+  it("toggle reveals the editor; blur persists the note in the store", async () => {
+    const threadId = await seedNoteThread()
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    // No note → the editor is closed; the toolbar opens it.
+    expect(screen.queryByTestId("thread-notes")).toBeNull()
+    fireEvent.click(screen.getByTestId("toolbar-note"))
+
+    const input = await screen.findByTestId("thread-note-input")
+    fireEvent.change(input, { target: { value: "  Approved by legal  " } })
+    fireEvent.blur(input)
+
+    // Persisted through the REAL setThreadNote (trimmed) into threads.note.
+    await waitFor(() =>
+      expect(storedNote(threadId)).resolves.toBe("Approved by legal")
+    )
+    // The subtle auto-save affordance shows after the write.
+    expect(screen.getByTestId("thread-note-saved")).not.toBeNull()
+  })
+
+  it("a stored note opens expanded and survives re-open; emptying removes it", async () => {
+    const threadId = await seedNoteThread()
+    await executor.execute("UPDATE threads SET note = $1 WHERE id = $2", [
+      "Call back Thursday",
+      threadId,
+    ])
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    // The note is visible WITHOUT toggling (spec: shown in the reading
+    // pane thereafter).
+    const input = await screen.findByTestId("thread-note-input")
+    expect((input as HTMLTextAreaElement).value).toBe("Call back Thursday")
+
+    // Emptying the note removes it (service normalizes to NULL).
+    fireEvent.change(input, { target: { value: "" } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(storedNote(threadId)).resolves.toBeNull())
+  })
+
+  it("closing the editor flushes a pending edit (debounce has not fired)", async () => {
+    const threadId = await seedNoteThread()
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    fireEvent.click(screen.getByTestId("toolbar-note"))
+    const input = await screen.findByTestId("thread-note-input")
+    fireEvent.change(input, { target: { value: "Typed and closed fast" } })
+    // No blur, no debounce wait — the toggle closes (unmounts) the editor,
+    // and the flush must land the keystrokes.
+    fireEvent.click(screen.getByTestId("toolbar-note"))
+
+    await waitFor(() =>
+      expect(storedNote(threadId)).resolves.toBe("Typed and closed fast")
+    )
+    expect(screen.queryByTestId("thread-notes")).toBeNull()
+  })
+})
+
+describe("toolbar Add to Todos (task 15.2)", () => {
+  async function seedTodoThread(): Promise<string> {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    const threadId = await createThread(executor, accountId, {
+      subject: "Needs a reply",
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: 1_700_000_000,
+      fromName: "Ada Lovelace",
+      fromAddress: "ada@example.com",
+      isRead: true,
+    })
+    return threadId
+  }
+
+  it("adds the thread through the shared todos flow and reflects membership", async () => {
+    const threadId = await seedTodoThread()
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    const button = screen.getByTestId("toolbar-add-todo")
+    expect(button.getAttribute("title")).toBe("Add to Todos")
+    fireEvent.click(button)
+
+    // The real flow wrote the todos row and toasted (the sidebar section
+    // reloads through the same notify seam its own test asserts).
+    await waitFor(() =>
+      expect(toastMock.success).toHaveBeenCalledWith("Added to Todos")
+    )
+    const rows = await executor.select<{ thread_id: string }>(
+      "SELECT thread_id FROM todos WHERE completed_at IS NULL"
+    )
+    expect(rows).toEqual([{ thread_id: threadId }])
+    // The button flips to its membership state.
+    await waitFor(() =>
+      expect(screen.getByTestId("toolbar-add-todo").getAttribute("title")).toBe(
+        "In Todos — click to move to the bottom"
+      )
+    )
+  })
+
+  it("a thread already on the list renders the membership state on open", async () => {
+    const threadId = await seedTodoThread()
+    await executor.execute(
+      "INSERT INTO todos (id, account_id, thread_id, position) VALUES ($1, $2, $3, 1)",
+      ["todo-seed", accountId, threadId]
+    )
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    await waitFor(() =>
+      expect(screen.getByTestId("toolbar-add-todo").getAttribute("title")).toBe(
+        "In Todos — click to move to the bottom"
+      )
+    )
   })
 })
 
@@ -898,5 +1255,82 @@ describe("task 7.6: inline reply affordance", () => {
     expect(quoteIndex).toBeGreaterThan(-1)
     // [signature] above [quoted history] per the placement rule.
     expect(signatureIndex).toBeLessThan(quoteIndex)
+  })
+})
+
+describe("reading-pane block sender (task 18.2)", () => {
+  /** A thread whose sender is blockable: the participants cache (the
+   * SAME source the context menu's block item reads) is populated like
+   * ingestion does. */
+  async function seedBlockableThread(): Promise<string> {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    const threadId = await createThread(executor, accountId, {
+      subject: "Suspicious offer",
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: 1_700_000_000,
+      fromName: "Spammy Co",
+      fromAddress: "spam@x.com",
+      isRead: true,
+    })
+    await recomputeThreadCaches(executor, threadId)
+    return threadId
+  }
+
+  it("opens the shared dialog and confirming writes the blocked_senders row", async () => {
+    const threadId = await seedBlockableThread()
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    fireEvent.click(screen.getByTestId("toolbar-block-sender"))
+
+    const dialog = await screen.findByTestId("block-sender-dialog")
+    expect(within(dialog).getByText("Block spam@x.com")).not.toBeNull()
+
+    // Defaults (Trash, no cleanup) — the confirm runs the shared block
+    // flow against the REAL blocklist service (the same wiring the
+    // thread list's onBlockSender performs).
+    fireEvent.click(screen.getByLabelText("Confirm block spam@x.com"))
+
+    await waitFor(async () => {
+      const rows = await listBlockedSenders(executor, accountId)
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({ sender: "spam@x.com", action: "trash" })
+    })
+    expect(toastMock.success).toHaveBeenCalledWith("Blocked spam@x.com")
+    // The dialog closed on confirm.
+    expect(screen.queryByTestId("block-sender-dialog")).toBeNull()
+  })
+
+  it("hides the block affordance without a usable cached sender", async () => {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    const threadId = await createThread(executor, accountId)
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: 1_700_000_000,
+      fromName: "Ada Lovelace",
+      fromAddress: "ada@example.com",
+      isRead: true,
+    })
+    // No recomputeThreadCaches — the participants cache stays empty, the
+    // same condition under which the context menu omits the item.
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    expect(screen.queryByTestId("toolbar-block-sender")).toBeNull()
+    expect(screen.queryByTestId("block-sender-dialog")).toBeNull()
   })
 })

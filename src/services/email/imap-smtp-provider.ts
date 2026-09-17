@@ -26,6 +26,7 @@ import {
   imapStoreFlags,
   imapTestConnection,
   smtpSendEmail,
+  smtpSendRawEmail,
   smtpTestConnection,
 } from "./invoke"
 import { toEmailFolders } from "./folder-mapper"
@@ -106,6 +107,8 @@ export function toNormalizedMessage(
     messageId?: string | null
     inReplyTo?: string | null
     references?: string | null
+    listUnsubscribe?: string | null
+    listUnsubscribePost?: string | null
     subject?: string | null
     from: { name?: string | null; email?: string | null }[]
     to: { name?: string | null; email?: string | null }[]
@@ -142,6 +145,10 @@ export function toNormalizedMessage(
     messageId: message.messageId ?? undefined,
     inReplyTo: message.inReplyTo ?? undefined,
     references: message.references ?? undefined,
+    // Task 18.3 (D13): the Rust ImapMessage carries the list-unsubscribe
+    // header pair verbatim; buildStoredHeaders (imap-sync) persists it.
+    listUnsubscribe: message.listUnsubscribe ?? undefined,
+    listUnsubscribePost: message.listUnsubscribePost ?? undefined,
     subject: message.subject ?? undefined,
     from: message.from.map(normalizeAddress),
     to: message.to.map(normalizeAddress),
@@ -157,8 +164,13 @@ export function toNormalizedMessage(
 }
 
 function toOutgoingEmail(input: SendEmailInput): OutgoingEmail {
+  // Task 16.2, design D10: the alias (when set) rides as the From HEADER
+  // — the Rust side builds the lettre message from this exact identity —
+  // while `from` (the account identity) is sent as `envelopeFrom` by
+  // sendMessage so MAIL FROM stays the authenticated account.
+  const headerFrom = input.fromAlias ?? input.from
   return {
-    from: { name: input.from.name ?? null, email: input.from.email },
+    from: { name: headerFrom.name ?? null, email: headerFrom.email },
     to: input.to.map((address) => ({
       name: address.name ?? null,
       email: address.email ?? "",
@@ -190,6 +202,16 @@ function toOutgoingEmail(input: SendEmailInput): OutgoingEmail {
         }
       : {}),
   }
+}
+
+/**
+ * The raw send's RCPT TO list: every To/Cc/Bcc address, trimmed (mirrors
+ * collect_recipients Rust-side, which likewise does not dedup).
+ */
+function envelopeRecipients(input: SendEmailInput): string[] {
+  return [...input.to, ...(input.cc ?? []), ...(input.bcc ?? [])]
+    .map((address) => (address.email ?? "").trim())
+    .filter((email) => email !== "")
 }
 
 /**
@@ -393,8 +415,37 @@ export function createImapSmtpProvider(
     },
 
     async sendMessage(input: SendEmailInput) {
+      // Task 18.5 (design D11): a PGP send arrives FULLY BUILT (the
+      // signed/encrypted PGP/MIME was frozen into the queued input at
+      // enqueue time — the passphrase exists only there) and is
+      // transmitted verbatim through the raw command; letting Rust build
+      // the MIME from the structured fields would unwrap the protection.
+      // The fields stay for bookkeeping only. The envelope mirrors the
+      // alias send below (D10): MAIL FROM is the authenticated account
+      // address and RCPT TO the structured recipients the send flow
+      // validated — never parsed back out of the raw headers.
+      if (input.pgpMime) {
+        // Hoisted: the property narrowing does not survive into the
+        // call() closure below.
+        const pgpMime = input.pgpMime
+        await call(() =>
+          smtpSendRawEmail(
+            requireSmtpParams(),
+            pgpMime,
+            envelopeRecipients(input),
+            input.from.email
+          )
+        )
+        return { messageId: input.messageId ?? "" }
+      }
+      // D10 (task 16.2): with an alias, the MIME From header carries the
+      // alias (toOutgoingEmail above) while MAIL FROM is pinned to the
+      // authenticated account address — the Rust command then transmits
+      // via the raw-envelope path instead of deriving the envelope from
+      // the (aliased) From header.
+      const envelopeFrom = input.fromAlias ? input.from.email : undefined
       const result = await call(() =>
-        smtpSendEmail(requireSmtpParams(), toOutgoingEmail(input))
+        smtpSendEmail(requireSmtpParams(), toOutgoingEmail(input), envelopeFrom)
       )
       return { messageId: result.messageId }
     },

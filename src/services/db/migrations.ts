@@ -390,4 +390,272 @@ export const MIGRATIONS: Migration[] = [
     description: "Add threads.participants JSON cache column",
     statements: ["ALTER TABLE threads ADD COLUMN participants TEXT"],
   },
+  {
+    // v3 (task 1.1): competitor-parity foundations from the design Migration
+    // Plan — thread state as columns (D1) plus the delivery-schedule pair
+    // (D6), and the ten feature tables later tasks build on.
+    version: 3,
+    description:
+      "Parity schema: thread state columns and 10 feature tables " +
+      "(snippets, saved searches, scheduled sends, follow-ups, blocked " +
+      "senders, aliases, sender stats, notification rules, rules, todos)",
+    statements: [
+      // Thread states live directly on threads (D1) so every existing list
+      // query and the pinned-first ordering stay join-free; NULL means the
+      // state is inactive. held_until/delivered_at back the delivery
+      // windows (D6): inbox queries exclude held threads and order by the
+      // release time. One ADD COLUMN per statement — SQLite cannot batch
+      // them.
+      "ALTER TABLE threads ADD COLUMN snoozed_until INTEGER",
+      "ALTER TABLE threads ADD COLUMN muted_at INTEGER",
+      "ALTER TABLE threads ADD COLUMN pinned_at INTEGER",
+      "ALTER TABLE threads ADD COLUMN done_at INTEGER",
+      "ALTER TABLE threads ADD COLUMN note TEXT",
+      "ALTER TABLE threads ADD COLUMN held_until INTEGER",
+      "ALTER TABLE threads ADD COLUMN delivered_at INTEGER",
+      // Composer text templates (task 6); deliberately global rather than
+      // account-scoped so a snippet is available from every account.
+      `
+        CREATE TABLE IF NOT EXISTS snippets (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          body TEXT NOT NULL,
+          -- Optional abbreviation that expands the snippet when typed
+          shortcut TEXT,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+      `,
+      // Stored query strings re-run through the search parser and
+      // query-builder (D4, task 7); position keeps the sidebar ordering
+      // stable across renames.
+      `
+        CREATE TABLE IF NOT EXISTS saved_searches (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          query TEXT NOT NULL,
+          position INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+      `,
+      // Send-later jobs (D3, task 10): the fully built MIME payload means
+      // firing needs no composer state, even after a restart. status moves
+      // scheduled → sending → sent | failed; cancelled hides a row before
+      // transmission.
+      `
+        CREATE TABLE IF NOT EXISTS scheduled_sends (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          mime_payload TEXT NOT NULL,
+          -- JSON-encoded resolved recipients for the Scheduled view
+          recipients_json TEXT NOT NULL,
+          subject TEXT,
+          due_at INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN (
+            'scheduled', 'sending', 'sent', 'failed', 'cancelled'
+          )),
+          last_error TEXT,
+          sent_at INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+      `,
+      // Follow-up reminders attached at send time (D8, task 14.2): the
+      // ingestion hook cancels one when a threaded reply arrives
+      // (cancelled_at set, row kept) and the due pass resurfaces due ones.
+      `
+        CREATE TABLE IF NOT EXISTS followup_reminders (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+          due_at INTEGER NOT NULL,
+          cancelled_at INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+      `,
+      `
+        CREATE INDEX IF NOT EXISTS idx_followup_reminders_account_due
+          ON followup_reminders(account_id, due_at)
+      `,
+      // Sender blocklist (task 18.2): the ingestion hook auto-files new
+      // mail from these senders per `action`.
+      `
+        CREATE TABLE IF NOT EXISTS blocked_senders (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          sender TEXT NOT NULL,
+          action TEXT NOT NULL DEFAULT 'trash' CHECK (action IN (
+            'trash', 'archive'
+          )),
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          UNIQUE (account_id, sender)
+        )
+      `,
+      // Send-as identities (D10, task 16): gmail rows come from the SendAs
+      // API, imap rows are manual. The From header carries the alias while
+      // the SMTP envelope stays on the account's primary address.
+      `
+        CREATE TABLE IF NOT EXISTS aliases (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          email TEXT NOT NULL,
+          display_name TEXT,
+          is_default INTEGER NOT NULL DEFAULT 0,
+          source TEXT NOT NULL CHECK (source IN ('gmail', 'imap')),
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          UNIQUE (account_id, email)
+        )
+      `,
+      // Per-sender statistics filled at ingestion (D5, task 13): the
+      // priority inbox heuristic scores reply counts, direct-to-me hits,
+      // recency and mailing-list participation (D7).
+      `
+        CREATE TABLE IF NOT EXISTS sender_stats (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          sender TEXT NOT NULL,
+          reply_count INTEGER NOT NULL DEFAULT 0,
+          direct_to_me_count INTEGER NOT NULL DEFAULT 0,
+          last_message_at INTEGER,
+          is_mailing_list INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          UNIQUE (account_id, sender)
+        )
+      `,
+      // Per-sender/per-label notification overrides (D16, task 8), checked
+      // per new message before the OS notification and the badge increment.
+      `
+        CREATE TABLE IF NOT EXISTS notification_rules (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          match_type TEXT NOT NULL CHECK (match_type IN ('sender', 'label')),
+          match_value TEXT NOT NULL,
+          action TEXT NOT NULL CHECK (action IN ('always', 'never')),
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          UNIQUE (account_id, match_type, match_value)
+        )
+      `,
+      // Local mail rules (D5, task 11): criteria reuse the search parser's
+      // AST serialized as JSON; actions compile to existing queue op kinds.
+      // position is the deterministic evaluation order; only enabled rows
+      // run at ingestion.
+      `
+        CREATE TABLE IF NOT EXISTS rules (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          criteria_json TEXT NOT NULL,
+          actions_json TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          position INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+      `,
+      // Cross-account todo list of threads (task 15.2): position is the
+      // manual ordering, completed_at marks completion.
+      `
+        CREATE TABLE IF NOT EXISTS todos (
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+          position INTEGER NOT NULL DEFAULT 0,
+          completed_at INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          UNIQUE (thread_id)
+        )
+      `,
+      // The (account_id, sender) index the design risk note calls for goes
+      // on messages(from_address) — the hot path for the bundle and sort
+      // queries that group by sender (D4); sender_stats already carries a
+      // UNIQUE(account_id, sender) of its own.
+      `
+        CREATE INDEX IF NOT EXISTS idx_messages_account_from
+          ON messages(account_id, from_address)
+      `,
+      `
+        CREATE INDEX IF NOT EXISTS idx_threads_account_held
+          ON threads(account_id, held_until)
+      `,
+      // Partial: only non-NULL wake-ups are scanned (Snoozed view, due pass)
+      `
+        CREATE INDEX IF NOT EXISTS idx_threads_snoozed_until
+          ON threads(snoozed_until) WHERE snoozed_until IS NOT NULL
+      `,
+    ],
+  },
+  {
+    // v4 (task 13.2, design D7): per-sender priority-inbox overrides. The
+    // user's Important/Other call must dominate the D7 heuristic score, so
+    // it lives beside the stats it overrides (one row per sender either
+    // way). NULL = no override — the sender classifies purely on its score.
+    // Additive and backfill-free: existing rows start unoverridden.
+    version: 4,
+    description: "Add sender_stats.user_class priority override column",
+    statements: [
+      "ALTER TABLE sender_stats ADD COLUMN user_class TEXT CHECK (user_class IN ('important', 'other'))",
+    ],
+  },
+  {
+    // v5 (task 17.x, design D9): the server-side mirror of a local draft.
+    // JSON-encoded ServerDraftRef — {provider:"gmail", draftId} after a
+    // Drafts API create, or {provider:"imap", folder, uid} after an
+    // imap_append whose copy was located by the draft's stable Message-ID.
+    // NULL = not mirrored yet (the queue's draft_upsert creates it).
+    // Additive and backfill-free: existing drafts simply mirror on their
+    // next autosave.
+    version: 5,
+    description: "Add local_drafts.server_draft_ref server-mirror column",
+    statements: ["ALTER TABLE local_drafts ADD COLUMN server_draft_ref TEXT"],
+  },
+  {
+    // v6 (task 1.3, design D18/D19): the security additions. junk_tokens is
+    // the naive-Bayes tokenizer's training store (D19): one row per
+    // (account, token) with spam/ham counts — probabilities are computed
+    // from the counts at classification time, so training only ever updates
+    // counters. Gmail accounts never train it, but the schema is shared.
+    // attachment_scan_cache (D18) caches hash-lookup verdicts per SHA-256 —
+    // the hash is the identity, so rows are global, not account-scoped.
+    // Engine counts back the "N of M engines" report and stay nullable so
+    // an 'unknown' verdict (failed lookup) can be cached too and re-checked
+    // via looked_up_at instead of re-querying on every open.
+    version: 6,
+    description:
+      "Security schema: junk_tokens token counts and " +
+      "attachment_scan_cache malware verdicts",
+    statements: [
+      // Per-account token counts (D19, task 18.10). The composite PK is the
+      // natural identity — it serves both training upserts and the
+      // account-scoped token lookups classification needs, so no extra
+      // index; account deletion cascades the whole store.
+      `
+        CREATE TABLE IF NOT EXISTS junk_tokens (
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          token TEXT NOT NULL,
+          spam_count INTEGER NOT NULL DEFAULT 0,
+          ham_count INTEGER NOT NULL DEFAULT 0,
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          PRIMARY KEY (account_id, token)
+        )
+      `,
+      // Global verdict cache keyed by SHA-256 (D18, task 18.9): one lookup
+      // per file content, shared across accounts.
+      `
+        CREATE TABLE IF NOT EXISTS attachment_scan_cache (
+          sha256 TEXT PRIMARY KEY,
+          verdict TEXT NOT NULL CHECK (verdict IN (
+            'malicious', 'suspicious', 'clean', 'unknown'
+          )),
+          malicious_count INTEGER,
+          total_engines INTEGER,
+          looked_up_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+      `,
+    ],
+  },
+  {
+    // v7 (task 20.2, contacts spec): free-form notes on a contact, edited
+    // from the Contacts browser. Additive and backfill-free: existing rows
+    // simply have no notes yet (NULL = none).
+    version: 7,
+    description: "Add contacts.notes free-form notes column",
+    statements: ["ALTER TABLE contacts ADD COLUMN notes TEXT"],
+  },
 ]

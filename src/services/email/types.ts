@@ -144,6 +144,13 @@ export interface NormalizedMessage {
   attachments: NormalizedAttachment[]
   /** imap: full folder path the message was fetched from. */
   folder?: string
+  // List-unsubscribe headers (task 18.3, design D13): the RFC 2369 /
+  // 8058 pair, captured verbatim from the provider surface (gmail
+  // payload.headers; imap via the Rust ImapMessage raw header fields).
+  /** `List-Unsubscribe` value (comma-separated angle-bracket targets). */
+  listUnsubscribe?: string
+  /** `List-Unsubscribe-Post` value (one-click = "List-Unsubscribe=One-Click"). */
+  listUnsubscribePost?: string
   // Gmail-shaped slots (4.2): the imap provider leaves these unset.
   /** Gmail unique message id. */
   gmailId?: string
@@ -169,7 +176,20 @@ export interface OutgoingAttachment {
 }
 
 export interface SendEmailInput {
+  /**
+   * The ENVELOPE sender: the authenticated account's primary address.
+   * Stays the account identity even when an alias sends (design D10) —
+   * SMTP MAIL FROM / the Gmail API user are always the account itself.
+   */
   from: { name?: string; email: string }
+  /**
+   * Header-only sender override (design D10, task 16.2): when set, the
+   * MIME From header carries this alias while `from` keeps the envelope.
+   * The Gmail raw message shows the alias (send-as); providers that
+   * derive the wire envelope from this DTO (SMTP) ignore the alias and
+   * use `from`, so the envelope can never diverge from the credentials.
+   */
+  fromAlias?: { name?: string; email: string }
   to: EmailAddress[]
   cc?: EmailAddress[]
   bcc?: EmailAddress[]
@@ -185,12 +205,37 @@ export interface SendEmailInput {
   /** Files to attach; both providers transmit them as multipart/mixed
    * parts around the alternative body. */
   attachments?: OutgoingAttachment[]
+  /**
+   * PGP/MIME prebuilt message (task 18.5, design D11): the COMPLETE RFC
+   * 822 message sendComposerDraft built and signed/encrypted at enqueue
+   * time — the passphrase exists only there, so the queue must carry the
+   * FINISHED PGP/MIME for verbatim replay. When present, providers
+   * transmit exactly this instead of building from the fields above;
+   * those fields stay populated for the local bookkeeping surfaces
+   * (failed-send subject/recipient counts, provisional Sent filing).
+   * Every shipped provider carries it: gmail via messages.send raw,
+   * imap via the raw SMTP command (smtp_send_raw_email).
+   */
+  pgpMime?: string
 }
 
 export interface SendEmailResult {
   /** The Message-ID that was transmitted. */
   messageId: string
 }
+
+/**
+ * Where a local draft's SERVER mirror lives (design D9, task 17.x).
+ * Stored JSON-encoded in `local_drafts.server_draft_ref` (migration v5);
+ * the queue's draft ops address the mirror through it.
+ *
+ * - gmail: the Drafts API draft id (drafts.update/delete address it).
+ * - imap: the folder path plus the appended copy's UID (found by the
+ *   draft's stable Message-ID after imap_append, which returns nothing).
+ */
+export type ServerDraftRef =
+  | { provider: "gmail"; draftId: string }
+  | { provider: "imap"; folder: string; uid: number }
 
 /** Message selector: either an explicit uid set or "n most recent". */
 export interface FetchQuery {

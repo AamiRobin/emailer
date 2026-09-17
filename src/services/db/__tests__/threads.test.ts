@@ -13,6 +13,7 @@ import {
   getLabelsForThreads,
   getThread,
   getThreadWithMessages,
+  listThreadsAcrossAccounts,
   listThreadsByFolder,
   recomputeThreadCaches,
   setThreadFolder,
@@ -21,6 +22,14 @@ import {
   upsertThreadByGmailId,
 } from "../threads"
 import { markMessagesRead } from "../messages"
+import { snoozeThread, wakeDueThreads } from "../../email-actions/snooze"
+import {
+  markThreadDone,
+  muteThread,
+  pinThread,
+  unmarkThreadDone,
+  unmuteThread,
+} from "../../email-actions/thread-states"
 
 describe("thread cache recompute", () => {
   let executor: TestExecutor
@@ -597,5 +606,623 @@ describe("listThreadsByFolder with imap-style fixtures", () => {
       folder: { kind: "labelId", labelId: archiveFolder },
     })
     expect(archive.map((row) => row.id)).toEqual([inWork, inArchive])
+  })
+})
+
+describe("snoozed threads: inbox exclusion and wake ordering (tasks 2.2/2.5)", () => {
+  let executor: TestExecutor
+  let accountId: string
+  let inbox: string
+  let older: string
+  let newer: string
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+    inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+
+    async function seed(date: number): Promise<string> {
+      const threadId = await createThread(executor, accountId)
+      await createMessage(executor, {
+        threadId,
+        accountId,
+        date,
+        snippet: "s",
+        isRead: true,
+      })
+      await setThreadLabels(executor, threadId, [inbox])
+      await recomputeThreadCaches(executor, threadId)
+      return threadId
+    }
+
+    older = await seed(at(100))
+    newer = await seed(at(500))
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("the inbox list hides a snoozed thread; other folders keep showing it", async () => {
+    await snoozeThread(executor, older, at(2000))
+
+    const inboxRows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    expect(inboxRows.map((thread) => thread.id)).toEqual([newer])
+
+    // Non-inbox folders are NOT affected by snooze (spec: snoozed mail
+    // stays visible in All Mail / its labels, and search is untouched).
+    const allRows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "all" },
+    })
+    expect(allRows.map((thread) => thread.id)).toEqual([newer, older])
+  })
+
+  it("after wakeDueThreads the thread is back, ordered FIRST via delivered_at", async () => {
+    await snoozeThread(executor, older, at(2000))
+
+    // Wake-up time passes (launch sweep or scheduled due pass).
+    expect(await wakeDueThreads(executor, at(3000))).toBe(1)
+
+    const rows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "specialUse", specialUse: "inbox" },
+    })
+    // The woken thread tops the inbox even though its last_message_at is
+    // the older one — delivered_at wins the COALESCE ordering.
+    expect(rows.map((thread) => thread.id)).toEqual([older, newer])
+    expect((await getThread(executor, older))?.delivered_at).toBe(at(3000))
+    expect((await getThread(executor, older))?.snoozed_until).toBeNull()
+  })
+})
+
+describe("muted and Done threads: inbox exclusion (tasks 3.1/3.2)", () => {
+  let executor: TestExecutor
+  let accountId: string
+  let inbox: string
+  let older: string
+  let newer: string
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+    inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+
+    async function seed(date: number): Promise<string> {
+      const threadId = await createThread(executor, accountId)
+      await createMessage(executor, {
+        threadId,
+        accountId,
+        date,
+        snippet: "s",
+        isRead: true,
+      })
+      await setThreadLabels(executor, threadId, [inbox])
+      await recomputeThreadCaches(executor, threadId)
+      return threadId
+    }
+
+    older = await seed(at(100))
+    newer = await seed(at(500))
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("the inbox list hides a muted thread; All Mail keeps showing it; unmute restores it", async () => {
+    await muteThread(executor, older)
+
+    const inboxRows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    expect(inboxRows.map((thread) => thread.id)).toEqual([newer])
+
+    // Mute is inbox-only: All Mail (and labels/search) keep the thread.
+    const allRows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "all" },
+    })
+    expect(allRows.map((thread) => thread.id)).toEqual([newer, older])
+
+    await unmuteThread(executor, older)
+    const restored = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    expect(restored.map((thread) => thread.id)).toEqual([newer, older])
+  })
+
+  it("the inbox list hides a Done thread (without flipping is_archived); undo restores it", async () => {
+    await markThreadDone(executor, older)
+
+    const inboxRows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "specialUse", specialUse: "inbox" },
+    })
+    expect(inboxRows.map((thread) => thread.id)).toEqual([newer])
+    // Done is a distinct local state, not an archive write.
+    expect((await getThread(executor, older))?.is_archived).toBe(0)
+
+    const allRows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "all" },
+    })
+    expect(allRows.map((thread) => thread.id)).toEqual([newer, older])
+
+    await unmarkThreadDone(executor, older)
+    const restored = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "specialUse", specialUse: "inbox" },
+    })
+    expect(restored.map((thread) => thread.id)).toEqual([newer, older])
+  })
+})
+
+describe("listThreadsByFolder sort options (task 4.1)", () => {
+  let executor: TestExecutor
+  let accountId: string
+  let inbox: string
+  // ids for the order assertions; seeded so every option separates them.
+  let zedOld: string // A — date 100, "Zed", "Mango", unread
+  let alice: string //  B — date 200, "alice", "apple", unread
+  let pinnedBob: string // C — date 300, no name (bob@…), "Cherry", PINNED
+  let zedNew: string // D — date 400, "Zed", "banana", read
+  let martha: string // E — date 500, "martha", "Apple", unread
+  let anonymous: string // F — date 50, no sender, no subject, read
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+    inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+
+    async function seed(
+      date: number,
+      options?: {
+        fromName?: string
+        fromAddress?: string
+        subject?: string
+        unread?: boolean
+      }
+    ): Promise<string> {
+      const threadId = await createThread(executor, accountId, {
+        subject: options?.subject,
+      })
+      await createMessage(executor, {
+        threadId,
+        accountId,
+        date,
+        subject: options?.subject,
+        snippet: "s",
+        fromName: options?.fromName,
+        fromAddress: options?.fromAddress,
+        isRead: !options?.unread,
+      })
+      await setThreadLabels(executor, threadId, [inbox])
+      await recomputeThreadCaches(executor, threadId)
+      return threadId
+    }
+
+    zedOld = await seed(at(100), {
+      fromName: "Zed",
+      fromAddress: "zed@x.com",
+      subject: "Mango",
+      unread: true,
+    })
+    alice = await seed(at(200), {
+      fromName: "alice",
+      fromAddress: "alice@x.com",
+      subject: "apple",
+      unread: true,
+    })
+    pinnedBob = await seed(at(300), {
+      fromAddress: "bob@x.com",
+      subject: "Cherry",
+    })
+    zedNew = await seed(at(400), {
+      fromName: "Zed",
+      fromAddress: "zed@x.com",
+      subject: "banana",
+    })
+    martha = await seed(at(500), {
+      fromName: "martha",
+      fromAddress: "martha@x.com",
+      subject: "Apple",
+      unread: true,
+    })
+    anonymous = await seed(at(50))
+    await pinThread(executor, pinnedBob)
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("date_desc keeps the historical newest-first order", async () => {
+    const rows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+      sort: "date_desc",
+    })
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedBob,
+      martha,
+      zedNew,
+      alice,
+      zedOld,
+      anonymous,
+    ])
+  })
+
+  it("date_asc flips the inbox date term (the delivered_at COALESCE)", async () => {
+    const rows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+      sort: "date_asc",
+    })
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedBob,
+      anonymous,
+      zedOld,
+      alice,
+      zedNew,
+      martha,
+    ])
+  })
+
+  it("sender sorts A→Z by the newest sender name (email fallback, NULLs last)", async () => {
+    const rows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+      sort: "sender",
+    })
+    // alice < bob@x.com (C's name-less email fallback) < martha < zed
+    // (tie between the two Zed threads broken by date DESC), the
+    // sender-less thread last. Pinned C still leads.
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedBob,
+      alice,
+      martha,
+      zedNew,
+      zedOld,
+      anonymous,
+    ])
+  })
+
+  it("a corrupt participants cache sorts last instead of failing the query", async () => {
+    // json_extract raises "malformed JSON" on this row — the guarded
+    // sender term must degrade it to NULL (the sender-less group), not
+    // fail the whole inbox query.
+    await executor.execute(
+      "UPDATE threads SET participants = 'not json' WHERE id = $1",
+      [martha]
+    )
+
+    const rows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+      sort: "sender",
+    })
+    // martha joins the NULL-sender group ordered by the date fallback
+    // (date 500 > anonymous's 50), still a total deterministic order.
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedBob,
+      alice,
+      zedNew,
+      zedOld,
+      martha,
+      anonymous,
+    ])
+  })
+
+  it("subject sorts A→Z case-insensitively with a date-desc stability fallback", async () => {
+    const rows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+      sort: "subject",
+    })
+    // "apple" (E and B tie → date DESC: E first), "banana", "mango", the
+    // subject-less thread last. Pinned C still leads.
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedBob,
+      martha,
+      alice,
+      zedNew,
+      zedOld,
+      anonymous,
+    ])
+  })
+
+  it("unread_first groups unread above read, date-desc within each group", async () => {
+    const rows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+      sort: "unread_first",
+    })
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedBob,
+      martha,
+      alice,
+      zedOld,
+      zedNew,
+      anonymous,
+    ])
+  })
+
+  it("the pinned thread leads EVERY option, also through specialUse selection", async () => {
+    for (const sort of [
+      "date_desc",
+      "date_asc",
+      "sender",
+      "subject",
+      "unread_first",
+    ] as const) {
+      const rows = await listThreadsByFolder(executor, {
+        accountId,
+        folder: { kind: "specialUse", specialUse: "inbox" },
+        sort,
+      })
+      expect(rows[0]?.id).toBe(pinnedBob)
+      expect(rows[0]?.pinned_at).not.toBeNull()
+    }
+  })
+
+  it("a woken thread's delivered_at joins the COALESCE under date_asc too", async () => {
+    await snoozeThread(executor, anonymous, at(2000))
+    expect(await wakeDueThreads(executor, at(3000))).toBe(1)
+
+    const rows = await listThreadsByFolder(executor, {
+      accountId,
+      folder: { kind: "preset", preset: "inbox" },
+      sort: "date_asc",
+    })
+    // delivered_at = at(3000) replaces last_message_at = at(50) in the
+    // COALESCE, so the woken thread moves from oldest to newest under ASC.
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedBob,
+      zedOld,
+      alice,
+      zedNew,
+      martha,
+      anonymous,
+    ])
+  })
+})
+
+describe("listThreadsAcrossAccounts (task 9.1)", () => {
+  let executor: TestExecutor
+  let accountA: string
+  let accountB: string
+  let inboxA: string
+  let inboxB: string
+  let trashA: string
+  let spamA: string
+  // Expected unified-inbox order: pinned first, then newest across accounts.
+  let pinnedA: string
+  let newestB: string
+  let midB: string
+  let plainA: string
+  let snoozedA: string
+  let mutedA: string
+  let doneA: string
+  let trashedA: string
+  let spammedA: string
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountA = await createAccount(executor, "gmail")
+    accountB = await createAccount(executor, "imap")
+    inboxA = await createGmailLabel(
+      executor,
+      accountA,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+    inboxB = await createImapFolderLabel(executor, accountB, "INBOX", "inbox")
+    trashA = await createGmailLabel(
+      executor,
+      accountA,
+      "TRASH",
+      "TRASH",
+      "trash"
+    )
+    spamA = await createGmailLabel(executor, accountA, "SPAM", "SPAM", "spam")
+
+    async function seed(
+      accountId: string,
+      inboxLabelId: string,
+      date: number,
+      labels: string[] = []
+    ): Promise<string> {
+      const threadId = await createThread(executor, accountId)
+      await createMessage(executor, {
+        threadId,
+        accountId,
+        date,
+        snippet: "s",
+        isRead: true,
+      })
+      await setThreadLabels(executor, threadId, [inboxLabelId, ...labels])
+      await recomputeThreadCaches(executor, threadId)
+      return threadId
+    }
+
+    pinnedA = await seed(accountA, inboxA, at(100))
+    await pinThread(executor, pinnedA)
+    newestB = await seed(accountB, inboxB, at(300))
+    midB = await seed(accountB, inboxB, at(200))
+    plainA = await seed(accountA, inboxA, at(100))
+    snoozedA = await seed(accountA, inboxA, at(400))
+    await snoozeThread(executor, snoozedA, at(9999))
+    mutedA = await seed(accountA, inboxA, at(350))
+    await muteThread(executor, mutedA)
+    doneA = await seed(accountA, inboxA, at(250))
+    await markThreadDone(executor, doneA)
+    trashedA = await seed(accountA, inboxA, at(150), [trashA])
+    spammedA = await seed(accountA, inboxA, at(120), [spamA])
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("returns the preset inbox across accounts: exclusions applied, pinned first", async () => {
+    const rows = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA, accountB],
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    // Snoozed/muted/done leave the list (inbox-only exclusions), and the
+    // trashed/spam seeds carry the inbox label too, so their exclusion
+    // exercises the preset's is_trashed/is_spam predicates.
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedA,
+      newestB,
+      midB,
+      plainA,
+    ])
+    // Every row carries its account identity (design D4) and belongs to
+    // the requested set.
+    expect(rows.map((thread) => thread.account_id)).toEqual([
+      accountA,
+      accountB,
+      accountB,
+      accountA,
+    ])
+  })
+
+  it("resolves the inbox role through both account models (gmail + imap)", async () => {
+    const rows = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA, accountB],
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    expect(new Set(rows.map((thread) => thread.account_id))).toEqual(
+      new Set([accountA, accountB])
+    )
+  })
+
+  it("restricts to the given account subset", async () => {
+    const rows = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountB],
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    expect(rows.map((thread) => thread.id)).toEqual([newestB, midB])
+    expect(rows.every((thread) => thread.account_id === accountB)).toBe(true)
+  })
+
+  it("treats an empty/omitted account set as every account", async () => {
+    const empty = await listThreadsAcrossAccounts(executor, {
+      accountIds: [],
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    const omitted = await listThreadsAcrossAccounts(executor, {
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    const expected = [pinnedA, newestB, midB, plainA]
+    expect(empty.map((thread) => thread.id)).toEqual(expected)
+    expect(omitted.map((thread) => thread.id)).toEqual(expected)
+  })
+
+  it("composes the preset's trash/spam exclusions into the specialUse inbox", async () => {
+    // The specialUse inbox is the same inbox view as the preset: gmail
+    // local trash (addSpecialLabel) keeps the INBOX membership, so the
+    // selector itself must exclude the trashed/spammed seeds — identical
+    // to the preset path (and the inbox badge).
+    const rows = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA, accountB],
+      folder: { kind: "specialUse", specialUse: "inbox" },
+    })
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedA,
+      newestB,
+      midB,
+      plainA,
+    ])
+  })
+
+  it("a locally trashed inbox thread leaves both inbox lists and stays in Trash", async () => {
+    // trashedA carries the inbox-role label AND the trash label, so
+    // setThreadLabels flagged it locally trashed while keeping its INBOX
+    // membership — exactly the row the raw specialUse selector leaked.
+    // spammedA is the same shape with the spam role.
+    const viaSpecialUse = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA, accountB],
+      folder: { kind: "specialUse", specialUse: "inbox" },
+    })
+    const viaPreset = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA, accountB],
+      folder: { kind: "preset", preset: "inbox" },
+    })
+    expect(viaSpecialUse.map((thread) => thread.id)).not.toContain(trashedA)
+    expect(viaPreset.map((thread) => thread.id)).not.toContain(trashedA)
+    expect(viaSpecialUse.map((thread) => thread.id)).not.toContain(spammedA)
+    expect(viaPreset.map((thread) => thread.id)).not.toContain(spammedA)
+
+    // Each stays listed in its own folder.
+    const trash = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA],
+      folder: { kind: "preset", preset: "trash" },
+    })
+    expect(trash.map((thread) => thread.id)).toEqual([trashedA])
+    const spam = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA],
+      folder: { kind: "preset", preset: "spam" },
+    })
+    expect(spam.map((thread) => thread.id)).toEqual([spammedA])
+  })
+
+  it("returns [] when no account in scope has the special-use role", async () => {
+    const rows = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA, accountB],
+      folder: { kind: "specialUse", specialUse: "flagged" },
+    })
+    expect(rows).toEqual([])
+  })
+
+  it("honors limit after the cross-account ordering", async () => {
+    const rows = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA, accountB],
+      folder: { kind: "preset", preset: "inbox" },
+      limit: 2,
+    })
+    expect(rows.map((thread) => thread.id)).toEqual([pinnedA, newestB])
+  })
+
+  it("orders by the sort clause with the inbox date term", async () => {
+    const rows = await listThreadsAcrossAccounts(executor, {
+      accountIds: [accountA, accountB],
+      folder: { kind: "preset", preset: "inbox" },
+      sort: "date_asc",
+    })
+    // date ASC flips the COALESCE(delivered_at, last_message_at) term; the
+    // pinned thread still leads.
+    expect(rows.map((thread) => thread.id)).toEqual([
+      pinnedA,
+      plainA,
+      midB,
+      newestB,
+    ])
   })
 })

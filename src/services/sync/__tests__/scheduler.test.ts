@@ -22,14 +22,17 @@ import { useSyncStore } from "../../../stores/sync-store"
 import { useAccountStore } from "../../../stores/account-store"
 import { notifyNewMail } from "../../notifications/new-mail-notifier"
 import { updateUnreadBadge } from "../../notifications/unread-badge"
-import type { SyncAllResult } from "../scheduler"
+import type { DueJobHandler, SyncAllResult } from "../scheduler"
 import {
   AccountSyncAuthError,
+  registerDueJobHandler,
+  runDueJobsOnce,
   setSyncAccountImplForTests,
   startScheduler,
   stopScheduler,
   syncAccount,
   triggerRefresh,
+  unregisterDueJobHandler,
 } from "../scheduler"
 
 // The scheduler resolves its executor through getExecutor(); point that at
@@ -108,6 +111,16 @@ function storeState() {
   return useSyncStore.getState()
 }
 
+// Due-job handlers registered by a test; afterEach unregisters them so a
+// failing test cannot leak handlers into later tests (the registry is
+// module-global).
+const testDueJobHandlers: string[] = []
+
+function registerTestDueJobHandler(name: string, handler: DueJobHandler): void {
+  registerDueJobHandler(name, handler)
+  testDueJobHandlers.push(name)
+}
+
 // ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
@@ -124,6 +137,9 @@ describe("sync scheduler", () => {
   afterEach(() => {
     stopScheduler()
     setSyncAccountImplForTests(null)
+    for (const name of testDueJobHandlers.splice(0)) {
+      unregisterDueJobHandler(name)
+    }
     vi.useRealTimers()
     useSyncStore.setState({ perAccount: {}, online: true })
     useAccountStore.setState({
@@ -166,15 +182,38 @@ describe("sync scheduler", () => {
     expect(recorder.calls).toEqual([target])
   })
 
-  it("skips accounts that are auth-error or disabled", async () => {
+  it("skips accounts that are auth-error", async () => {
     await createAccountRow("gmail", { status: "auth-error" })
     const active = await createAccountRow("gmail")
-    await createAccountRow("imap", { isActive: 0 })
 
     const result = await triggerRefresh()
 
     expect(result.synced).toEqual([active])
     expect(recorder.calls).toEqual([active])
+  })
+
+  it("syncs an active account that is not the last-selected one (is_active = 0)", async () => {
+    const first = await createAccountRow("gmail")
+    const second = await createAccountRow("imap")
+    // persistActiveAccount (the account switch) clears the flag on every
+    // row and sets it on the chosen one — a "last selected" marker that
+    // must never gate syncing: after switching to `second`, `first` keeps
+    // syncing (and both are listed by listActiveAccounts).
+    await executor?.execute("UPDATE accounts SET is_active = 0")
+    await executor?.execute("UPDATE accounts SET is_active = 1 WHERE id = $1", [
+      second,
+    ])
+
+    const result = await triggerRefresh()
+
+    expect(result.synced.sort()).toEqual([first, second].sort())
+    expect(recorder.calls.sort()).toEqual([first, second].sort())
+
+    // The per-account refresh path uses the same status-only rule.
+    recorder.calls = []
+    const single = await triggerRefresh(first)
+    expect(single.synced).toEqual([first])
+    expect(recorder.calls).toEqual([first])
   })
 
   it("isolates per-account errors and still syncs the rest", async () => {
@@ -268,6 +307,159 @@ describe("sync scheduler", () => {
     stopScheduler()
     await vi.advanceTimersByTimeAsync(120_000)
     expect(recorder.calls).toHaveLength(2)
+  })
+
+  it("runs registered due handlers on each tick; unregistering stops them", async () => {
+    vi.useFakeTimers()
+    let runs = 0
+    registerTestDueJobHandler("counter", async () => {
+      runs += 1
+    })
+    startScheduler({ intervalMs: 60_000 })
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(runs).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(runs).toBe(2)
+
+    unregisterDueJobHandler("counter")
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(runs).toBe(2)
+  })
+
+  it("drains due jobs before the sync pass; the two never overlap", async () => {
+    vi.useFakeTimers()
+    const id = await createAccountRow("gmail")
+    const events: string[] = []
+
+    // A due handler stuck in a gate the test controls.
+    let releaseDue!: () => void
+    const dueGate = new Promise<void>((resolve) => {
+      releaseDue = resolve
+    })
+    registerTestDueJobHandler("gated", async () => {
+      events.push("due-start")
+      await dueGate
+      events.push("due-end")
+    })
+
+    startScheduler({ intervalMs: 60_000 })
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    // The combined pass started with the due drain: the handler is in
+    // flight and the sync has not begun.
+    expect(events).toEqual(["due-start"])
+    expect(recorder.calls).toEqual([])
+
+    releaseDue()
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // The sync ran only after the due drain completed.
+    expect(events).toEqual(["due-start", "due-end"])
+    expect(recorder.calls).toEqual([id])
+  })
+
+  it("delays the due drain until an in-flight sync pass completes", async () => {
+    vi.useFakeTimers()
+    const id = await createAccountRow("gmail")
+    let dueRuns = 0
+
+    // Slow sync: the account is stuck in the gate (real DB, real promises).
+    let releaseSync!: () => void
+    recorder.gate = new Promise<void>((resolve) => {
+      releaseSync = resolve
+    })
+    const refresh = triggerRefresh()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(recorder.calls).toEqual([id])
+
+    // A tick arriving mid-sync must not start the due drain.
+    registerTestDueJobHandler("gated", async () => {
+      dueRuns += 1
+    })
+    startScheduler({ intervalMs: 60_000 })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(dueRuns).toBe(0)
+    expect(recorder.calls).toEqual([id])
+
+    // Releasing the sync lets the chained pass drain due jobs; the tick
+    // merged its accounts too, so the drain re-syncs them (same shape as
+    // the overlapping-trigger drain above).
+    releaseSync()
+    await refresh
+    expect(dueRuns).toBe(1)
+    expect(recorder.calls).toEqual([id, id])
+  })
+
+  it("isolates a throwing due handler without breaking the tick or the sync", async () => {
+    vi.useFakeTimers()
+    const id = await createAccountRow("gmail")
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    let afterThrowRuns = 0
+    registerTestDueJobHandler("boom", async () => {
+      throw new Error("due job exploded")
+    })
+    // Registered after the throwing one: insertion order must still
+    // reach it.
+    registerTestDueJobHandler("after-boom", async () => {
+      afterThrowRuns += 1
+    })
+
+    startScheduler({ intervalMs: 60_000 })
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    // The failure was logged and isolated: the sync ran and the handler
+    // after the throwing one was reached.
+    expect(recorder.calls).toEqual([id])
+    expect(afterThrowRuns).toBe(1)
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('due-job handler "boom" failed'),
+      expect.any(Error)
+    )
+
+    // Later ticks keep dispatching handlers.
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(afterThrowRuns).toBe(2)
+    warn.mockRestore()
+  })
+
+  it("runDueJobsOnce drains handlers without a sync pass", async () => {
+    let runs = 0
+    registerTestDueJobHandler("once", async () => {
+      runs += 1
+    })
+
+    await runDueJobsOnce()
+
+    expect(runs).toBe(1)
+    expect(recorder.calls).toEqual([])
+  })
+
+  it("runDueJobsOnce waits for an in-flight sync pass instead of overlapping it", async () => {
+    const id = await createAccountRow("gmail")
+    let releaseGate!: () => void
+    recorder.gate = new Promise<void>((resolve) => {
+      releaseGate = resolve
+    })
+    const refresh = triggerRefresh()
+    await vi.waitFor(() => expect(recorder.calls).toEqual([id]))
+
+    let runs = 0
+    registerTestDueJobHandler("once", async () => {
+      runs += 1
+    })
+
+    // The drain is deferred while the sync pass is in flight.
+    const once = runDueJobsOnce()
+    expect(runs).toBe(0)
+
+    releaseGate()
+    await Promise.all([refresh, once])
+
+    // The chained drain ran the handler, and synced nothing extra.
+    expect(runs).toBe(1)
+    expect(recorder.calls).toEqual([id])
   })
 
   it("coalesces overlapping triggers into a single drain pass (single-flight)", async () => {

@@ -1,13 +1,19 @@
 import type { SqlExecutor } from "../db/executor"
 import { reconcileProvisionalSent } from "../composer/send"
+import { getAccount } from "../db/accounts"
 import { findLabelByImapFolder, getLabel, insertLabel } from "../db/labels"
 import type { SpecialUse } from "../db/labels"
 import type { AttachmentInput, ContactRef, MessageInput } from "../db/messages"
 import { upsertMessageByProviderId } from "../db/messages"
+import {
+  listNotificationRules,
+  resolveNotificationDecision,
+} from "../db/notification-rules"
 import type { ThreadInput } from "../db/threads"
 import {
   getThread,
   insertThread,
+  isThreadMuted,
   recomputeThreadCaches,
   setThreadFolder,
 } from "../db/threads"
@@ -26,6 +32,19 @@ import { ProviderAuthError } from "../email/types"
 import { getFolderSyncState, upsertFolderSyncState } from "./folder-sync-state"
 import type { FetchFlagsChangedFn } from "./flag-sync"
 import { reconcileAllFolderFlags } from "./flag-sync"
+import { listEnabledRules } from "../rules/db"
+import {
+  applyBlockedSenderFiling,
+  applyDeliveryHolds,
+  applyJunkFiling,
+  ingestionEventFromInput,
+  recordSenderStats,
+  runIngestionRules,
+  type IngestionEvent,
+} from "../rules/ingestion"
+import { listBlockedSenders } from "../db/blocked-senders"
+import { listDeliverySchedules } from "../settings/delivery-schedules"
+import { loadJunkFilterConfig } from "../security/junk-filter"
 import {
   findMessageByImapUid,
   findThreadByMessageIdHeader,
@@ -138,6 +157,13 @@ export async function syncImapAccount(
   const { executor, provider, accountId } = options
   const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
   const onProgress = options.onProgress ?? ((): void => {})
+  // The account's own address anchors the sender-stats flags (task 13.1,
+  // D7: direct-to-me + thread participation). Aliases (task 16) will
+  // widen this to the alias set.
+  const account = await getAccount(executor, accountId)
+  if (!account) {
+    throw new Error(`imap sync: account ${accountId} not found`)
+  }
 
   const folders = await provider.listFolders()
   const labelIdsByPath = await ensureFolderLabels(executor, accountId, folders)
@@ -166,7 +192,8 @@ export async function syncImapAccount(
         accountId,
         folder,
         labelId,
-        batchSize
+        batchSize,
+        account.email
       )
       summary.foldersSynced += 1
       summary.newMessages += outcome.newMessages
@@ -297,7 +324,8 @@ async function syncFolder(
   accountId: string,
   folder: EmailFolder,
   labelId: string | null,
-  batchSize: number
+  batchSize: number,
+  accountEmail: string
 ): Promise<FolderOutcome> {
   const state = await getFolderSyncState(executor, accountId, folder.path)
 
@@ -350,7 +378,21 @@ async function syncFolder(
     folder.path,
     labelId,
     fetched,
-    previousLastSeenUid
+    previousLastSeenUid,
+    accountEmail,
+    {
+      // Seed pass (first sync of this folder, or its UIDVALIDITY reset):
+      // the whole folder is a backfill — store and file everything, but
+      // the count is capped to 0 so a seed never reads as fresh mail. A
+      // folder synced while EMPTY is not a seed: its state row exists (with
+      // a null uidvalidity — the server never reported one) but saw no
+      // messages, so its first real arrival must still announce (the row's
+      // last_seen_uid is 0 and the uid gate below counts it).
+      countNew: !(state === null || invalidated),
+      // Additive-INBOX rule (the gmail model): only an inbox-role arrival
+      // folder may re-file a reused thread into the inbox.
+      arrivalIsInbox: folder.specialUse === "inbox",
+    }
   )
 
   const maxSeenUid = fetched.reduce(
@@ -491,13 +533,27 @@ function threadIdForKey(accountId: string, key: string): string {
   return `th-${stableHash(`${accountId}\u0000${key}`)}`
 }
 
+/** Count/booking gates for one folder pass. */
+interface FolderGates {
+  /**
+   * False on a seed pass (first sync of the folder / UIDVALIDITY reset):
+   * the pass stores and files its messages but counts none of them as
+   * new — a backfill must not announce.
+   */
+  countNew: boolean
+  /** The arrival folder carries the inbox special-use role. */
+  arrivalIsInbox: boolean
+}
+
 async function storeFolderMessages(
   executor: SqlExecutor,
   accountId: string,
   folderPath: string,
   labelId: string | null,
   fetched: NormalizedMessage[],
-  previousLastSeenUid: number
+  previousLastSeenUid: number,
+  accountEmail: string,
+  gates: FolderGates
 ): Promise<FolderOutcome> {
   if (fetched.length === 0) {
     return { newMessages: 0, threadsCreatedOrUpdated: 0 }
@@ -575,7 +631,34 @@ async function storeFolderMessages(
   // Pass 3 — persist messages, then refresh thread caches; threads
   // created here are stamped with this folder (and its archive/trash/
   // spam caches), reused threads keep the folder they already live in.
-  let newMessages = 0
+  const mutedThreads = new Set<string>()
+  for (const threadId of touchedThreads) {
+    if (await isThreadMuted(executor, threadId)) mutedThreads.add(threadId)
+  }
+  const rules = await listNotificationRules(executor, accountId)
+  // Ingestion rules load once per folder pass (one criteria/actions parse
+  // per rule) and are handed to the hook call below; delivery schedules
+  // (task 12.1, D6) load once per pass the same way — the hook consults
+  // them per event and applyDeliveryHolds writes the held threads'
+  // held_until right after the hook.
+  const enabledRules = await listEnabledRules(executor, accountId)
+  const deliverySchedules = await listDeliverySchedules(executor, accountId)
+  // Sender blocklist (task 18.2, the hook's FIFTH consumer): preloaded
+  // once per folder pass like the rules and schedules; a blocked sender's
+  // new message reports blockedAction and applyBlockedSenderFiling files
+  // its thread right after the hook's holds.
+  const blockedSenders = await listBlockedSenders(executor, accountId)
+  // Local junk filter (task 18.10, D19, the hook's SIXTH consumer):
+  // preloaded once per folder pass like the blocklist — IMAP account +
+  // per-account toggle on, else null and the hook never classifies. The
+  // gmail engine passes no config at all, which is the structural half of
+  // the D19 gmail exemption (the guard inside loadJunkFilterConfig is the
+  // other half).
+  const junkFilter = await loadJunkFilterConfig(executor, accountId)
+
+  // Newly inserted messages: rule-hook events (uid kept for the count's
+  // delta gate) + the provisional-sent twin drop (task 8.7).
+  const newEvents: { event: IngestionEvent; uid: number }[] = []
   for (const message of ordered) {
     const rowId = imapMessageRowId(accountId, folderPath, message.uid)
     const threadId = threadIdByRowId.get(rowId)
@@ -586,17 +669,156 @@ async function storeFolderMessages(
     }
     const input = toMessageInput(accountId, folderPath, message, threadId)
     const { created } = await upsertMessageByProviderId(executor, input)
-    if (created && message.uid > previousLastSeenUid) newMessages += 1
-    // Task 8.7: when the server copy of a sent message first lands, drop
-    // the composer's provisional Sent twin (same Message-ID header).
-    if (created) await reconcileProvisionalSent(executor, accountId, input)
+    if (created) {
+      // The folder label's row name IS the folder path
+      // (ensureFolderLabels), so it doubles as the label name here.
+      const event = ingestionEventFromInput(input, [folderPath])
+      // List signal (task 13.1, D7): the IMAP surface (Rust ImapMessage)
+      // exposes no List-Id/Precedence headers, so the bracketed subject
+      // prefix many lists carry stands in — a documented approximation
+      // (see IngestionEvent.isMailingList).
+      event.isMailingList = /^\[[^\]]+\]/.test(message.subject ?? "")
+      newEvents.push({ event, uid: message.uid })
+      // Task 8.7: when the server copy of a sent message first lands, drop
+      // the composer's provisional Sent twin (same Message-ID header).
+      await reconcileProvisionalSent(executor, accountId, input)
+    }
+  }
+  // Thread participation (task 13.1, D7): one lookup per touched thread,
+  // run AFTER the upserts so a user message from this same batch counts
+  // too; stamped on that thread's new events only.
+  const threadIdsWithNew = new Set(
+    newEvents.map((entry) => entry.event.threadId)
+  )
+  for (const threadId of threadIdsWithNew) {
+    const own = await executor.select<{ one: number }>(
+      "SELECT 1 AS one FROM messages WHERE thread_id = $1 AND from_address = $2 COLLATE NOCASE LIMIT 1",
+      [threadId, accountEmail]
+    )
+    if (own.length === 0) continue
+    for (const entry of newEvents) {
+      if (entry.event.threadId === threadId)
+        entry.event.threadHasUserMessage = true
+    }
   }
 
   for (const threadId of createdThreads) {
     await setThreadFolder(executor, threadId, labelId)
   }
+  // Additive-INBOX re-entry (the gmail model): a NEW message landing in
+  // the inbox-role folder re-files a reused thread that currently lives
+  // elsewhere — a reply to an archived thread re-enters the inbox (and
+  // setThreadFolder clears is_archived). Only inbox-role arrivals re-file
+  // (a reply landing in Archive must not), and only threads that actually
+  // received newly created mail — a server-wins re-fetch of an old
+  // message never yanks the thread back.
+  if (gates.arrivalIsInbox && labelId !== null) {
+    const threadsWithNewMail = new Set(
+      newEvents.map((entry) => entry.event.threadId)
+    )
+    for (const threadId of threadsWithNewMail) {
+      if (createdThreads.has(threadId)) continue
+      const current = await executor.select<{
+        folder_label_id: string | null
+      }>("SELECT folder_label_id FROM threads WHERE id = $1", [threadId])
+      if ((current[0]?.folder_label_id ?? null) !== labelId) {
+        await setThreadFolder(executor, threadId, labelId)
+      }
+    }
+  }
   for (const threadId of touchedThreads) {
     await recomputeThreadCaches(executor, threadId)
+  }
+
+  // Ingestion hook (task 11.1/11.2, design D5): the newly created messages
+  // run through the account's enabled rules in deterministic order — after
+  // the folder stamping + cache recompute above, so a ruled move/archive
+  // sticks, and through the thread-actions service (local effect + queue
+  // op). The new-mail count is finalized only AFTER the hook, from the
+  // post-rule state: a message ruled away (archive/trash/move/mark_read/
+  // mark_as_spam — see SUPPRESSES_NOTIFICATION in rules/actions.ts) is not
+  // counted, so
+  // the count the scheduler forwards to notifyNewMail never announces
+  // ruled mail. The mute gate and the notification rules (task 8.1,
+  // design D16) still gate the count around the hook outcome — mute stays
+  // stronger than everything, rules never ADD to the count, and "always"
+  // notification rules stay inert here. Like those gates, rules touch only
+  // the announcement count, never the badge total. Delivery schedules run
+  // in the same hook call: matched messages report heldUntil and the hold
+  // lands on the thread right after (a held message counts like a
+  // ruled-away one — it never announces). Two more gates bracket the final
+  // count: a seed pass (`countNew: false` — first sync of the folder or
+  // its UIDVALIDITY reset) stores and files but announces nothing, and a
+  // message whose thread is trashed/spammed never announces.
+  const outcomes = await runIngestionRules(
+    executor,
+    accountId,
+    newEvents.map((entry) => entry.event),
+    {
+      rules: enabledRules,
+      schedules: deliverySchedules,
+      blockedSenders,
+      ...(junkFilter ? { junk: junkFilter } : {}),
+    }
+  )
+  await applyDeliveryHolds(executor, outcomes)
+  // Blocked senders (task 18.2): mark read + trash/archive the blocked
+  // senders' threads per the outcomes' blockedAction (FIFTH hook
+  // consumer — see rules/ingestion.ts). The count gate below already
+  // excludes them via suppressesNotification.
+  await applyBlockedSenderFiling(executor, accountId, outcomes)
+  // Local junk filter (task 18.10): apply the auto-move the outcomes'
+  // junkVerdicts computed — markSpam placement WITHOUT training (D19) —
+  // right after the blocked filing; the count gate below already excludes
+  // junked mail via suppressesNotification.
+  await applyJunkFiling(executor, accountId, outcomes)
+  // Sender stats (task 13.1, D7): the hook flow's third consumer — every
+  // new message's sender accumulates its row; classification itself is
+  // lazy, at view time (priority/classify.ts). Stats never touch the
+  // outcomes or the notification count.
+  await recordSenderStats(
+    executor,
+    accountId,
+    accountEmail,
+    newEvents.map((entry) => entry.event)
+  )
+  const outcomeByRowId = new Map(
+    outcomes.map((outcome) => [outcome.messageRowId, outcome])
+  )
+  // Placement gate (same predicate style as the other count gates): a
+  // message whose THREAD is trashed or spammed never announces — read
+  // from the caches recomputed above, memoized per thread.
+  const filedThreads = new Map<string, boolean>()
+  const isThreadFiled = async (threadId: string): Promise<boolean> => {
+    const cached = filedThreads.get(threadId)
+    if (cached !== undefined) return cached
+    const rows = await executor.select<{
+      is_trashed: number
+      is_spam: number
+    }>("SELECT is_trashed, is_spam FROM threads WHERE id = $1", [threadId])
+    const filed =
+      rows[0] !== undefined &&
+      (rows[0].is_trashed === 1 || rows[0].is_spam === 1)
+    filedThreads.set(threadId, filed)
+    return filed
+  }
+
+  let newMessages = 0
+  for (const { event, uid } of newEvents) {
+    if (
+      gates.countNew &&
+      uid > previousLastSeenUid &&
+      !mutedThreads.has(event.threadId) &&
+      !(await isThreadFiled(event.threadId)) &&
+      resolveNotificationDecision(
+        rules,
+        event.fromAddress,
+        event.labelNames
+      ) === "notify" &&
+      !(outcomeByRowId.get(event.messageRowId)?.suppressesNotification ?? false)
+    ) {
+      newMessages += 1
+    }
   }
 
   return { newMessages, threadsCreatedOrUpdated: touchedThreads.size }
@@ -668,7 +890,27 @@ function toMessageInput(
     isFlagged: message.flags.includes("\\Flagged"),
     hasAttachments: message.attachments.length > 0,
     attachments,
+    headers: buildStoredHeaders(message),
   }
+}
+
+/**
+ * The stored `headers` JSON (task 18.3, design D13): the list-unsubscribe
+ * header pair, captured verbatim from the normalized message and keyed by
+ * lowercase header name — the only headers this surface stores (the mail
+ * view parses them per displayed message; security/unsubscribe.ts owns the
+ * grammar). Undefined when the message carries neither header, so the
+ * column stays NULL instead of "{}".
+ */
+function buildStoredHeaders(message: NormalizedMessage): string | undefined {
+  const headers: Record<string, string> = {}
+  if (message.listUnsubscribe !== undefined) {
+    headers["list-unsubscribe"] = message.listUnsubscribe
+  }
+  if (message.listUnsubscribePost !== undefined) {
+    headers["list-unsubscribe-post"] = message.listUnsubscribePost
+  }
+  return Object.keys(headers).length > 0 ? JSON.stringify(headers) : undefined
 }
 
 /** Drop address entries without an email; undefined stays undefined so

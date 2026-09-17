@@ -5,20 +5,18 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import {
-  SHORTCUTS,
-  SHORTCUT_GROUPS,
-  type ShortcutBinding,
-} from "@/constants/shortcuts"
+import { SHORTCUT_GROUPS, type ShortcutBinding } from "@/constants/shortcuts"
+import { useEffectiveShortcuts } from "@/hooks/shortcut-bindings"
 
 /**
  * Shortcuts help overlay (task 6.6): the `?` reference required by the
  * mailbox-ui spec. Purely presentational — open state is owned by the
  * mount point (App) and shared with useKeyboardShortcuts, which opens it
  * on `?` and dismisses on Esc; the dialog's native Esc path funnels into
- * the same onOpenChange. Rows render straight from the fixed binding
- * table (src/constants/shortcuts.ts), grouped by area in table order —
- * the same table the shortcuts settings section (11.3) will present.
+ * the same onOpenChange. Rows render from the EFFECTIVE binding table
+ * (defaults + persisted overrides via useEffectiveShortcuts, design D15)
+ * grouped by area in table order — so a binding changed in settings
+ * (task 20.1) shows up here immediately and after a restart.
  */
 
 /** Single binding row: description on the left, key cap(s) on the right. */
@@ -30,7 +28,10 @@ function ShortcutRow({ binding }: { binding: ShortcutBinding }) {
     >
       <dt className="text-sm text-muted-foreground">{binding.description}</dt>
       <dd>
-        <kbd className="inline-flex min-w-6 items-center justify-center rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-xs font-medium text-foreground">
+        <kbd
+          data-testid={`shortcut-keys-${binding.id}`}
+          className="inline-flex min-w-6 items-center justify-center rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-xs font-medium text-foreground"
+        >
           {binding.keys}
         </kbd>
       </dd>
@@ -47,6 +48,7 @@ export function ShortcutsOverlay({
   open,
   onOpenChange,
 }: ShortcutsOverlayProps) {
+  const bindings = useEffectiveShortcuts()
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent data-testid="shortcuts-overlay" className="sm:max-w-lg">
@@ -58,10 +60,10 @@ export function ShortcutsOverlay({
         </DialogHeader>
         <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
           {SHORTCUT_GROUPS.map((group) => {
-            const bindings = SHORTCUTS.filter(
+            const groupBindings = bindings.filter(
               (binding) => binding.group === group.id
             )
-            if (bindings.length === 0) return null
+            if (groupBindings.length === 0) return null
             return (
               <section
                 key={group.id}
@@ -71,7 +73,7 @@ export function ShortcutsOverlay({
                   {group.label}
                 </h3>
                 <dl className="flex flex-col gap-2">
-                  {bindings.map((binding) => (
+                  {groupBindings.map((binding) => (
                     <ShortcutRow key={binding.id} binding={binding} />
                   ))}
                 </dl>

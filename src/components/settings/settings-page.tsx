@@ -1,5 +1,21 @@
 import { useState } from "react"
-import { ArrowLeft, BookOpen, Keyboard, Palette, UserRound } from "lucide-react"
+import {
+  Archive,
+  ArrowDownUp,
+  ArrowLeft,
+  Ban,
+  Bell,
+  BookOpen,
+  CalendarClock,
+  Filter,
+  KeyRound,
+  Keyboard,
+  MailWarning,
+  Palette,
+  ShieldAlert,
+  UserRound,
+  Zap,
+} from "lucide-react"
 import type { LucideIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
@@ -8,8 +24,18 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { AccountsSection } from "@/components/settings/accounts-section"
 import { AppearanceSection } from "@/components/settings/appearance-section"
+import { AttachmentSecuritySection } from "@/components/settings/attachment-security-section"
+import { AutoArchiveSection } from "@/components/settings/auto-archive-section"
+import { BlockedSendersSection } from "@/components/settings/blocked-senders-section"
+import { DataPortabilitySection } from "@/components/settings/data-portability-section"
+import { DeliverySchedulesSection } from "@/components/settings/delivery-schedules-section"
+import { JunkFilterSection } from "@/components/settings/junk-filter-section"
+import { NotificationsSection } from "@/components/settings/notifications-section"
+import { PgpSection } from "@/components/settings/pgp-section"
 import { ReadingSection } from "@/components/settings/reading-section"
+import { RulesSection } from "@/components/settings/rules-section"
 import { ShortcutsSection } from "@/components/settings/shortcuts-section"
+import { SnippetsSection } from "@/components/settings/snippets-section"
 import { useUiStore } from "@/stores/ui-store"
 
 /**
@@ -26,7 +52,21 @@ import { useUiStore } from "@/stores/ui-store"
  * deep-link individual settings sections.
  */
 
-type SettingsSectionId = "accounts" | "appearance" | "reading" | "shortcuts"
+type SettingsSectionId =
+  | "accounts"
+  | "pgp"
+  | "attachment-security"
+  | "junk-filter"
+  | "data-portability"
+  | "appearance"
+  | "reading"
+  | "notifications"
+  | "rules"
+  | "blocked-senders"
+  | "delivery-schedules"
+  | "auto-archive"
+  | "shortcuts"
+  | "snippets"
 
 const SECTIONS: {
   id: SettingsSectionId
@@ -34,9 +74,31 @@ const SECTIONS: {
   icon: LucideIcon
 }[] = [
   { id: "accounts", label: "Accounts", icon: UserRound },
+  { id: "pgp", label: "Encryption", icon: KeyRound },
+  {
+    id: "attachment-security",
+    label: "Attachment security",
+    icon: ShieldAlert,
+  },
+  { id: "junk-filter", label: "Junk filter", icon: MailWarning },
+  {
+    id: "data-portability",
+    label: "Import & export",
+    icon: ArrowDownUp,
+  },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "reading", label: "Reading", icon: BookOpen },
+  { id: "notifications", label: "Notifications", icon: Bell },
+  { id: "rules", label: "Rules", icon: Filter },
+  { id: "blocked-senders", label: "Blocked senders", icon: Ban },
+  {
+    id: "delivery-schedules",
+    label: "Delivery schedules",
+    icon: CalendarClock,
+  },
+  { id: "auto-archive", label: "Auto-archive", icon: Archive },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
+  { id: "snippets", label: "Snippets", icon: Zap },
 ]
 
 /**
@@ -46,12 +108,32 @@ function ActiveSection({ id }: { id: SettingsSectionId }) {
   switch (id) {
     case "accounts":
       return <AccountsSection />
+    case "pgp":
+      return <PgpSection />
+    case "attachment-security":
+      return <AttachmentSecuritySection />
+    case "junk-filter":
+      return <JunkFilterSection />
+    case "data-portability":
+      return <DataPortabilitySection />
     case "appearance":
       return <AppearanceSection />
     case "reading":
       return <ReadingSection />
+    case "notifications":
+      return <NotificationsSection />
+    case "rules":
+      return <RulesSection />
+    case "blocked-senders":
+      return <BlockedSendersSection />
+    case "delivery-schedules":
+      return <DeliverySchedulesSection />
+    case "auto-archive":
+      return <AutoArchiveSection />
     case "shortcuts":
       return <ShortcutsSection />
+    case "snippets":
+      return <SnippetsSection />
   }
 }
 

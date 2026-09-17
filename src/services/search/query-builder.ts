@@ -1,13 +1,20 @@
 import { escapeLikePattern, toFtsMatch } from "./fts"
 import type { ParsedQuery } from "./parser"
+import type { ThreadSortOption } from "../db/thread-sort"
+import { DEFAULT_THREAD_SORT, threadSortOrderClause } from "../db/thread-sort"
 
 /**
- * Builds the SQL for an account-scoped Gmail-style thread search from a
- * ParsedQuery. Pure string/array construction — no I/O, and user input is
- * always bound through `$N` parameters, never interpolated.
+ * Builds the SQL for a Gmail-style thread search from a ParsedQuery, over
+ * ONE account or a SET of accounts (task 9.1, design D4: the unified /
+ * split / saved-search scopes run the same search minus the account
+ * filter — the account restriction is `threads.account_id = $1` for a
+ * single id and `threads.account_id IN ($1…$n)` for a set; an empty set
+ * renders a no-match predicate). Pure string/array construction — no I/O,
+ * and user input is always bound through `$N` parameters, never
+ * interpolated.
  *
  * Shape: one SELECT over `threads`, restricted to
- * - the account (`threads.account_id = ?`), and
+ * - the account set (`threads.account_id = ?` / `IN (?…)`), and
  * - the mailbox (`is_trashed = 0 AND is_spam = 0`): like Gmail, search
  *   covers mail the user can act on; trashed/spammed threads are surfaced
  *   by their own folders (threads.ts presets), not search results.
@@ -48,10 +55,29 @@ import type { ParsedQuery } from "./parser"
  * An empty ParsedQuery yields the bare mailbox query (all non-trash,
  * non-spam threads of the account); searchThreadsQuery (index.ts)
  * short-circuits that case to an empty result instead.
+ *
+ * Ordering: `(pinned_at IS NOT NULL) DESC` leads every sort, then the
+ * requested ThreadSortOption's fixed fragment (task 4.1 — search results
+ * are a list scope too), then `threads.id ASC` as the tiebreaker.
+ * threadSortOrderClause in db/thread-sort.ts owns the fragments — search
+ * uses the non-inbox (plain last_message_at) date term. Muted/Done threads
+ * are NOT filtered here: mute/done hide a thread from the inbox and badges
+ * only, never from search.
  */
 
 export interface SearchThreadsOptions {
   limit?: number
+  /** Trailing sort after the pinned-first lead. Default: date_desc. */
+  sort?: ThreadSortOption
+  /**
+   * Swap the select list for `COUNT(*)` and drop ORDER BY/LIMIT — the
+   * total-match count for the EXACT same WHERE clause (rules "apply now",
+   * task 11.4, runs its confirmation-gate count through this so the count
+   * the user confirms is the count the apply would act on). Ignored
+   * predicates stay put; only the projection and the tail change, so the
+   * parameter list is identical to the plain build.
+   */
+  countOnly?: boolean
 }
 
 export interface BuiltThreadSearchSql {
@@ -70,12 +96,30 @@ const SHORT_TERM_LIKE_COLUMNS = [
 ]
 
 export function buildThreadSearchSql(
-  accountId: string,
+  accountId: string | string[],
   parsed: ParsedQuery,
   options?: SearchThreadsOptions
 ): BuiltThreadSearchSql {
-  const params: unknown[] = [accountId]
-  const conditions: string[] = ["threads.is_trashed = 0", "threads.is_spam = 0"]
+  // Account scope: a single id keeps the historical `= $1` shape; a set
+  // renders the IN list with the ids bound first (ascending placeholder
+  // order — see executor.ts). [] means "match nothing": callers that mean
+  // "every account" pass the full id list, never [].
+  const accountScope = Array.isArray(accountId)
+    ? accountId.length > 0
+      ? {
+          sql: `threads.account_id IN (${accountId
+            .map((_, index) => `$${index + 1}`)
+            .join(", ")})`,
+          params: accountId,
+        }
+      : { sql: "1 = 0", params: [] as string[] }
+    : { sql: "threads.account_id = $1", params: [accountId] }
+  const params: unknown[] = [...accountScope.params]
+  const conditions: string[] = [
+    accountScope.sql,
+    "threads.is_trashed = 0",
+    "threads.is_spam = 0",
+  ]
 
   // 1. from: — address OR display name of some message in the thread.
   for (const value of parsed.from) {
@@ -173,14 +217,31 @@ export function buildThreadSearchSql(
     )
   }
 
-  const limitClause = options?.limit ? ` LIMIT $${params.length + 1}` : ""
-  if (options?.limit) params.push(options.limit)
+  const counting = options?.countOnly === true
+  const limitClause =
+    !counting && options?.limit ? ` LIMIT $${params.length + 1}` : ""
+  if (!counting && options?.limit) params.push(options.limit)
 
   return {
     sql: [
-      "SELECT threads.* FROM threads",
-      `WHERE threads.account_id = $1 AND ${conditions.join(" AND ")}`,
-      "ORDER BY threads.last_message_at DESC" + limitClause,
+      counting
+        ? // The count variant: same WHERE, aggregate projection, no tail —
+          // the count is the total, not a page.
+          "SELECT COUNT(*) AS count FROM threads"
+        : "SELECT threads.* FROM threads",
+      `WHERE ${conditions.join(" AND ")}`,
+      // Pinned-first leads every sort (mail-organization spec: pinned
+      // threads stay on top — search results are a list too); the trailing
+      // fragment comes from the closed sort set (task 4.1). Muted/Done
+      // mail deliberately stays searchable; only the ordering gains a term.
+      // (Dropped for countOnly — ordering cannot change a COUNT.)
+      ...(counting
+        ? []
+        : [
+            "ORDER BY " +
+              threadSortOrderClause(options?.sort ?? DEFAULT_THREAD_SORT) +
+              limitClause,
+          ]),
     ].join(" "),
     params,
   }
