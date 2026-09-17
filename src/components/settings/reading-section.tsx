@@ -105,6 +105,9 @@ export function ReadingSection() {
           </div>
           <Select
             value={readingPane}
+            items={Object.fromEntries(
+              PANE_OPTIONS.map((option) => [option.value, option.label])
+            )}
             onValueChange={(value) =>
               changePane(String(value) as ReadingPanePosition)
             }

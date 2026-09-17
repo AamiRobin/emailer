@@ -254,14 +254,14 @@ describe("DeliverySchedulesSection", () => {
       "value",
       "Newsletters"
     )
-    // Before a popup open, Base UI's SelectValue renders the raw stored
-    // value ("label" / "6"), so assert on that for the select prefills.
+    // The closed SelectValue resolves labels through the `items` map, so
+    // the prefills render as the human-readable option labels.
     expect(
       screen.getByRole("combobox", { name: "Match by" }).textContent
-    ).toContain("label")
+    ).toContain("Label")
     expect(
       screen.getByRole("combobox", { name: "Delivery day" }).textContent
-    ).toContain("6")
+    ).toContain("Saturday")
     expect(screen.getByLabelText("Delivery time")).toHaveProperty(
       "value",
       "08:00"

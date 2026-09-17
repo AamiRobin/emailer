@@ -159,6 +159,7 @@ function AddRuleDialog({
             <Label htmlFor="notification-rule-match-type">Match by</Label>
             <Select
               value={matchType}
+              items={{ sender: "Sender address", label: "Label" }}
               onValueChange={(value) =>
                 setMatchType(String(value) as NotificationRuleMatchType)
               }
@@ -190,6 +191,7 @@ function AddRuleDialog({
             <Label htmlFor="notification-rule-action">Then</Label>
             <Select
               value={action}
+              items={{ never: "Never notify", always: "Always notify" }}
               onValueChange={(value) =>
                 setAction(String(value) as NotificationRuleAction)
               }

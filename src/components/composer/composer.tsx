@@ -12,7 +12,7 @@ import { Underline } from "@tiptap/extension-underline"
 import { EditorContent, useEditor } from "@tiptap/react"
 import { StarterKit } from "@tiptap/starter-kit"
 import { Placeholder } from "@tiptap/extensions"
-import { Paperclip } from "lucide-react"
+import { Paperclip, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -29,7 +29,9 @@ import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { useAccountStore } from "@/stores/account-store"
+import { useFolderCountsStore } from "@/stores/folder-counts-store"
 import { getComposerPayload, useComposerStore } from "@/stores/composer-store"
+import { refreshThreadList } from "@/stores/thread-list-store"
 import { hasInvalidRecipient } from "./address-validation"
 import { addFileAttachments, pickAttachments } from "./attachment-input"
 import { getAttachmentBytes } from "./attachment-bytes"
@@ -192,6 +194,7 @@ function ComposerView() {
   const toggleCc = useComposerStore((state) => state.toggleCc)
   const toggleBcc = useComposerStore((state) => state.toggleBcc)
   const reset = useComposerStore((state) => state.reset)
+  const close = useComposerStore((state) => state.close)
   const draftKey = useComposerStore((state) => state.draftKey)
   const composerAccountId = useComposerStore((state) => state.activeAccountId)
   // Fall back to the shell's active account (e.g. a composer opened before
@@ -232,13 +235,25 @@ function ComposerView() {
     }
   }, [])
 
-  const { flush } = useDraftAutosave({
+  const { flush, saveNow } = useDraftAutosave({
     accountId: accountId ?? "",
     draftKey: draftKey ?? "",
     getDraftInput,
     executor,
     enabled: Boolean(accountId && draftKey),
   })
+
+  /**
+   * Post-close cache refresh: a sent, scheduled or discarded draft changed
+   * the mailbox data behind the composer (the local_drafts row is gone, a
+   * sent message landed in Sent) — re-read the visible list and the folder
+   * badges now instead of waiting for the next sync (the same discipline
+   * as the toolbar/context-menu action flows).
+   */
+  const refreshMailboxCaches = () => {
+    void refreshThreadList()
+    void useFolderCountsStore.getState().refreshFolderCounts()
+  }
 
   // ---- From picker (task 16.2, design D10) ----
 
@@ -486,6 +501,7 @@ function ComposerView() {
           // sendComposerDraft already deleted the draft row; this sweep
           // also removes snapshots the autosave poll had not observed yet.
           await deleteDraftByKey(executor, accountId, draftKey)
+          refreshMailboxCaches()
         } else {
           setSendError(result.error)
         }
@@ -699,6 +715,7 @@ function ComposerView() {
           // sweep also removes snapshots the autosave poll had not
           // observed yet (same double-sweep as handleSend).
           await deleteDraftByKey(executor, accountId, draftKey)
+          refreshMailboxCaches()
         } else {
           setSendError(result.error)
         }
@@ -724,6 +741,7 @@ function ComposerView() {
         await deleteDraftByKey(executor, accountId, draftKey)
       }
       reset()
+      refreshMailboxCaches()
     })()
   }
 
@@ -735,6 +753,21 @@ function ComposerView() {
       return
     }
     setConfirmDiscard(true)
+  }
+
+  // ---- Close keeping the draft ----
+
+  /**
+   * The third way out of the composer beside Send and Discard: dismiss
+   * the window while KEEPING the draft. saveNow() writes the CURRENT
+   * snapshot to the `local_drafts` row (flush() would only rewrite the
+   * last poll-observed one, missing edits newer than a poll tick) and the
+   * Drafts folder lists the row; clicking it resumes via resumeDraft.
+   * close() then drops only the open flag — deliberately keeping every
+   * field, unlike reset().
+   */
+  const handleCloseKeepDraft = () => {
+    void saveNow().finally(() => close())
   }
 
   // ---- Attachments (task 8.5) ----
@@ -866,7 +899,27 @@ function ComposerView() {
           dragActive ? "bg-primary/5 ring-2 ring-primary ring-inset" : ""
         }`}
       >
-        <div className="flex flex-col gap-2 px-4 pt-4">
+        <div className="flex items-center justify-between px-4 pt-3">
+          <span className="text-sm font-medium text-muted-foreground">
+            {mode.kind === "reply"
+              ? "Reply"
+              : mode.kind === "forward"
+                ? "Forward"
+                : "New message"}
+          </span>
+          {/* Dismiss keeping the draft — the autosaved local_drafts row
+              stays addressable from the Drafts folder (resume on click). */}
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Close and save draft"
+            title="Save draft and close"
+            onClick={handleCloseKeepDraft}
+          >
+            <X aria-hidden />
+          </Button>
+        </div>
+        <div className="flex flex-col gap-2 px-4 pt-2">
           {/* From picker (task 16.2): rendered only when the account has
               send-as aliases; option value "" is the bare identity. */}
           {aliases.length > 0 ? (

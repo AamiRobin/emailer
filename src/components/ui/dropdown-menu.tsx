@@ -153,6 +153,10 @@ function DropdownMenuCheckboxItem({
   children,
   checked,
   inset,
+  // Radix parity: Base UI defaults CheckboxItem's closeOnClick to false, so
+  // an unchecked default left every toggle menu stuck open; callers that
+  // want toggle-style stay-open pass closeOnClick={false} explicitly.
+  closeOnClick = true,
   ...props
 }: MenuPrimitive.CheckboxItem.Props & {
   inset?: boolean
@@ -161,6 +165,7 @@ function DropdownMenuCheckboxItem({
     <MenuPrimitive.CheckboxItem
       data-slot="dropdown-menu-checkbox-item"
       data-inset={inset}
+      closeOnClick={closeOnClick}
       className={cn(
         "relative flex cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
@@ -194,6 +199,10 @@ function DropdownMenuRadioItem({
   className,
   children,
   inset,
+  // Radix parity: Base UI defaults RadioItem's closeOnClick to false, so a
+  // picked option (e.g. the thread sort selector) applied its value but
+  // left the menu open; single-choice selections close, like Radix/shadcn.
+  closeOnClick = true,
   ...props
 }: MenuPrimitive.RadioItem.Props & {
   inset?: boolean
@@ -202,6 +211,7 @@ function DropdownMenuRadioItem({
     <MenuPrimitive.RadioItem
       data-slot="dropdown-menu-radio-item"
       data-inset={inset}
+      closeOnClick={closeOnClick}
       className={cn(
         "relative flex cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-sm outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className

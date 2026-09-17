@@ -15,6 +15,7 @@ import type { LabelRow } from "@/services/db/labels"
 import type { AccountType } from "@/services/email/types"
 import { deleteUserLabel } from "@/services/labels/label-admin"
 import { notifyUserLabelsChanged } from "@/components/layout/use-sidebar-data"
+import { refreshThreadList } from "@/stores/thread-list-store"
 
 /**
  * Delete-label confirmation (task 10.4): names the label, states what the
@@ -46,6 +47,10 @@ export function LabelDeleteDialog({
         labelId: label.id,
       })
       notifyUserLabelsChanged()
+      // The delete stripped this label from every local thread — the open
+      // list's label chips are stale until a re-read (the sidebar notify
+      // above covers only the label section).
+      void refreshThreadList()
       onOpenChange(false)
     } catch (error) {
       setErrorMessage(

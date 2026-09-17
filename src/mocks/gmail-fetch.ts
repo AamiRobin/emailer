@@ -49,6 +49,21 @@ function mockId(): string {
   return id
 }
 
+/** Deterministic placeholder bytes for one mocked attachment: readable
+ * repeating ASCII so Save/Open have real content in mock mode without
+ * shipping fixture payloads. Gmail wire format is base64url. */
+function mockAttachmentData(messageId: string, partId: string): string {
+  const bytes = new TextEncoder().encode(
+    `mock attachment content — ${messageId}/${partId}\n`.repeat(8)
+  )
+  let binary = ""
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "")
+}
+
 async function mockGoogleResponse(
   url: string,
   method: string
@@ -120,6 +135,24 @@ async function mockGoogleResponse(
 
   if (path === `${GMAIL_API_ROOT}/messages` && method === "GET") {
     return jsonResponse({ messages: [], resultSizeEstimate: 0 })
+  }
+
+  const ATTACHMENTS_PREFIX = `${GMAIL_API_ROOT}/messages/`
+  if (
+    path.startsWith(ATTACHMENTS_PREFIX) &&
+    path.includes("/attachments/") &&
+    method === "GET"
+  ) {
+    // Attachment content (messages/<id>/attachments/<part>): the seeded
+    // rows carry no bytes, so the UI's Save/Open would otherwise surface
+    // the generic 404 as "Could not save this file." — serve placeholder
+    // content instead.
+    const [, tail] = path.slice(ATTACHMENTS_PREFIX.length).split("/")
+    const [messageId, partId] = tail.split("/attachments/")
+    return jsonResponse({
+      data: mockAttachmentData(messageId, partId),
+      size: 256,
+    })
   }
 
   if (path.startsWith(`${GMAIL_API_ROOT}/messages/`)) {

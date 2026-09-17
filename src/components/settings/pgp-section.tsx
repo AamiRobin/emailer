@@ -552,6 +552,7 @@ function ImportKeyDialog({
               onValueChange={(value) =>
                 setKind(String(value) === "private" ? "private" : "public")
               }
+              items={{ public: "Public key", private: "Private key" }}
             >
               <SelectTrigger id="pgp-import-kind">
                 <SelectValue />

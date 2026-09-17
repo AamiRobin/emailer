@@ -169,6 +169,9 @@ export function AppearanceSection() {
         >
           <Select
             value={theme ?? "system"}
+            items={Object.fromEntries(
+              THEME_OPTIONS.map((option) => [option.value, option.label])
+            )}
             onValueChange={(value) =>
               changeThemeMode(String(value) as ThemeMode)
             }
@@ -248,6 +251,9 @@ export function AppearanceSection() {
         >
           <Select
             value={String(fontScale)}
+            items={Object.fromEntries(
+              FONT_SCALES.map((scale) => [String(scale.value), scale.label])
+            )}
             onValueChange={(value) => {
               changeFontScale(Number(value))
             }}

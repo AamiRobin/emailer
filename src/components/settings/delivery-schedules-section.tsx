@@ -304,6 +304,7 @@ function ScheduleDialog({
             <Label htmlFor="delivery-schedule-match-type">Match by</Label>
             <Select
               value={matchKind}
+              items={{ sender: "Sender address", label: "Label" }}
               onValueChange={(value) =>
                 setMatchKind(String(value) as DeliveryScheduleMatchKind)
               }
@@ -338,6 +339,9 @@ function ScheduleDialog({
             <div className="flex items-center gap-2">
               <Select
                 value={String(dayOfWeek)}
+                items={Object.fromEntries(
+                  WEEKDAY_NAMES.map((day, index) => [String(index), day])
+                )}
                 onValueChange={(value) => setDayOfWeek(Number(value))}
               >
                 <SelectTrigger

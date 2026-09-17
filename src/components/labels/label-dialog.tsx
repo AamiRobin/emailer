@@ -29,6 +29,7 @@ import {
   renameUserLabel,
 } from "@/services/labels/label-admin"
 import { notifyUserLabelsChanged } from "@/components/layout/use-sidebar-data"
+import { refreshThreadList } from "@/stores/thread-list-store"
 import { LabelColorPicker } from "./label-color-picker"
 
 /**
@@ -132,6 +133,9 @@ export function LabelDialog({
         }
       }
       notifyUserLabelsChanged()
+      // A rename/recolor changes the chips rendered on thread rows — the
+      // open list needs a re-read, same as the delete flow.
+      void refreshThreadList()
       onOpenChange(false)
     } catch (error) {
       setErrorMessage(

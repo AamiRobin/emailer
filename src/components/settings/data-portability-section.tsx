@@ -78,6 +78,16 @@ export function DataPortabilitySection() {
   const [progress, setProgress] = useState<Progress | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
+  // Value→label maps for the closed triggers: Base UI can only resolve a
+  // selected label from rendered items, and the popups render lazily, so
+  // without these the closed selects show raw ids ("acc-mock-gmail").
+  const accountItems = Object.fromEntries(
+    accounts.map((candidate) => [candidate.id, candidate.email])
+  )
+  const folderItems = Object.fromEntries(
+    labels.map((label) => [label.id, label.name])
+  )
+
   // Labels of the selected account (the export folder set and the import
   // destination list — one row per folder, both providers).
   useEffect(() => {
@@ -195,6 +205,7 @@ export function DataPortabilitySection() {
         <Label htmlFor="data-portability-account">Account</Label>
         <Select
           value={accountId}
+          items={accountItems}
           onValueChange={(value) => setAccountId(String(value))}
         >
           <SelectTrigger id="data-portability-account" className="w-72">
@@ -222,6 +233,7 @@ export function DataPortabilitySection() {
         <div className="flex items-center gap-2">
           <Select
             value={exportLabelId}
+            items={folderItems}
             onValueChange={(value) => setExportLabelId(String(value))}
           >
             <SelectTrigger
@@ -313,6 +325,7 @@ export function DataPortabilitySection() {
           <Label htmlFor="import-destination">Destination folder</Label>
           <Select
             value={destination}
+            items={{ [NEW_FOLDER]: "New folder…", ...folderItems }}
             onValueChange={(value) => setDestination(String(value))}
           >
             <SelectTrigger

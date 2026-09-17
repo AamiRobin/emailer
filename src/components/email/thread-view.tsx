@@ -655,7 +655,9 @@ function ThreadViewContent({
                 next ? "read" : "unread",
                 (executor) =>
                   setThreadRead(executor, owningAccountId, threadId, next),
-                () => setHasUnread(next)
+                // `next` is the mark-read value; the thread now has unread
+                // messages exactly when it was marked unread instead.
+                () => setHasUnread(!next)
               )
             }}
           >

@@ -185,8 +185,9 @@ export function gmailSystemLabelId(specialUse: SpecialUse): string {
     drafts: "DRAFT",
     spam: "SPAM",
     trash: "TRASH",
+    archive: "ARCHIVE",
   }
-  return `${GMAIL_ACCOUNT_ID}:${systemIds[specialUse]}`
+  return `${GMAIL_ACCOUNT_ID}:${systemIds[specialUse] ?? specialUse.toUpperCase()}`
 }
 
 /** Plain labels use the folder-mapper identity: `<accountId>:folder-<name>`. */
