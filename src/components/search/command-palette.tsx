@@ -148,7 +148,7 @@ export function CommandPalette() {
         // Brand glyph when the provider is known; generic user icon
         // otherwise (unchanged behavior for custom domains).
         icon: brand
-          ? ({ className }) => (
+          ? ({ className }: { className?: string }) => (
               <ProviderIcon provider={brand} className={className} />
             )
           : UserRound,

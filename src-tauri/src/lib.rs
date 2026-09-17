@@ -8,6 +8,7 @@ mod mail_import;
 mod net;
 mod oauth;
 mod smtp;
+mod updates;
 
 // CSP note (tauri.conf.json is plain JSON, so this lives here):
 // `script-src` carries two pinned hashes and no `'unsafe-inline'`:
@@ -85,7 +86,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(external_navigation_plugin())
+        .manage(updates::UpdatesState::default())
         .invoke_handler(tauri::generate_handler![
+            updates::check_for_update,
+            updates::download_and_install_update,
             badge::set_unread_badge,
             imap::commands::imap_test_connection,
             imap::commands::imap_list_folders,

@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react"
+import { listen } from "@tauri-apps/api/event"
+import { relaunch } from "@tauri-apps/plugin-process"
 import { CircleCheck, Download, Loader2, RefreshCw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -13,18 +15,20 @@ import {
 import { getExecutor } from "@/services/db/executor"
 import {
   checkForUpdate,
+  downloadAndInstallUpdate,
   getUpdateChannel,
   setUpdateChannel,
+  UPDATE_DOWNLOAD_PROGRESS_EVENT,
   type UpdateChannel,
+  type UpdateMetadata,
 } from "@/services/updates/updater"
-import type { Update } from "@tauri-apps/plugin-updater"
-import { relaunch } from "@tauri-apps/plugin-process"
 
 /**
  * Settings "Updates" section: the release channel (stable / beta) plus a
- * manual check-for-updates button. Checks run against the channel's
- * static manifest endpoint (src/services/updates/updater.ts) through the
- * Tauri updater plugin; installing hands back to the plugin and relaunches.
+ * manual check-for-updates button. Checks go through the Rust updater
+ * commands (src/services/updates/updater.ts) so the channel's manifest
+ * endpoint is picked server-side; installing hands back to the plugin and
+ * relaunches.
  *
  * Only the packaged desktop app can check — in the browser (mock mode)
  * there is no Tauri IPC, and the section says so instead of offering a
@@ -38,7 +42,7 @@ type CheckState =
   | { kind: "idle" }
   | { kind: "checking" }
   | { kind: "up-to-date" }
-  | { kind: "available"; update: Update; version: string }
+  | { kind: "available"; update: UpdateMetadata }
   | { kind: "downloading"; received: number; total: number | null }
   | { kind: "ready" }
   | { kind: "error"; message: string }
@@ -83,7 +87,7 @@ export function UpdatesSection() {
         setState({ kind: "up-to-date" })
         return
       }
-      setState({ kind: "available", update, version: update.version })
+      setState({ kind: "available", update })
     } catch (error) {
       setState({
         kind: "error",
@@ -93,31 +97,21 @@ export function UpdatesSection() {
     }
   }
 
-  async function downloadAndInstall(update: Update) {
+  async function downloadAndInstall() {
     setState({ kind: "downloading", received: 0, total: null })
-    try {
-      await update.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          setState({
-            kind: "downloading",
-            received: 0,
-            total: event.data.contentLength ?? null,
-          })
-        } else if (event.event === "Progress") {
-          setState((current) => ({
-            kind: "downloading",
-            received:
-              current.kind === "downloading"
-                ? current.received + event.data.chunkLength
-                : event.data.chunkLength,
-            total: current.kind === "downloading" ? current.total : null,
-          }))
-        } else if (event.event === "Finished") {
-          setState({ kind: "ready" })
-        }
+    const unlisten = await listen<{
+      received: number
+      total: number | null
+    }>(UPDATE_DOWNLOAD_PROGRESS_EVENT, (event) => {
+      setState({
+        kind: "downloading",
+        received: event.payload.received,
+        total: event.payload.total,
       })
-      // "Finished" may not fire if the plugin resolves first.
-      setState((current) => (current.kind === "downloading" ? { kind: "ready" } : current))
+    })
+    try {
+      await downloadAndInstallUpdate()
+      setState({ kind: "ready" })
     } catch (error) {
       setState({
         kind: "error",
@@ -126,6 +120,8 @@ export function UpdatesSection() {
             ? error.message
             : "The update could not be downloaded.",
       })
+    } finally {
+      unlisten()
     }
   }
 
@@ -183,7 +179,7 @@ export function UpdatesSection() {
           <CheckStatus
             state={state}
             channel={channel}
-            onInstall={(update) => void downloadAndInstall(update)}
+            onInstall={() => void downloadAndInstall()}
             onRestart={() => void relaunch()}
           />
         </div>
@@ -204,7 +200,7 @@ function CheckStatus({
 }: {
   state: CheckState
   channel: UpdateChannel
-  onInstall: (update: Update) => void
+  onInstall: () => void
   onRestart: () => void
 }) {
   switch (state.kind) {
@@ -226,9 +222,10 @@ function CheckStatus({
       return (
         <div className="flex flex-col items-start gap-2">
           <p role="status" className="text-sm text-foreground">
-            Version {state.version} is available on the {channel} channel.
+            Version {state.update.version} is available on the {channel}{" "}
+            channel (you are on {state.update.currentVersion}).
           </p>
-          <Button size="sm" onClick={() => onInstall(state.update)}>
+          <Button size="sm" onClick={() => onInstall()}>
             <Download />
             Download and install
           </Button>

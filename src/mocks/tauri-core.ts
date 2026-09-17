@@ -143,16 +143,16 @@ export function convertFileSrc(filePath: string): string {
 }
 
 /**
- * Inert stand-ins for the api/core IPC plumbing classes the updater
- * plugin's JS imports (plugins/updater pull `Resource` and `Channel` from
- * @tauri-apps/api/core, which this module aliases in mock mode). They are
- * never exercised — the Updates section refuses to check outside the
- * desktop app — they only need to satisfy the import graph.
+ * Inert stand-ins for the api/core IPC plumbing classes the plugin JS
+ * packages import from @tauri-apps/api/core (which this module aliases
+ * in mock mode). They are never exercised — Tauri-only features refuse
+ * to run outside the desktop app — they only need to satisfy the import
+ * graph.
  */
 export class Resource {
-  #rid: number
+  rid: number
   constructor(rid: number) {
-    this.#rid = rid
+    this.rid = rid
   }
   async close(): Promise<void> {}
 }
@@ -169,7 +169,6 @@ export class Channel<T = unknown> {
   toJSON(): string {
     return `__CHANNEL__:${this.id}`
   }
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   invoke(value: unknown): void {
     this.#onmessage?.(value as T)
   }

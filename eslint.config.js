@@ -6,8 +6,9 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  // .kilo: tool-managed git worktrees (never project sources)
-  globalIgnores(['dist', 'examples', 'openspec', '.kilo']),
+  // .kilo: tool-managed git worktrees; src-tauri/target: Rust build output
+  // (tauri embeds minified frontend assets as codegen .js during builds)
+  globalIgnores(['dist', 'examples', 'openspec', '.kilo', 'src-tauri/target']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [
