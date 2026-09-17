@@ -6,7 +6,8 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist', 'examples', 'openspec']),
+  // .kilo: tool-managed git worktrees (never project sources)
+  globalIgnores(['dist', 'examples', 'openspec', '.kilo']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

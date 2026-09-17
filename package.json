@@ -1,7 +1,7 @@
 {
   "name": "emailer",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "version:set": "node scripts/set-version.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
@@ -31,7 +32,9 @@
     "@tauri-apps/plugin-log": "^2",
     "@tauri-apps/plugin-notification": "^2.4.0",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-sql": "^2.4.1",
+    "@tauri-apps/plugin-updater": "^2.11.0",
     "@tiptap/extension-link": "^3.31.3",
     "@tiptap/extension-text-align": "^3.31.3",
     "@tiptap/extension-underline": "^3.31.3",

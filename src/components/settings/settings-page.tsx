@@ -12,6 +12,7 @@ import {
   Keyboard,
   MailWarning,
   Palette,
+  RefreshCw,
   ShieldAlert,
   UserRound,
   Zap,
@@ -36,6 +37,7 @@ import { ReadingSection } from "@/components/settings/reading-section"
 import { RulesSection } from "@/components/settings/rules-section"
 import { ShortcutsSection } from "@/components/settings/shortcuts-section"
 import { SnippetsSection } from "@/components/settings/snippets-section"
+import { UpdatesSection } from "@/components/settings/updates-section"
 import { useUiStore } from "@/stores/ui-store"
 
 /**
@@ -58,6 +60,7 @@ type SettingsSectionId =
   | "attachment-security"
   | "junk-filter"
   | "data-portability"
+  | "updates"
   | "appearance"
   | "reading"
   | "notifications"
@@ -86,6 +89,7 @@ const SECTIONS: {
     label: "Import & export",
     icon: ArrowDownUp,
   },
+  { id: "updates", label: "Updates", icon: RefreshCw },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "reading", label: "Reading", icon: BookOpen },
   { id: "notifications", label: "Notifications", icon: Bell },
@@ -116,6 +120,8 @@ function ActiveSection({ id }: { id: SettingsSectionId }) {
       return <JunkFilterSection />
     case "data-portability":
       return <DataPortabilitySection />
+    case "updates":
+      return <UpdatesSection />
     case "appearance":
       return <AppearanceSection />
     case "reading":

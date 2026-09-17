@@ -75,6 +75,11 @@ jobs:
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing (docs/releases.md): the private key lives in the
+          # repo secrets; the matching public key is pinned in
+          # src-tauri/tauri.conf.json plugins.updater.pubkey.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.platform, 'macos-') && '-' || '' }}
         with:
           tagName: v__VERSION__
@@ -82,14 +87,18 @@ jobs:
           releaseBody: |
             See the assets below to download this version.
             The Windows portable executable requires the Microsoft Edge WebView2 Runtime.
-          releaseDraft: true
-          prerelease: false
+          # Channel model (docs/releases.md): a tag with a prerelease suffix
+          # (v0.2.0-beta.1) publishes immediately as a prerelease — the beta
+          # channel; a plain tag (v0.2.0) publishes as the stable/latest
+          # release. The app version must equal the tag (npm run version:set).
+          releaseDraft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generateReleaseNotes: true
           retryAttempts: 2
           args: ${{ matrix.args }}
           assetNamePattern: ${{ matrix.assetPattern }}
           uploadPlainBinary: ${{ matrix.uploadPlainBinary }}
-          includeUpdaterJson: false
+          includeUpdaterJson: true
 
       - name: Upload Windows portable executable
         if: matrix.portableUpload
@@ -132,3 +141,38 @@ jobs:
             echo "- Release: ${{ steps.tauri.outputs.releaseHtmlUrl }}"
             echo "- Artifacts: \`${{ steps.tauri.outputs.artifactPaths }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Mirror this build's updater manifest onto the perpetual "channels"
+  # release: stable tags land as latest-stable.json, prerelease tags as
+  # latest-beta.json. The in-app updater reads those two static URLs
+  # (src/services/updates/updater.ts), so a channel switch is just a
+  # manifest swap — GitHub's "latest" release excludes prereleases, which
+  # is what keeps the two channels separate. Runs only when every platform
+  # leg built, so a manifest never points at a partial release.
+  publish-channel-manifests:
+    needs: publish-tauri
+    if: ${{ needs.publish-tauri.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload channel manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            MANIFEST="latest-beta.json"
+          else
+            MANIFEST="latest-stable.json"
+          fi
+
+          gh release download "v$VERSION" --pattern "latest.json" --output "/tmp/latest.json"
+          cp "/tmp/latest.json" "/tmp/$MANIFEST"
+
+          if ! gh release view "channels" >/dev/null 2>&1; then
+            gh release create "channels" \
+              --title "Release channel manifests" \
+              --notes "Moving updater manifests for the beta and stable channels. Not a downloadable release — see the versioned releases." \
+              --latest=false
+          fi
+          gh release upload "channels" "/tmp/$MANIFEST" --clobber
+          echo "Manifest published: channels/$MANIFEST (v$VERSION)"

@@ -32,3 +32,5 @@ examples
 # playwright-cli session artifacts
 .playwright-cli
 gui-test-screenshots/
+.tauri-signing/
+.kilo/

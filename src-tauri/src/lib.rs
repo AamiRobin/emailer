@@ -78,6 +78,12 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        // Updater + process: in-app update checks and relaunch-after-install
+        // (settings "Updates" section). Endpoints and the signing pubkey live
+        // in tauri.conf.json plugins.updater; the release workflow signs
+        // update artifacts with the TAURI_SIGNING_* secrets.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(external_navigation_plugin())
         .invoke_handler(tauri::generate_handler![
             badge::set_unread_badge,
