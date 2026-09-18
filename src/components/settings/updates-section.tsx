@@ -215,7 +215,7 @@ function CheckStatus({
           className="flex items-center gap-1.5 text-sm text-muted-foreground"
         >
           <CircleCheck className="size-4" aria-hidden />
-          emailer is up to date.
+          Emailer is up to date.
         </p>
       )
     case "available":

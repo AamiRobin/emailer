@@ -1,8 +1,8 @@
 <p align="center">
-  <img src=".github/assets/icon.png" width="88" alt="emailer icon" />
+  <img src=".github/assets/icon.png" width="88" alt="Emailer icon" />
 </p>
 
-<h1 align="center">emailer</h1>
+<h1 align="center">Emailer</h1>
 
 <p align="center">
   A local-first desktop email client for Gmail and IMAP.<br/>
@@ -17,10 +17,10 @@
 
 ---
 
-## Why emailer
+## Why Emailer
 
 Most email clients either hold your credentials hostage in the cloud or feel
-like a web page in a frame. emailer is a real desktop app: your messages,
+like a web page in a frame. Emailer is a real desktop app: your messages,
 credentials and settings live in a local SQLite database, search and reading
 work offline, and sync runs quietly in the background when you're online.
 
@@ -28,11 +28,11 @@ work offline, and sync runs quietly in the background when you're online.
 
 **Inbox — light**
 
-<img src="docs/screenshots/inbox-light.png" alt="emailer inbox, light theme" width="900" />
+<img src="docs/screenshots/inbox-light.png" alt="Emailer inbox, light theme" width="900" />
 
 **Inbox — dark**
 
-<img src="docs/screenshots/inbox-dark.png" alt="emailer inbox, dark theme" width="900" />
+<img src="docs/screenshots/inbox-dark.png" alt="Emailer inbox, dark theme" width="900" />
 
 **Composer** · **Adding an account with provider detection**
 
@@ -109,7 +109,7 @@ are bundled with the app, and nothing is shared with third parties:
    screen): user type *External*, add yourself as a **test user**.
 4. Create credentials: *OAuth client ID* → application type **Desktop
    app**.
-5. In emailer: **Add account → Gmail**, paste the client ID, and sign in
+5. In Emailer: **Add account → Gmail**, paste the client ID, and sign in
    in the browser window that opens.
 
 The app requests the `https://mail.google.com/` and `email` scopes and

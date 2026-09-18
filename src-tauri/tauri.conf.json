@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "emailer",
+  "productName": "Emailer",
   "version": "0.2.0",
   "identifier": "com.amirobin.emailer",
   "build": {
@@ -14,7 +14,7 @@
     "withGlobalTauri": false,
     "windows": [
       {
-        "title": "emailer",
+        "title": "Emailer",
         "width": 1400,
         "height": 918,
         "center": true,

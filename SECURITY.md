@@ -9,7 +9,7 @@ affected version/commit, and reproduction steps.
 
 ## Scope notes
 
-- emailer is local-first: messages, credentials and settings live in a
+- Emailer is local-first: messages, credentials and settings live in a
   local SQLite database. Account passwords and OAuth tokens are stored
   encrypted (keychain-backed); the malware hash-lookup feature sends only
   SHA-256 hashes of attachments to VirusTotal, and only when explicitly

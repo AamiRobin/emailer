@@ -33,7 +33,7 @@ export function WelcomePanel({ onAddAccount }: { onAddAccount: () => void }) {
     <EmptyState
       testId="welcome-panel"
       icon={MailIcon}
-      title="Welcome to emailer"
+      title="Welcome to Emailer"
       hint="A local-first mail client: your messages stay on this machine and keep working offline. Connect an account to start syncing."
       actions={
         <>

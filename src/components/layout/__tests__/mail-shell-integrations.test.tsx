@@ -345,7 +345,7 @@ describe("welcome state (6.9)", () => {
     render(<MailShell />)
 
     const welcome = await screen.findByTestId("welcome-panel")
-    expect(welcome.textContent).toContain("Welcome to emailer")
+    expect(welcome.textContent).toContain("Welcome to Emailer")
     expect(screen.getByRole("button", { name: "Add Gmail" })).not.toBeNull()
     expect(screen.getByRole("button", { name: "Add IMAP/SMTP" })).not.toBeNull()
     // The mailbox chrome is not required to proceed: no list is rendered.
