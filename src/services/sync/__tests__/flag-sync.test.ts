@@ -154,6 +154,9 @@ class FakeFlagsProvider implements EmailProvider {
   async deleteForever(): Promise<void> {
     throw new Error("not implemented in fake")
   }
+  async getMessageSource(): Promise<string> {
+    throw new Error("not implemented in fake")
+  }
   async sendMessage(): Promise<SendEmailResult> {
     throw new Error("not implemented in fake")
   }

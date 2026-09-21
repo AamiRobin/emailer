@@ -3,6 +3,10 @@ import {
   clearGmailTokenCache,
   exchangeCodeForTokens,
 } from "../email/token-manager"
+import {
+  clearMicrosoftTokenCache,
+  exchangeMicrosoftCodeForTokens,
+} from "../email/microsoft-token-manager"
 import type { SqlExecutor } from "../db/executor"
 import { getExecutor } from "../db/executor"
 import { getAccount, updateCredentials, updateStatus } from "../db/accounts"
@@ -24,6 +28,11 @@ import {
 } from "./add-imap"
 import type { ImapTestConfig } from "./add-imap"
 import { OauthFlowError, runGoogleConsent } from "./oauth-pkce"
+import {
+  MicrosoftMailScopeNotGrantedError,
+  missingMailScopes,
+  runMicrosoftConsent,
+} from "./microsoft-oauth"
 
 /**
  * Re-authentication orchestrators (task 5.6, accounts spec "Runtime
@@ -82,7 +91,7 @@ export class AccountTypeError extends Error {
 async function loadAccountOfType(
   executor: SqlExecutor,
   accountId: string,
-  type: "gmail" | "imap"
+  type: "gmail" | "imap" | "microsoft"
 ): Promise<{ email: string }> {
   const row = await getAccount(executor, accountId)
   if (!row) throw new AccountNotFoundError(accountId)
@@ -223,6 +232,128 @@ export async function reauthGmailAccount(
   })
   // Any cached access token minted from the old grant is now stale.
   clearGmailTokenCache(accountId)
+  await finishReauth(executor, accountId, credentialsJson)
+
+  return { accountId, email }
+}
+
+// ---------------------------------------------------------------------------
+// Microsoft 365: rerun the Entra OAuth consent (parity-round-2, task 3.1)
+// ---------------------------------------------------------------------------
+
+function mapMicrosoftFlowError(error: OauthFlowError): Error {
+  switch (error.code) {
+    case "consent-denied":
+      return new ConsentDeniedError(error.message, {
+        providerError: error.providerError,
+        providerErrorDescription: error.providerErrorDescription,
+      })
+    case "cancelled":
+      return new OauthCancelledError()
+    default:
+      return new NetworkError(error.message, { cause: error })
+  }
+}
+
+/** Same failure mapping as the add flow's exchange step. */
+async function exchangeMicrosoftWithMappedErrors(
+  clientId: string,
+  code: string,
+  codeVerifier: string,
+  redirectUri: string,
+  fetchImpl: FetchImpl
+): Promise<{
+  accessToken: string
+  refreshToken: string
+  expiresIn: number
+  scope: string
+}> {
+  try {
+    return await exchangeMicrosoftCodeForTokens(
+      clientId,
+      code,
+      codeVerifier,
+      redirectUri,
+      fetchImpl
+    )
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (/\(invalid_client\)/.test(message)) {
+      throw new InvalidClientIdError()
+    }
+    throw new NetworkError(
+      "The sign-in could not be completed with Microsoft. Please try again.",
+      { cause: error }
+    )
+  }
+}
+
+export interface ReauthMicrosoftOptions {
+  /** The Microsoft app registration's client id the consent round uses. */
+  clientId: string
+  /** Step callbacks so the UI can show progress. */
+  onProgress?: (step: GmailFlowStep) => void
+  /** Test seams (vitest); production uses the defaults. */
+  fetchImpl?: FetchImpl
+  executor?: SqlExecutor
+}
+
+/**
+ * Re-authorize an existing Microsoft account: browser consent (login_hint
+ * pinned to the account's own address) → PKCE code exchange → rotate the
+ * encrypted OAuth envelope → status "active". The row is updated in
+ * place — no second account is created and local mail data (including
+ * the stored per-folder delta links) is untouched.
+ */
+export async function reauthMicrosoftAccount(
+  accountId: string,
+  options: ReauthMicrosoftOptions
+): Promise<ReauthResult> {
+  const { clientId, onProgress, fetchImpl = fetch } = options
+  const executor = options.executor ?? getExecutor()
+  const { email } = await loadAccountOfType(executor, accountId, "microsoft")
+
+  // 1. Browser consent, login_hint pinned to this account's own address.
+  onProgress?.("consent")
+  const consent = await runMicrosoftConsent({
+    clientId,
+    loginHint: email,
+  }).catch((error: unknown) => {
+    throw error instanceof OauthFlowError
+      ? mapMicrosoftFlowError(error)
+      : new NetworkError("Sign-in failed. Please try again.", { cause: error })
+  })
+
+  // 2. Exchange the authorization code; offline_access guarantees a
+  //    fresh refresh token on every Entra code grant.
+  onProgress?.("exchange")
+  const tokens = await exchangeMicrosoftWithMappedErrors(
+    clientId,
+    consent.code,
+    consent.codeVerifier,
+    consent.redirectUri,
+    fetchImpl
+  )
+
+  // 3. Verify the grant before rotating anything: a consent that arrived
+  //    WITHOUT the mail scopes (admin-denied on a work/school tenant)
+  //    must fail with the missing scope names — never seal an envelope
+  //    that would fail opaquely on every sync. Nothing has been written.
+  const missing = missingMailScopes(tokens.scope)
+  if (missing.length > 0) {
+    throw new MicrosoftMailScopeNotGrantedError(missing)
+  }
+
+  // 4. Rotate the envelope in place and reactivate. No profile read and
+  //    no insert: the account keeps its id, mail data and delta cursors.
+  onProgress?.("save")
+  const credentialsJson = await encryptCredentials({
+    refreshToken: tokens.refreshToken,
+    accessToken: tokens.accessToken,
+    accessTokenExpiresAt: Date.now() + tokens.expiresIn * 1000,
+  })
+  // Any cached access token minted from the old grant is now stale.
+  clearMicrosoftTokenCache(accountId)
   await finishReauth(executor, accountId, credentialsJson)
 
   return { accountId, email }

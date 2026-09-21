@@ -1,11 +1,20 @@
 import { useCallback, useEffect, useState } from "react"
-import { ChevronDown, ChevronUp, Filter, Pencil, Trash2 } from "lucide-react"
+import {
+  ChevronDown,
+  ChevronUp,
+  Filter,
+  Pencil,
+  Sparkles,
+  Trash2,
+} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
 import { Separator } from "@/components/ui/separator"
 import { getExecutor } from "@/services/db/executor"
+import type { RuleAssistCandidate } from "@/services/ai/rule-assist"
+import { isAiConfigured, isSurfaceEnabled } from "@/services/ai/settings"
 import type { RuleRow } from "@/services/rules"
 import {
   deleteRule,
@@ -16,6 +25,7 @@ import {
 import { useActiveAccount } from "@/stores/account-store"
 
 import { ApplyRuleDialog } from "./apply-rule-dialog"
+import { DescribeRuleDialog } from "./describe-rule-dialog"
 import {
   RuleDialog,
   type RuleDialogTarget,
@@ -138,6 +148,13 @@ export function RulesSection() {
   const account = useActiveAccount()
   const [rules, setRules] = useState<RuleRow[]>([])
   const [dialog, setDialog] = useState<RuleDialogTarget | null>(null)
+  // Task 2.5: the "Describe a rule…" affordance's state — the dialog's
+  // open flag, its availability probe (AI configured + ruleAssist surface
+  // on; fail-toward-hidden like every AI affordance), and the validated
+  // candidate awaiting the editor's explicit confirm.
+  const [describeOpen, setDescribeOpen] = useState(false)
+  const [describeAvailable, setDescribeAvailable] = useState(false)
+  const [candidate, setCandidate] = useState<RuleAssistCandidate | null>(null)
 
   const reload = useCallback(() => {
     // Without an active account there is nothing to load — the render
@@ -157,6 +174,32 @@ export function RulesSection() {
   // The shell only mounts settings after bootstrap(), so the executor is
   // available (same assumption as the other sections).
   useEffect(reload, [reload])
+
+  // Task 2.5: the describe affordance renders ONLY when AI is configured
+  // AND the ruleAssist surface is enabled — the same best-effort probe
+  // and fail-toward-hidden posture as the reading pane's AI affordances.
+  useEffect(() => {
+    let cancelled = false
+    try {
+      const executor = getExecutor()
+      void (async () => {
+        try {
+          const [configured, surface] = await Promise.all([
+            isAiConfigured(executor),
+            isSurfaceEnabled(executor, "ruleAssist"),
+          ])
+          if (!cancelled) setDescribeAvailable(configured && surface)
+        } catch {
+          if (!cancelled) setDescribeAvailable(false)
+        }
+      })()
+    } catch {
+      // No executor — hidden.
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   async function handleToggleEnabled(
     rule: RuleRow,
@@ -222,14 +265,32 @@ export function RulesSection() {
               : "Automatically file new mail as it arrives."}
           </p>
         </div>
-        <Button
-          size="sm"
-          disabled={!account}
-          onClick={() => setDialog({ mode: "add" })}
-        >
-          <Filter />
-          Add Rule
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {/* Task 2.5: the natural-language entry point, beside the manual
+              flow. Visible only when AI can serve it (probe above); opens
+              the describe dialog, whose valid candidates continue in the
+              SAME RuleDialog editor below — creation stays the editor's
+              explicit save, exactly like the manual flow. */}
+          {account && describeAvailable && (
+            <Button
+              size="sm"
+              variant="outline"
+              data-testid="describe-rule-open"
+              onClick={() => setDescribeOpen(true)}
+            >
+              <Sparkles />
+              Describe a rule…
+            </Button>
+          )}
+          <Button
+            size="sm"
+            disabled={!account}
+            onClick={() => setDialog({ mode: "add" })}
+          >
+            <Filter />
+            Add Rule
+          </Button>
+        </div>
       </div>
       <p className="text-xs text-muted-foreground">
         Rules run top to bottom on each new message, before the new-mail
@@ -279,6 +340,40 @@ export function RulesSection() {
             if (!open) setDialog(null)
           }}
           onSaved={reload}
+        />
+      )}
+      {/* Task 2.5: the describe dialog. A derived candidate opens the SAME
+          RuleDialog editor in add mode, prefilled with the translated
+          name/query/actions (its own key so the prefill initializes);
+          creation happens ONLY on the editor's explicit save, and a
+          cancel writes nothing. */}
+      {account && (
+        <DescribeRuleDialog
+          open={describeOpen}
+          onOpenChange={(open) => {
+            if (!open) setDescribeOpen(false)
+          }}
+          onDerived={(derived) => {
+            setCandidate(derived)
+            setDescribeOpen(false)
+          }}
+        />
+      )}
+      {candidate && account && (
+        <RuleDialog
+          key={`describe-${candidate.name}-${candidate.criteriaQuery}`}
+          accountId={account.id}
+          target={{ mode: "add" }}
+          initialName={candidate.name}
+          initialCriteria={candidate.criteriaQuery}
+          initialActions={candidate.actions}
+          onOpenChange={(open) => {
+            if (!open) setCandidate(null)
+          }}
+          onSaved={() => {
+            setCandidate(null)
+            reload()
+          }}
         />
       )}
     </section>

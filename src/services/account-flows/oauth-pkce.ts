@@ -10,16 +10,15 @@ import { openUrl } from "@tauri-apps/plugin-opener"
  * opener plugin, and the authorization code is captured by the Rust
  * loopback server (src-tauri/src/oauth.rs, `start_oauth_server`).
  *
- * Port-fallback caveat: the redirect URI is always built from the fixed
- * default loopback port (17248, mirroring Rust's DEFAULT_OAUTH_PORT). If
- * another process already owns that port, the Rust command falls back to
- * an ephemeral one — but the browser still redirects to the URI embedded
- * in the authorization URL, so the redirect lands on the other process and
- * the wait ends in the Rust-side timeout. That surfaces as a retryable
- * OauthFlowError("timeout"); freeing the port and retrying fixes it. A
- * code that does arrive on a fallback port is still exchanged against the
- * original redirect URI (Google only compares the URI string), so no
- * special-casing is needed beyond the timeout path.
+ * Port policy: Google requires the EXACT registered loopback port (unlike
+ * Microsoft, which accepts any localhost port) — the redirect URI is always
+ * built from the fixed default loopback port (17248, mirroring Rust's
+ * DEFAULT_OAUTH_PORT). The flow therefore probes that port with
+ * `find_free_loopback_port({ preferred })` BEFORE opening the browser: when
+ * another process already owns it, the browser redirect would land nowhere
+ * and the wait would end in a silent timeout, so it fails fast with the
+ * typed "port-busy" OauthFlowError ("the sign-in port is in use — close
+ * the other app and retry") instead.
  *
  * Credential hygiene: token values, the verifier and the client id never
  * appear in error messages or logs.
@@ -38,6 +37,15 @@ export const GOOGLE_AUTH_ENDPOINT =
  */
 export const GMAIL_SCOPES = ["https://mail.google.com/", "email"]
 
+/**
+ * Google Calendar scope (task 5.1, design D5): requested ONLY by the
+ * calendar-connect consent round (see calendar/connect.ts), never by the
+ * mail flow — `buildGoogleAuthUrl`'s default is exactly GMAIL_SCOPES, so a
+ * mail-only OAuth round cannot even ask for calendar access.
+ */
+export const GOOGLE_CALENDAR_SCOPE =
+  "https://www.googleapis.com/auth/calendar"
+
 /** Mirrors oauth.rs OauthCallback (serde camelCase). */
 export interface OauthCallback {
   /** The port actually bound (may differ from the request on fallback). */
@@ -46,10 +54,23 @@ export interface OauthCallback {
   state?: string | null
   error?: string | null
   errorDescription?: string | null
+  /**
+   * Space-separated scopes Google GRANTED, relayed verbatim from the
+   * success redirect's `scope` query parameter (absent on error
+   * redirects). Task 5.1: the calendar connect verifies the calendar scope
+   * actually landed before storing anything.
+   */
+  scope?: string | null
 }
 
 export type OauthFailureCode =
-  "consent-denied" | "state-mismatch" | "timeout" | "cancelled" | "loopback"
+  | "consent-denied"
+  | "state-mismatch"
+  | "timeout"
+  | "cancelled"
+  | "loopback"
+  /** The fixed loopback port is owned by another process (Google flow). */
+  | "port-busy"
 
 /**
  * Typed failure of the browser consent round-trip. `consent-denied` is
@@ -62,6 +83,12 @@ export class OauthFlowError extends Error {
   readonly googleError?: string
   /** Google's human-readable description, when provided. */
   readonly googleErrorDescription?: string
+  /**
+   * Provider-neutral aliases (Microsoft flows set these INSTEAD of the
+   * google* pair; the google* fields stay for the Google flow's shape).
+   */
+  readonly providerError?: string
+  readonly providerErrorDescription?: string
 
   constructor(
     code: OauthFailureCode,
@@ -69,6 +96,8 @@ export class OauthFlowError extends Error {
     options?: {
       googleError?: string
       googleErrorDescription?: string
+      providerError?: string
+      providerErrorDescription?: string
       cause?: unknown
     }
   ) {
@@ -80,6 +109,8 @@ export class OauthFlowError extends Error {
     this.code = code
     this.googleError = options?.googleError
     this.googleErrorDescription = options?.googleErrorDescription
+    this.providerError = options?.providerError
+    this.providerErrorDescription = options?.providerErrorDescription
   }
 }
 
@@ -139,6 +170,13 @@ export interface GoogleAuthUrlInput {
   redirectUri: string
   state: string
   codeChallenge: string
+  /**
+   * Scopes to request. Defaults to GMAIL_SCOPES — the DEFAULT (mail) path
+   * requests exactly what it always did, never the calendar scope
+   * (task 5.1, design D5: the calendar scope is added only by the
+   * calendar-connect consent round, which passes it explicitly).
+   */
+  scopes?: string[]
   /** Pre-fills Google's account chooser. */
   loginHint?: string
 }
@@ -153,7 +191,7 @@ export function buildGoogleAuthUrl(input: GoogleAuthUrlInput): string {
     client_id: input.clientId,
     redirect_uri: input.redirectUri,
     response_type: "code",
-    scope: GMAIL_SCOPES.join(" "),
+    scope: (input.scopes ?? GMAIL_SCOPES).join(" "),
     state: input.state,
     code_challenge: input.codeChallenge,
     code_challenge_method: "S256",
@@ -187,6 +225,13 @@ export interface RunConsentOptions {
   clientId: string
   loginHint?: string
   /**
+   * Scopes to request; defaults to GMAIL_SCOPES (the unchanged mail flow).
+   * The calendar connect passes GMAIL_SCOPES plus the calendar scope
+   * (task 5.1, design D5) so the fresh consent yields a refresh token that
+   * covers both grants.
+   */
+  scopes?: string[]
+  /**
    * Milliseconds to wait after starting the loopback server before opening
    * the browser (tests pass 0 with fake-timer-free mocks).
    */
@@ -203,6 +248,20 @@ export interface RunConsentOptions {
 export async function runGoogleConsent(
   options: RunConsentOptions
 ): Promise<ConsentResult> {
+  // Probe the fixed loopback port BEFORE opening the browser: Google only
+  // ever redirects to the exact registered port, so a port owned by
+  // another process can only end in the redirect landing nowhere and the
+  // wait timing out. Fail fast with an actionable, typed error instead.
+  const free = await invoke<number>("find_free_loopback_port", {
+    preferred: OAUTH_LOOPBACK_PORT,
+  }).catch(() => null)
+  if (free !== OAUTH_LOOPBACK_PORT) {
+    throw new OauthFlowError(
+      "port-busy",
+      "The sign-in port is in use — close the other app and retry."
+    )
+  }
+
   const { codeVerifier, codeChallenge } = await createPkcePair()
   const state = createOauthState()
   const redirectUri = `http://127.0.0.1:${OAUTH_LOOPBACK_PORT}`
@@ -211,6 +270,7 @@ export async function runGoogleConsent(
     redirectUri,
     state,
     codeChallenge,
+    scopes: options.scopes,
     loginHint: options.loginHint,
   })
 

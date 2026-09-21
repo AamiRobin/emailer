@@ -123,6 +123,12 @@ pub struct ImapMessage {
     /// `List-Unsubscribe-Post` header value, verbatim (RFC 8058, one-click
     /// = "List-Unsubscribe=One-Click"). None when absent.
     pub list_unsubscribe_post: Option<String>,
+    /// Consolidated SPF/DKIM/DMARC verdicts from the message's
+    /// `Authentication-Results` headers (task 2.1, design D10), compact
+    /// "spf=pass;dkim=fail;dmarc=none" — see `auth_results::parse_auth_results`
+    /// for the format and the worst-wins consolidation rule. None when the
+    /// message carries no such header (spec: no headers → no badge).
+    pub auth_results: Option<String>,
     pub subject: Option<String>,
     pub from: Vec<ImapAddress>,
     pub to: Vec<ImapAddress>,

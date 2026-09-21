@@ -18,6 +18,7 @@ import type {
   SendEmailInput,
 } from "./types"
 import { ProviderAuthError } from "./types"
+import { parseAuthResults } from "./auth-results"
 import type {
   GmailHistoryRecord,
   GmailLabel,
@@ -281,6 +282,19 @@ function headerValue(
   return header?.value
 }
 
+/** EVERY header matching name, in payload order — unlike headerValue,
+ * which stops at the first. Required for Authentication-Results (task
+ * 2.1, design D10): a message may carry several, and the compact verdict
+ * must consolidate all of them, not just the first. */
+function headerValues(
+  part: GmailMessagePart | undefined,
+  name: string
+): string[] {
+  return (part?.headers ?? [])
+    .filter((candidate) => candidate.name.toLowerCase() === name.toLowerCase())
+    .map((candidate) => candidate.value)
+}
+
 function base64UrlToText(value: string): string {
   const base64 = value.replace(/-/g, "+").replace(/_/g, "/")
   const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4)
@@ -374,6 +388,14 @@ export function mapGmailMessage(message: GmailMessage): NormalizedMessage {
     // the sync engine stores the pair in the message's headers JSON.
     listUnsubscribe: headerValue(payload, "List-Unsubscribe"),
     listUnsubscribePost: headerValue(payload, "List-Unsubscribe-Post"),
+    // Task 2.1 (design D10): Gmail REST is called TS-side (plugin-http), so
+    // its headers never transit Rust — parse HERE at ingestion instead,
+    // with the same compact format and worst-wins rule as the Rust parser
+    // (see auth-results.ts for the documented deviation). All
+    // Authentication-Results headers consolidate, not just the first.
+    authResults: parseAuthResults(
+      headerValues(payload, "Authentication-Results")
+    ),
     subject: headerValue(payload, "Subject"),
     from: addressesFromHeader(headerValue(payload, "From")),
     to: addressesFromHeader(headerValue(payload, "To")),
@@ -723,6 +745,21 @@ export function createGmailProvider(
 
     async deleteForever(refs: MessageRef[]): Promise<void> {
       for (const ref of refs) await client.deleteMessage(refMessageId(ref))
+    },
+
+    /**
+     * Raw source (task 1.2, design D6): messages.get with format=raw —
+     * the complete RFC 822 message, base64url-encoded, decoded here. One
+     * request per call, nothing cached (the source view refetches).
+     */
+    async getMessageSource(ref: MessageRef): Promise<string> {
+      const message = await client.getMessage(refMessageId(ref), "raw")
+      if (!message.raw) {
+        throw new Error(
+          `Gmail returned no raw source for message ${refMessageId(ref)}`
+        )
+      }
+      return base64UrlToText(message.raw)
     },
 
     async sendMessage(input: SendEmailInput) {

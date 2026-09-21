@@ -14,6 +14,10 @@ import {
   runAutoArchive,
   AUTO_ARCHIVE_DUE_JOB,
 } from "./email-actions/auto-archive"
+import {
+  startCategoryBackfill,
+  CATEGORY_BACKFILL_DUE_JOB,
+} from "./categorization/backfill"
 import { runDueFollowUps, FOLLOWUPS_DUE_JOB } from "./email-actions/followups"
 import {
   runDueScheduledSends,
@@ -123,6 +127,21 @@ function registerFollowUpsJob(): void {
 }
 
 /**
+ * Register the category backfill with the scheduler's due-jobs registry
+ * (design D2/D4, task 3.4): the on-demand job classifies remaining
+ * NULL-category threads in bounded batches — each tick runs one bounded
+ * slice and yields (a large mailbox never blocks a tick), runDueJobsOnce()
+ * gives an explicit start its immediate first pickup, and the module's
+ * running/done/cancelled guards keep the frequent ticks no-ops when no
+ * backfill is wanted or the job already finished.
+ */
+function registerCategoryBackfillJob(): void {
+  registerDueJobHandler(CATEGORY_BACKFILL_DUE_JOB, () =>
+    startCategoryBackfill(getExecutor())
+  )
+}
+
+/**
  * One-time app startup initialization, awaited by App before the shell
  * renders. The database (and its migrations) must be ready before any
  * feature init or store hydration runs, since stores are rebuilt from the
@@ -135,8 +154,9 @@ function registerFollowUpsJob(): void {
  * scheduler (60s interval) start. Neither loop runs an immediate sync on
  * launch — the first refresh is user/UI-triggered so the window paints
  * without waiting on the network. The snooze wake-up, scheduled-send,
- * delivery-hold release, auto-archive and follow-up-reminder due-job
- * handlers are registered before the scheduler starts, and one
+ * delivery-hold release, auto-archive, follow-up-reminder and
+ * category-backfill due-job handlers are registered before the scheduler
+ * starts, and one
  * fire-and-forget runDueJobsOnce() drains due jobs immediately (spec: a
  * snooze, a scheduled send, a delivery window or a follow-up reminder
  * whose time passed while the app was closed is caught up on startup,
@@ -156,8 +176,29 @@ export function bootstrap(): Promise<void> {
       registerDeliveryHoldsJob()
       registerAutoArchiveJob()
       registerFollowUpsJob()
+      registerCategoryBackfillJob()
       startScheduler()
       void runDueJobsOnce()
     })
   return bootstrapPromise
+}
+
+let popoutBootstrapPromise: Promise<void> | null = null
+
+/**
+ * Reduced startup for pop-out thread windows (task 1.9, design D8):
+ * database + migrations only. The background loops (sync scheduler,
+ * offline queue replay, due jobs) and the notification system stay
+ * MAIN-WINDOW-owned — a pop-out must not run a second sync loop or
+ * double-fire notifications. Reads and local writes go straight to the
+ * shared SQLite file; provider-touching work the pop-out enqueues (send,
+ * archive moves) is replayed by the main window's queue loop. The
+ * account/thread stores are seeded by the pop-out app after this
+ * resolves (PopoutApp), since they need the target thread's account.
+ *
+ * Idempotent per window, same discipline as bootstrap().
+ */
+export function bootstrapPopout(): Promise<void> {
+  popoutBootstrapPromise ??= initDatabase()
+  return popoutBootstrapPromise
 }

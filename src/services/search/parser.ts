@@ -125,6 +125,41 @@ export function isEmptyQuery(parsed: ParsedQuery): boolean {
   )
 }
 
+/**
+ * True when the query uses at least one OPERATOR — positive or negated
+ * (from/to/subject/label, the flag, size and date operators). Free-text
+ * terms, quoted or not, are not operators. The relaxed fallback (task 1.3,
+ * design D7) keys off this: a query that scopes with operators is never
+ * rewritten into its any-term form, because silently dropping the operator
+ * scope would show the user mail they explicitly filtered out.
+ */
+export function usesOperators(parsed: ParsedQuery): boolean {
+  return (
+    parsed.from.length > 0 ||
+    parsed.to.length > 0 ||
+    parsed.subject.length > 0 ||
+    parsed.labels.length > 0 ||
+    parsed.hasAttachment ||
+    parsed.isUnread ||
+    parsed.isStarred ||
+    parsed.larger.length > 0 ||
+    parsed.smaller.length > 0 ||
+    parsed.before.length > 0 ||
+    parsed.after.length > 0 ||
+    parsed.negatedFrom.length > 0 ||
+    parsed.negatedTo.length > 0 ||
+    parsed.negatedSubject.length > 0 ||
+    parsed.negatedLabels.length > 0 ||
+    parsed.negatedLarger.length > 0 ||
+    parsed.negatedSmaller.length > 0 ||
+    parsed.negatedBefore.length > 0 ||
+    parsed.negatedAfter.length > 0 ||
+    parsed.negatedFlags.hasAttachment ||
+    parsed.negatedFlags.isUnread ||
+    parsed.negatedFlags.isStarred
+  )
+}
+
 /** Parse a raw search input into structured, AND-combinable predicates. */
 export function parseSearchQuery(input: string): ParsedQuery {
   const parsed: ParsedQuery = {

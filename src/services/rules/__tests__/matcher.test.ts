@@ -31,6 +31,7 @@ function event(overrides: Partial<IngestionEvent> = {}): IngestionEvent {
     date: 1_700_000_000,
     threadHasUserMessage: false,
     isMailingList: false,
+    headers: {},
     ...overrides,
   }
 }

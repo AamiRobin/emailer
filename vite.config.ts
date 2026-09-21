@@ -69,6 +69,12 @@ export default defineConfig(({ mode }) => ({
   },
   build: {
     rolldownOptions: {
+      // Two entries: the app shell and the static splash screen (task 1.7)
+      // the splash window loads directly from dist/splashscreen.html.
+      input: {
+        main: path.resolve(import.meta.dirname, "index.html"),
+        splashscreen: path.resolve(import.meta.dirname, "splashscreen.html"),
+      },
       output: {
         codeSplitting: {
           groups: [
@@ -97,5 +103,6 @@ export default defineConfig(({ mode }) => ({
   test: {
     environment: "jsdom",
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    setupFiles: ["./vitest.setup.ts"],
   },
 }))

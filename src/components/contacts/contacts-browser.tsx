@@ -4,7 +4,7 @@ import { ArrowLeft, Search, Users } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { AccountBadge } from "@/components/email/account-badge"
 import { EmptyState } from "@/components/email/empty-state"
-import { getInitials, avatarTokenClass } from "@/components/email/message-utils"
+import { ContactAvatar } from "./contact-avatar"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -162,15 +162,15 @@ function ContactRowButton({
       )}
       onClick={onSelect}
     >
-      <span
-        aria-hidden
-        className={cn(
-          "flex size-8 shrink-0 items-center justify-center rounded-full text-xs font-medium",
-          avatarTokenClass(contact.email)
-        )}
-      >
-        {getInitials(contact.name, contact.email)}
-      </span>
+      {/* Task 2.5 (spec contacts "Contact avatars"): Gravatar when the
+          setting is on and one exists, deterministic initials otherwise;
+          the component performs no fetches at all while the setting is
+          off. */}
+      <ContactAvatar
+        email={contact.email}
+        name={contact.name}
+        className="size-8 shrink-0"
+      />
       <span className="grid min-w-0 flex-1 gap-0">
         <span className="truncate text-sm font-medium">{displayName}</span>
         <span className="truncate text-xs text-muted-foreground">

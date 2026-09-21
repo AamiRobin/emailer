@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { useUiStore } from "@/stores/ui-store"
+import { AskInboxButton } from "./ask-inbox-dialog"
 import { CreateFilterButton } from "./create-filter-button"
 import { SaveAsSplitButton } from "./save-as-split-button"
 import { SaveSearchButton } from "./save-search-button"
@@ -81,8 +82,21 @@ export function SearchField({ className }: { className?: string }) {
           aria-label="Search mail"
           autoComplete="off"
           className="ps-8"
+          onKeyDown={(event) => {
+            // Implicit browser submission (Enter in a lone text input) does
+            // not fire in the webview, so submit explicitly. The form's
+            // onSubmit stays the single submission seam.
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault()
+              event.currentTarget.form?.requestSubmit()
+            }
+          }}
         />
       </div>
+      {/* Ask My Inbox (task 4.7, design D3): the AI entry point sits at
+          the end of the search row, self-gating (renders null until a
+          provider is configured and the askInbox surface is on). */}
+      <AskInboxButton />
       {activeQuery !== null && (
         <>
           <SaveSearchButton query={activeQuery} />

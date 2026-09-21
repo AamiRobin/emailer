@@ -14,11 +14,13 @@ import {
 } from "@/components/ui/dialog"
 import { AddGmailFlow } from "./add-gmail-flow"
 import { AddImapFlow } from "./add-imap-flow"
+import { AddMicrosoftFlow } from "./add-microsoft-flow"
 
 /**
- * Entry point of the add-account UI (tasks 5.3/5.4): the chooser between
- * the Gmail (OAuth) and the generic IMAP/SMTP flow, plus the "what do I
- * need" pointer to Google's Client-ID instructions. The individual flows
+ * Entry point of the add-account UI (tasks 5.3/5.4, parity-round-2
+ * 3.5): the chooser between the Gmail (OAuth), Microsoft 365 (Graph
+ * OAuth) and the generic IMAP/SMTP flow, plus the "what do I need"
+ * pointer to Google's Client-ID instructions. The individual flows
  * replace the chooser content and report back through onSuccess.
  */
 
@@ -26,7 +28,7 @@ import { AddImapFlow } from "./add-imap-flow"
 const GMAIL_SETUP_GUIDE_URL =
   "https://developers.google.com/gmail/api/quickstart/js"
 
-type AddAccountMode = "choose" | "gmail" | "imap"
+type AddAccountMode = "choose" | "gmail" | "microsoft" | "imap"
 
 interface AddAccountDialogProps {
   open: boolean
@@ -47,10 +49,17 @@ const options: {
     icon: <ProviderIcon provider="gmail" className="size-4" />,
   },
   {
+    mode: "microsoft",
+    title: "Microsoft 365 / Outlook.com",
+    description:
+      "Sign in with your Microsoft account in the browser — work, school or personal (Outlook, Hotmail, Live). Needs a one-time app registration (free).",
+    icon: <ProviderIcon provider="outlook" className="size-4" />,
+  },
+  {
     mode: "imap",
     title: "Other email (IMAP/SMTP)",
     description:
-      "Outlook, Yahoo, iCloud, Fastmail, GMX, Zoho or any provider — with your email address and password.",
+      "Yahoo, iCloud, Fastmail, GMX, Zoho or any provider — with your email address and password.",
     icon: <Server className="size-4 text-muted-foreground" />,
   },
 ]
@@ -83,6 +92,8 @@ export function AddAccountDialog({
       <DialogContent className="sm:max-w-md">
         {mode === "gmail" ? (
           <AddGmailFlow onBack={() => setMode("choose")} onSuccess={close} />
+        ) : mode === "microsoft" ? (
+          <AddMicrosoftFlow onBack={() => setMode("choose")} onSuccess={close} />
         ) : mode === "imap" ? (
           <AddImapFlow onBack={() => setMode("choose")} onSuccess={close} />
         ) : (

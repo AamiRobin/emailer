@@ -1,6 +1,6 @@
 [package]
 name = "tauri-native"
-version = "0.2.0"
+version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -20,7 +20,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 log = "0.4"
 tauri-plugin-log = "2"
-tauri = { version = "2", features = [] }
+# tray-icon: system tray with unread tooltip + Open/Compose/Quit menu (spec
+# desktop-integration "System tray"); Rust-side only, no capability entries.
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,21 +36,41 @@ tauri-plugin-fs = "2"
 # In-app update checks (settings "Updates" section) + relaunch after install
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Desktop integration (Phase 1, spec desktop-integration): single-instance
+# lock with argv relay, launch-at-login, mailto: deep links, global compose
+# shortcut. D7 in the change design.
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-deep-link = "2"
+tauri-plugin-global-shortcut = "2"
 
 # Mail engine (IMAP fetch / message parsing / SMTP send)
-async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
-# "rt" + "macros" power #[tokio::test] for the OAuth loopback server tests
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }# "rt" + "macros" power #[tokio::test] for the OAuth loopback server tests
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros"] }
 tokio-native-tls = "0.3"
 futures = "0.3"
 mail-parser = "0.11"
 # Attachment content crosses the Tauri JSON bridge base64-encoded (D15)
 base64 = "0.22"
+# Gravatar avatar lookups (task 2.5, design D12): SHA-256 of the trimmed,
+# lowercased address is the cache-file name and the gravatar.com URL key.
+# Already in the dependency tree transitively; only newly declared here.
+sha2 = "0.10"
 lettre = { version = "0.11", default-features = false, features = [
     "smtp-transport",
     "tokio1-native-tls",
     "builder",
 ] }
+# Minimal CalDAV client (task 5.2, design D5): WebDAV/CalDAV servers answer
+# PROPFIND/REPORT with namespaced multistatus XML whose property order,
+# prefixes and entity encoding vary per server (Radicale / Nextcloud /
+# Fastmail). Design D5 names quick-xml for this — the ONE new crate this
+# task adds, zero transitive dependencies, events-based parsing only (no
+# serde feature). CalDAV's calendar-data payloads embed XML-escaped
+# iCalendar text, so hand-rolled string walking would have to re-implement
+# entity decoding to stay correct; the audited-dependencies posture is kept
+# by pinning this single, tiny, no-dep crate.
+quick-xml = "0.36"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -66,3 +88,10 @@ strip = true
 # build scripts) opt out of stripping; the shipped binary still gets it.
 [profile.release.build-override]
 strip = false
+
+# macOS-only desktop integration (task 1.4): LaunchServices C API for the
+# mailto default-handler control (core-foundation provides the CFString
+# wrappers; the two LSCopy/SetDefaultHandlerForURLScheme functions are
+# linked directly — see desktop.rs default_handler).
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"

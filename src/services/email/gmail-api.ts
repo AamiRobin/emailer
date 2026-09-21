@@ -188,7 +188,10 @@ export interface GmailClient {
     maxResults?: number
     pageToken?: string
   }): Promise<GmailMessagesPage>
-  getMessage(id: string, format?: "full" | "metadata"): Promise<GmailMessage>
+  getMessage(
+    id: string,
+    format?: "full" | "metadata" | "raw"
+  ): Promise<GmailMessage>
   getThread(id: string): Promise<GmailThread>
   /** raw = base64url RFC 822 message (https://gmail.googleapis.com JSON endpoint). */
   sendMessageRaw(rawBase64Url: string): Promise<GmailMessage>
@@ -365,7 +368,7 @@ export function createGmailClient(deps: GmailClientDeps): GmailClient {
       return request<GmailMessagesPage>("GET", "messages", { query: search })
     },
 
-    getMessage(id: string, format: "full" | "metadata" = "full") {
+    getMessage(id: string, format: "full" | "metadata" | "raw" = "full") {
       return request<GmailMessage>(
         "GET",
         `messages/${encodeURIComponent(id)}`,

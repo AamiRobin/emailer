@@ -30,8 +30,10 @@ import {
   type PgpMimeOptions,
 } from "../email/mime-builder"
 import type { EmailAddress, SendEmailInput } from "../email/types"
+import { archiveThread } from "../email-actions/thread-actions"
 import { attachReplyFollowUp } from "../email-actions/followups"
 import { isOnline } from "../online"
+import { playSentSound } from "../notifications/sounds"
 import { enqueueSend, operationFromRow } from "../queue/operation"
 import { deleteDraft, deleteDraftByKey } from "./drafts"
 
@@ -342,6 +344,18 @@ export interface SendComposerDraftArgs {
    * plain send, byte-identical to before this task.
    */
   pgp?: PgpSendOptions
+  /**
+   * Send & Archive (batch C2): archive this source thread once the send
+   * has COMMITTED — i.e. after the enqueue/sent-filing/draft-deletion
+   * sequence finished (status "queued"). The composer's split button sets
+   * it from the reply/forward mode's sourceThreadId, and because it rides
+   * the send args it lands at the correct undo-window hook point too: the
+   * expiry transmits these exact args, so the archive happens when the
+   * send does — after the window expires, never on cancel, never when
+   * validation or the enqueue path failed. An archive failure is logged
+   * and never fails the committed send.
+   */
+  archiveSourceThreadId?: string
 }
 
 export type SendComposerDraftResult =
@@ -442,6 +456,27 @@ export async function sendComposerDraft(
       queuedOffline: !isOnline(),
     }
     emitCompleted(event)
+    // Sent-confirmation chime (task 1.5, settings spec, design D12): the
+    // same surface as the UI's "Message sent" toast — an accepted send —
+    // and only there: an offline enqueue toasts "Message queued", which
+    // is not a sent confirmation. playSentSound consults its own toggle
+    // (default off) and never throws.
+    if (!event.queuedOffline) void playSentSound()
+    // Send & Archive (batch C2): strictly AFTER the send committed (the
+    // same archive action the thread list uses — local mutation, provider
+    // enqueue, list event). It re-enters on the undo-window expiry path
+    // too, because the flag rides the frozen send args. An archive
+    // failure never fails the committed send.
+    if (args.archiveSourceThreadId) {
+      try {
+        await archiveThread(executor, accountId, args.archiveSourceThreadId)
+      } catch (error) {
+        console.warn(
+          "[composer-send] send & archive: archiving the source thread failed",
+          error
+        )
+      }
+    }
     return { status: "queued", ...event }
   } catch (error) {
     const message = sanitizeError(error)

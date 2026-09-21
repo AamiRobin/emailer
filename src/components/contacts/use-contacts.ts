@@ -4,11 +4,16 @@ import type { SqlExecutor } from "@/services/db/executor"
 import { getExecutor } from "@/services/db/executor"
 import {
   deleteContact,
+  getContact,
   listAllContacts,
   listContactThreads,
   updateContact,
   type ContactRow,
 } from "@/services/db/contacts"
+import {
+  deleteCarddavContact,
+  pushContactEdit,
+} from "@/services/contacts/carddav"
 import type { ThreadRow } from "@/services/db/threads"
 import { useComposerStore } from "@/stores/composer-store"
 import { useUiStore } from "@/stores/ui-store"
@@ -60,14 +65,21 @@ export function setContactsBrowserExecutor(executor: SqlExecutor | null): void {
 }
 
 // ---- Refresh seam: the edit/delete flows notify subscribers after their
-// mutation so the browser re-queries SQLite. ----
+// mutation so the browser re-queries SQLite. The registry lives in its
+// own module (./contacts-changed) so surfaces that only NOTIFY — the
+// settings address-book section — do not have to import this module (its
+// composer-store import would drag the send chain into the settings
+// graph; design D11). notifyContactsChanged is re-exported here for the
+// existing callers. ----
 
-const contactsChangedListeners = new Set<() => void>()
+import {
+  notifyContactsChanged,
+  subscribeContactsChanged,
+} from "./contacts-changed"
 
-/** Tell useContacts subscribers to re-query the address book. */
-export function notifyContactsChanged(): void {
-  for (const listener of contactsChangedListeners) listener()
-}
+// Re-exported for the existing callers (the browser tests notify through
+// this module's seam).
+export { notifyContactsChanged }
 
 /**
  * Every known contact across ALL accounts, most recent correspondence
@@ -77,13 +89,7 @@ export function notifyContactsChanged(): void {
 export function useContacts(query: string): ContactRow[] {
   const [contacts, setContacts] = useState<ContactRow[]>([])
   const [revision, setRevision] = useState(0)
-  useEffect(() => {
-    const invalidate = (): void => setRevision((value) => value + 1)
-    contactsChangedListeners.add(invalidate)
-    return () => {
-      contactsChangedListeners.delete(invalidate)
-    }
-  }, [])
+  useEffect(() => subscribeContactsChanged(() => setRevision((value) => value + 1)), [])
   useEffect(() => {
     let cancelled = false
     // The promise hop keeps the load (and the no-DB fallback —
@@ -146,8 +152,12 @@ export function useContactThreads(contact: ContactRow | null): ThreadRow[] {
 // ---- Mutation flows ----
 
 /**
- * Apply an explicit display-name edit (the detail's rename). Best-effort:
- * failures are logged and reported so the editor stays open.
+ * Apply an explicit display-name edit (the detail's rename). The local
+ * row updates first; a CARDDAV-sourced contact then pushes the edit to
+ * the server (last write wins on conflict — the Rust side refetches a
+ * fresh ETag and re-PUTs the local version). Best-effort: failures are
+ * logged and reported so the editor stays open; the next successful sync
+ * converges either way.
  */
 export async function renameContact(
   contactId: string,
@@ -155,6 +165,7 @@ export async function renameContact(
 ): Promise<boolean> {
   try {
     await updateContact(resolveExecutor(), contactId, { name })
+    await pushContactEdit(resolveExecutor(), contactId, { name })
   } catch (error) {
     console.warn("[contacts-browser] rename failed", error)
     return false
@@ -164,8 +175,8 @@ export async function renameContact(
 }
 
 /**
- * Save free-form notes (the detail's notes editor). Best-effort, like
- * renameContact.
+ * Save free-form notes (the detail's notes editor). Same flow and
+ * write-back contract as renameContact.
  */
 export async function saveContactNotes(
   contactId: string,
@@ -173,6 +184,7 @@ export async function saveContactNotes(
 ): Promise<boolean> {
   try {
     await updateContact(resolveExecutor(), contactId, { notes })
+    await pushContactEdit(resolveExecutor(), contactId, { notes })
   } catch (error) {
     console.warn("[contacts-browser] notes save failed", error)
     return false
@@ -182,13 +194,22 @@ export async function saveContactNotes(
 }
 
 /**
- * Delete the contact (the detail's confirmed delete). The address-book
- * row goes away; messages are never touched and the contact reappears on
- * the next correspondence (contacts spec "Contact lifecycle").
+ * Delete the contact (the detail's confirmed delete). For a CARDDAV-
+ * sourced contact the server DELETE goes first — a failed push keeps the
+ * row (a local-only delete would resurrect on the next sync); local
+ * rows delete as before. Messages are never touched, and a local contact
+ * reappears on the next correspondence (contacts spec "Contact
+ * lifecycle").
  */
 export async function deleteContactById(contactId: string): Promise<void> {
   try {
-    await deleteContact(resolveExecutor(), contactId)
+    const contact = await getContact(resolveExecutor(), contactId)
+    if (contact?.source === "carddav") {
+      // Server first; the row goes with it (or is kept on failure).
+      await deleteCarddavContact(resolveExecutor(), contactId)
+    } else {
+      await deleteContact(resolveExecutor(), contactId)
+    }
   } catch (error) {
     console.warn("[contacts-browser] delete failed", error)
     return

@@ -445,6 +445,33 @@
   --sidebar-primary-foreground: oklch(0.24 0.05 185);
 }
 
+/* Cyan */
+[data-accent="cyan"] {
+  --primary: oklch(0.52 0.105 223.128);
+  --primary-foreground: oklch(0.985 0 0);
+  --ring: oklch(0.789 0.154 211.53);
+  --chart-1: oklch(0.789 0.154 211.53);
+  --chart-2: oklch(0.865 0.127 207.078);
+  --chart-3: oklch(0.609 0.126 221.723);
+  --chart-4: oklch(0.917 0.08 205.041);
+  --chart-5: oklch(0.52 0.105 223.128);
+  --sidebar-primary: oklch(0.52 0.105 223.128);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+}
+
+[data-accent="cyan"].dark {
+  --primary: oklch(0.789 0.154 211.53);
+  --primary-foreground: oklch(0.24 0.06 220);
+  --ring: oklch(0.715 0.143 215.221);
+  --chart-1: oklch(0.789 0.154 211.53);
+  --chart-2: oklch(0.865 0.127 207.078);
+  --chart-3: oklch(0.715 0.143 215.221);
+  --chart-4: oklch(0.609 0.126 221.723);
+  --chart-5: oklch(0.65 0.12 224);
+  --sidebar-primary: oklch(0.789 0.154 211.53);
+  --sidebar-primary-foreground: oklch(0.24 0.06 220);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

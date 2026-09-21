@@ -22,6 +22,7 @@ import type {
   MessageRef,
 } from "../../email/types"
 import { GmailApiError } from "../../email/gmail-api"
+import { GraphApiError } from "../../email/graph-api"
 import type { LabelAdminService } from "../../labels/label-admin"
 import { useOnlineStore } from "../../../stores/online-store"
 import {
@@ -46,6 +47,7 @@ import {
   enqueueDeleteFolder,
   enqueueDeleteLabel,
   enqueueMarkRead,
+  enqueueMove,
   enqueueNotSpam,
   enqueueRenameFolder,
   enqueueSend,
@@ -107,6 +109,7 @@ function createFakeProvider(
     deleteForever: vi.fn(async (refs: MessageRef[]) => {
       calls.push(`deleteForever:${tag(refs)}`)
     }),
+    getMessageSource: vi.fn(async () => ""),
     sendMessage: vi.fn(
       async (input: { subject: string; messageId?: string }) => {
         calls.push(`send:${input.subject}`)
@@ -230,6 +233,51 @@ describe("queue processor", () => {
     const after = await processQueue(options())
     expect(after.attempted).toBe(0)
     expect(provider.archive).toHaveBeenCalledTimes(MAX_OPERATION_ATTEMPTS)
+  })
+
+  it("completes a permanent Graph 404 as terminal on the FIRST attempt, error recorded once", async () => {
+    const provider = useFakeProvider(accountId, "microsoft")
+    provider.moveToFolder = vi.fn(async () => {
+      throw new GraphApiError(
+        404,
+        "Graph POST me/messages/m1/move failed with 404 [ErrorItemNotFound]",
+        "ErrorItemNotFound"
+      )
+    })
+    const id = await enqueueMove(executor, accountId, inboxRef, "Archive")
+
+    const result = await processQueue(options())
+    // Failed fast: no requeue, no retry budget burned.
+    expect(result.failed).toBe(1)
+    expect(result.requeued).toBe(0)
+    expect(result.succeeded).toBe(0)
+    expect(provider.moveToFolder).toHaveBeenCalledTimes(1)
+
+    const row = await getPendingOperation(executor, id)
+    expect(row?.status).toBe("failed")
+    expect(row?.attempts).toBe(0)
+    expect(row?.last_error).toContain("ErrorItemNotFound")
+
+    // Nothing pending left and a later pass never executes the op again.
+    expect(await listPendingOperations(executor, accountId)).toHaveLength(0)
+    const second = await processQueue(options())
+    expect(second.attempted).toBe(0)
+    expect(provider.moveToFolder).toHaveBeenCalledTimes(1)
+  })
+
+  it("treats Graph 403 the same terminal way but keeps retrying other failures", async () => {
+    const provider = useFakeProvider(accountId, "microsoft")
+    provider.moveToFolder = vi.fn(async () => {
+      throw new GraphApiError(403, "Graph failed with 403 [ErrorAccessDenied]")
+    })
+    const id = await enqueueMove(executor, accountId, inboxRef, "Archive")
+
+    const result = await processQueue(options())
+    expect(result.failed).toBe(1)
+    expect(result.requeued).toBe(0)
+    const row = await getPendingOperation(executor, id)
+    expect(row?.status).toBe("failed")
+    expect(provider.moveToFolder).toHaveBeenCalledTimes(1)
   })
 
   it("holds the FIFO position while an operation retries", async () => {

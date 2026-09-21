@@ -38,6 +38,29 @@ export type {
 } from "./add-gmail"
 
 export {
+  MICROSOFT_AUTH_ENDPOINT,
+  MICROSOFT_SCOPES,
+  buildMicrosoftAuthUrl,
+  runMicrosoftConsent,
+} from "./microsoft-oauth"
+export type {
+  MicrosoftAuthUrlInput,
+  MicrosoftConsentResult,
+  RunMicrosoftConsentOptions,
+} from "./microsoft-oauth"
+
+export {
+  addMicrosoftAccount,
+  fetchMicrosoftProfile,
+} from "./add-microsoft"
+export type {
+  AddMicrosoftOptions,
+  AddMicrosoftResult,
+  MicrosoftFlowStep,
+  MicrosoftProfile,
+} from "./add-microsoft"
+
+export {
   ImapTestFailedError,
   MissingSettingsError,
   SmtpTestFailedError,
@@ -59,8 +82,13 @@ export {
   AccountTypeError,
   reauthGmailAccount,
   reauthImapPassword,
+  reauthMicrosoftAccount,
 } from "./reauth"
-export type { ReauthGmailOptions, ReauthResult } from "./reauth"
+export type {
+  ReauthGmailOptions,
+  ReauthMicrosoftOptions,
+  ReauthResult,
+} from "./reauth"
 
 export {
   KNOWN_PROVIDERS,
@@ -72,6 +100,8 @@ export {
   discoverByDomain,
   discoverByEmail,
   extractDomain,
+  isMicrosoftGraphDomain,
+  isMicrosoftGraphEmail,
 } from "./provider-discovery"
 export type {
   DiscoveredSettings,

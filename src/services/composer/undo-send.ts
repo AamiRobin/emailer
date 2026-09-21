@@ -119,6 +119,13 @@ export function sendWithUndoDelay(
     // passphrase the composer collected) MUST ride the frozen args — the
     // expiry fires them, and the passphrase exists only in memory.
     ...(args.pgp !== undefined ? { pgp: args.pgp } : {}),
+    // Batch C2 (Send & Archive): the source-thread archive rides the
+    // frozen args for the same reason as `pgp` — the expiry is the point
+    // where the send (and therefore its archive) actually happens; a
+    // cancelled window must archive nothing.
+    ...(args.archiveSourceThreadId !== undefined
+      ? { archiveSourceThreadId: args.archiveSourceThreadId }
+      : {}),
     // Task 16.2: the alias From identity rides too (same reason as `pgp`
     // above) — an undo-window expiry re-enters sendComposerDraft, and
     // without it the delayed send would silently lose the alias an

@@ -263,6 +263,30 @@ describe("search UI: submit and clear-to-previous-view (9.2)", () => {
     expect(useUiStore.getState().view).toEqual(DEFAULT_VIEW)
     expect(screen.queryByTestId("search-query-chip")).toBeNull()
   })
+
+  it("submits on Enter in the field (the webview has no implicit submission)", async () => {
+    await seedMailbox()
+    const { container } = render(<MailShell />)
+    await waitFor(() =>
+      expect(container.querySelector("[data-thread-row]")).not.toBeNull()
+    )
+
+    // The form has no submit button, and neither the webview nor jsdom
+    // performs the browser's implicit Enter submission — the field's
+    // keydown handler must submit it explicitly.
+    fireEvent.change(screen.getByLabelText("Search mail"), {
+      target: { value: "invoice" },
+    })
+    fireEvent.keyDown(screen.getByLabelText("Search mail"), { key: "Enter" })
+
+    await waitFor(() =>
+      expect(useUiStore.getState().view).toEqual({
+        kind: "search",
+        query: "invoice",
+      })
+    )
+    expect(await screen.findByTestId("search-query-chip")).toBeTruthy()
+  })
 })
 
 describe("offline banner (6.8)", () => {
@@ -461,5 +485,35 @@ describe("palette, composer and toaster mounts", () => {
       expect(screen.queryByTestId("composer-overlay")).toBeNull()
     )
     expect(useUiStore.getState().composerOpen).toBe(false)
+  })
+
+  it("minimize hides the centered overlay — `hidden` must win over the centering `flex`", async () => {
+    await seedMailbox()
+    render(<MailShell />)
+    act(() => {
+      useUiStore.getState().setComposerOpen(true)
+      useUiStore.getState().setComposerMode("centered")
+    })
+    await screen.findByTestId("composer-overlay")
+    // Regression (batch C2 follow-up): `flex` and `hidden` are both
+    // display utilities — with both on the overlay the stylesheet order
+    // decided, `flex` won, and the minimized card stayed on screen next
+    // to the tray chip. The centering classes must drop out while
+    // minimized so `hidden` is the only display class left.
+    act(() => {
+      useComposerStore.getState().minimize()
+    })
+    const overlay = await screen.findByTestId("composer-overlay")
+    expect(overlay.className).toContain("hidden")
+    expect(overlay.className).not.toContain("flex")
+    // Restoring brings the centering layout back.
+    act(() => {
+      useComposerStore.getState().restore()
+    })
+    await waitFor(() => {
+      const restored = screen.getByTestId("composer-overlay")
+      expect(restored.className).toContain("flex")
+      expect(restored.className).not.toContain("hidden")
+    })
   })
 })

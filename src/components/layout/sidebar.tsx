@@ -3,10 +3,12 @@ import { useDroppable } from "@dnd-kit/core"
 import {
   BellRing,
   BookUser,
+  Calendar,
   CirclePlus,
   Layers,
   PanelLeftClose,
   PanelLeftOpen,
+  Paperclip,
   Settings,
   SquarePen,
   Zap,
@@ -45,6 +47,7 @@ import {
 import { SavedSearchesSection } from "./saved-searches-section"
 import { ScheduledSendsSection } from "./scheduled-sends-dialog"
 import { SnoozedSection } from "./snoozed-section"
+import { TasksSection } from "./tasks-section"
 import { TodosSection } from "./todos-section"
 import { FOLDER_ITEMS } from "./folders"
 
@@ -207,6 +210,29 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
   const contactsActive = view.kind === "contacts"
   const enterContacts = () => {
     setView({ kind: "contacts" })
+  }
+  // Attachments entry (task 3.7, design D14): the CURRENT account's
+  // attachments behind the ui-store "attachments" view — the same
+  // settings-style full-pane browser as Contacts, scoped to the active
+  // account (the hook re-queries on account switches).
+  const attachmentsAvailable = accounts.some(
+    (account) => account.status === "active"
+  )
+  const attachmentsActive = view.kind === "attachments"
+  const enterAttachments = () => {
+    setView({ kind: "attachments" })
+  }
+  // Calendar entry (task 5.3, design D5): the month/week/day calendar view
+  // behind the ui-store "calendar" view — the same settings-style
+  // full-pane surface as Contacts/Attachments, rendering the cached
+  // calendar_events of every connected source. Renders with 1+ active
+  // accounts like the other aggregate entries.
+  const calendarAvailable = accounts.some(
+    (account) => account.status === "active"
+  )
+  const calendarActive = view.kind === "calendar"
+  const enterCalendar = () => {
+    setView({ kind: "calendar" })
   }
   const enterUnifiedInbox = () => {
     useUiStore.getState().setListScope({ kind: "unified" })
@@ -470,6 +496,92 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
                 Contacts
               </button>
             ))}
+          {/* Attachments (task 3.7, design D14): the current account's
+              attachment index behind the ui-store "attachments" view —
+              the settings-style full-pane browser (search/type filters/
+              grid-list/preview/save/jump-to-source). Sits with the other
+              aggregate entries and renders with 1+ active accounts, in
+              both layouts like Contacts above. */}
+          {attachmentsAvailable &&
+            (isCollapsed ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Attachments"
+                      aria-current={attachmentsActive ? "true" : undefined}
+                      className={cn(
+                        buttonVariants({ variant: "ghost", size: "icon-lg" }),
+                        "mx-auto",
+                        attachmentsActive && "bg-muted text-foreground"
+                      )}
+                      onClick={enterAttachments}
+                    >
+                      <Paperclip />
+                    </button>
+                  }
+                />
+                <TooltipContent side="right">Attachments</TooltipContent>
+              </Tooltip>
+            ) : (
+              <button
+                type="button"
+                aria-current={attachmentsActive ? "true" : undefined}
+                className={cn(
+                  buttonVariants({ variant: "ghost", size: "sm" }),
+                  "w-full justify-start",
+                  attachmentsActive && "bg-muted text-foreground"
+                )}
+                onClick={enterAttachments}
+              >
+                <Paperclip />
+                Attachments
+              </button>
+            ))}
+          {/* Calendar (task 5.3, design D5): the connected calendars'
+              month/week/day view behind the ui-store "calendar" view — the
+              settings-style full-pane browser (today/prev/next by unit,
+              all-day row, per-calendar colors, cached offline ranges).
+              Sits with the other aggregate entries and renders with 1+
+              active accounts, in both layouts like Attachments above. */}
+          {calendarAvailable &&
+            (isCollapsed ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Calendar"
+                      aria-current={calendarActive ? "true" : undefined}
+                      className={cn(
+                        buttonVariants({ variant: "ghost", size: "icon-lg" }),
+                        "mx-auto",
+                        calendarActive && "bg-muted text-foreground"
+                      )}
+                      onClick={enterCalendar}
+                    >
+                      <Calendar />
+                    </button>
+                  }
+                />
+                <TooltipContent side="right">Calendar</TooltipContent>
+              </Tooltip>
+            ) : (
+              <button
+                type="button"
+                aria-current={calendarActive ? "true" : undefined}
+                className={cn(
+                  buttonVariants({ variant: "ghost", size: "sm" }),
+                  "w-full justify-start",
+                  calendarActive && "bg-muted text-foreground"
+                )}
+                onClick={enterCalendar}
+              >
+                <Calendar />
+                Calendar
+              </button>
+            ))}
           {FOLDER_ITEMS.map((item) =>
             isCollapsed ? (
               <Tooltip key={item.countKey}>
@@ -535,6 +647,15 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
             expanded (discoverable before the first scheduled send); the
             badge counts pending rows. */}
         {!isCollapsed && <ScheduledSendsSection />}
+        {/* Tasks (task 5.7, design D6): the task manager's sidebar home —
+            open tasks across ALL accounts with due/overdue ordering, the
+            one-action "Today & overdue" filter, completion and the
+            completed disclosure. Deliberately coexists with the
+            lightweight Todos section below it, and — unlike that
+            ephemeral inventory — renders ALWAYS (with an empty state)
+            while expanded, yielding to the icon rail like the other user
+            sections. */}
+        {!isCollapsed && <TasksSection />}
         {/* Todos (task 15.2): pending threads across ALL accounts, each
             row completing/reordering/removing in place — renders only
             while pending todos exist, like the Snoozed section. */}

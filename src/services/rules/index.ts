@@ -16,6 +16,10 @@ export {
   type RuleRow,
 } from "./db"
 export { parseRuleCriteria, messageMatchesCriteria } from "./criteria"
+// The condition-operator vocabulary (parity-round-2 task 2.5) joins the
+// barrel: the rule-assist prompt composes from it, beside the action
+// vocabulary it already reads from here.
+export { RULE_CONDITION_OPERATORS } from "./criteria"
 export {
   applyRuleActions,
   parseActionsJson,
@@ -24,6 +28,10 @@ export {
   type RuleAction,
   type RuleActionType,
 } from "./actions"
+// The category vocabulary the set_category action names (task 3.4) —
+// re-exported so the rules UI (dialog select, action chips) reads it from
+// the rules module it belongs to.
+export { CATEGORIES, type Category } from "../categorization/classify"
 export {
   runIngestionRules,
   applyBlockedSenderFiling,

@@ -10,6 +10,7 @@ import {
   setSetting,
   SETTINGS_KEYS,
 } from "../db/settings"
+import { playNewMailSound } from "./sounds"
 
 /**
  * New-mail OS notifications (task 4.6). The sync scheduler calls
@@ -29,6 +30,15 @@ import {
  * Bodies never contain message content — only a count and the account
  * email. This module never rejects: a failed settings read fails open
  * (the default is on) and notification failures are swallowed.
+ *
+ * Sound (task 1.5, settings spec, design D12): the new-mail chime is
+ * requested ONLY at the point below — after every gate passed and the OS
+ * notification was handed over — so the sync engines' "never notify"
+ * rules and the mute gate (which zero the count before this module is
+ * called), the notifications setting, a permission denial and the
+ * coalescing window all silence the sound exactly as they silence the
+ * banner. The chime consults its own sound toggle (sounds.ts) and never
+ * throws.
  */
 
 const SETTING_CACHE_TTL_MS = 30_000
@@ -135,8 +145,12 @@ export async function notifyNewMail(event: NewMailEvent): Promise<void> {
           ? `1 new message for ${event.accountEmail}`
           : `${event.count} new messages for ${event.accountEmail}`,
     })
+    // Only here — the banner is out, so the chime may follow (sounds.ts
+    // still honors its own toggle and never throws).
+    void playNewMailSound()
   } catch {
-    // No OS notification center (or plugin failure) — nothing to do.
+    // No OS notification center (or plugin failure) — nothing to do, and
+    // no chime either: the sound follows the banner, never precedes it.
   }
 }
 

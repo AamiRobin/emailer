@@ -25,6 +25,9 @@ import { getSetting, setSetting } from "../db/settings"
  * markup only (`<p>` + `<br>`), so it survives the email sanitizer. */
 export const COMPOSER_BLOCK_SEPARATOR = "<p><br></p>"
 
+/** The class marking the managed signature block in a composed body. */
+export const SIGNATURE_BLOCK_CLASS = "emailer-signature"
+
 /** Settings key holding an account's signature payload. */
 export function signatureSettingKey(accountId: string): string {
   return `signature:${accountId}`
@@ -85,7 +88,7 @@ export function appendSignature(
 ): string {
   const signature = signatureHtml.trim()
   if (!signature) return bodyHtml
-  const signatureBlock = `<div class="emailer-signature">${signature}</div>`
+  const signatureBlock = `<div class="${SIGNATURE_BLOCK_CLASS}">${signature}</div>`
   const body = bodyHtml.trim()
   if (!body) return signatureBlock
 
@@ -104,4 +107,83 @@ export function appendSignature(
  * with one, so the gap never doubles up. */
 function separatorAfter(html: string): string {
   return html.endsWith(COMPOSER_BLOCK_SEPARATOR) ? "" : COMPOSER_BLOCK_SEPARATOR
+}
+
+// ---------------------------------------------------------------------------
+// Managed-block replacement (composer batch C1, fix 3)
+// ---------------------------------------------------------------------------
+
+/** The managed block's opening tag, as appendSignature emits it. */
+const SIGNATURE_BLOCK_OPEN = new RegExp(
+  `<div\\s+class=(?:"${SIGNATURE_BLOCK_CLASS}"|'${SIGNATURE_BLOCK_CLASS}')`,
+  "i"
+)
+
+/** One `<div …>` open or `</div>` close token, for the balance scan. */
+const DIV_TOKEN = /<\/?div\b[^>]*>/gi
+
+/**
+ * Locate the managed signature block in a body: the first
+ * `div.emailer-signature` open tag plus its MATCHING close — the
+ * signature HTML may itself contain nested divs, so a naive regex for
+ * `</div>` would cut the block short. Returns the [start, end) range
+ * covering the whole `<div …>…</div>`, or null when the body has no
+ * managed block (or an unbalanced one, which is treated the same —
+ * corrupt markup is never edited by these helpers).
+ */
+function findSignatureBlockRange(html: string): {
+  start: number
+  end: number
+} | null {
+  const open = SIGNATURE_BLOCK_OPEN.exec(html)
+  if (!open) return null
+  const tokens = DIV_TOKEN
+  tokens.lastIndex = open.index + open[0].length
+  let depth = 1
+  let match: RegExpExecArray | null
+  while ((match = tokens.exec(html)) !== null) {
+    depth += match[0].startsWith("</") ? -1 : 1
+    if (depth === 0) {
+      return { start: open.index, end: match.index + match[0].length }
+    }
+  }
+  return null
+}
+
+/**
+ * Remove the managed signature block from a body (and ONE adjacent
+ * separator, so no double blank line is left behind). A body without a
+ * managed block is returned unchanged; user text above/below the block
+ * is preserved byte-for-byte. Pure string work.
+ */
+export function removeSignatureBlock(bodyHtml: string): string {
+  const range = findSignatureBlockRange(bodyHtml)
+  if (!range) return bodyHtml
+  let before = bodyHtml.slice(0, range.start)
+  let after = bodyHtml.slice(range.end)
+  if (before.endsWith(COMPOSER_BLOCK_SEPARATOR)) {
+    before = before.slice(0, -COMPOSER_BLOCK_SEPARATOR.length)
+  } else if (after.startsWith(COMPOSER_BLOCK_SEPARATOR)) {
+    after = after.slice(COMPOSER_BLOCK_SEPARATOR.length)
+  }
+  return `${before}${after}`
+}
+
+/**
+ * Replace whatever managed signature block the body holds with
+ * `signatureHtml`, placed by the same composition rule appendSignature
+ * uses — end of body for new mail, [body][signature][quote] when a
+ * quoted history is present. An empty `signatureHtml` ("No signature")
+ * just removes the existing block, keeping the user's text. This is the
+ * per-message selector's whole write path: re-selecting an account swaps
+ * the block without touching anything above it.
+ */
+export function insertSignatureBlock(
+  bodyHtml: string,
+  signatureHtml: string
+): string {
+  const withoutOld = removeSignatureBlock(bodyHtml)
+  const signature = signatureHtml.trim()
+  if (!signature) return withoutOld
+  return appendSignature(withoutOld, signature)
 }

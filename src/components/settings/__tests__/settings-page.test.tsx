@@ -235,6 +235,7 @@ describe("settings page navigation", () => {
       "Appearance",
       "Reading",
       "Notifications",
+      "Subscriptions",
       "Auto-archive",
       "Shortcuts",
       "Snippets",
@@ -255,6 +256,10 @@ describe("settings page navigation", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Auto-archive" }))
     expect(screen.getByRole("heading", { name: "Auto-archive" })).toBeTruthy()
+
+    // Subscription manager (task 3.6): the settings entry point.
+    fireEvent.click(screen.getByRole("button", { name: "Subscriptions" }))
+    expect(screen.getByRole("heading", { name: "Subscriptions" })).toBeTruthy()
 
     fireEvent.click(screen.getByRole("button", { name: "Shortcuts" }))
     expect(screen.getByRole("heading", { name: "Shortcuts" })).toBeTruthy()
@@ -346,6 +351,28 @@ describe("appearance section", () => {
     ).toBe("true")
     await waitFor(async () => {
       expect(await getAccentPreference(executor)).toBe("blue")
+    })
+  })
+
+  it("the eighth color accent (cyan) applies data-accent live and persists", async () => {
+    render(<SettingsPage />)
+    openAppearance()
+
+    // Task 2.6: nine registry entries (neutral + eight color accents) render
+    // as swatch buttons in the accent group.
+    const group = screen.getByRole("group", { name: "Accent color" })
+    expect(group.querySelectorAll("button")).toHaveLength(9)
+
+    fireEvent.click(screen.getByRole("button", { name: "Accent: Cyan" }))
+
+    expect(document.documentElement.getAttribute("data-accent")).toBe("cyan")
+    expect(
+      screen
+        .getByRole("button", { name: "Accent: Cyan" })
+        .getAttribute("aria-pressed")
+    ).toBe("true")
+    await waitFor(async () => {
+      expect(await getAccentPreference(executor)).toBe("cyan")
     })
   })
 

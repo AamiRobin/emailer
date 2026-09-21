@@ -77,6 +77,9 @@ function routeConsent(
   callback?: (state: string | null) => OauthCallback
 ): void {
   invokeMock.mockImplementation(((command: string) => {
+    if (command === "find_free_loopback_port") {
+      return Promise.resolve(17248)
+    }
     if (command !== "start_oauth_server") {
       return Promise.reject(new Error(`unexpected command: ${command}`))
     }

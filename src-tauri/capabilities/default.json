@@ -1,9 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. Notes: opener:allow-open-path exists for the attachments feature (src/services/attachments/file-actions.ts) \u2014 opening downloaded/cache files with the OS default app. It is path-scoped to $APPDATA/** (the attachment cache subtree the feature actually opens); the mock/dev note that it 'cannot be narrowed' is outdated \u2014 tauri-plugin-opener supports path scopes and every openPath call site targets <appData>/attachment_cache. http:default is limited to the Google API hosts the Gmail REST client calls (token-manager.ts, gmail-api.ts, add-gmail.ts) plus www.virustotal.com for the opt-in attachment malware hash lookup (src/services/attachments/malware-lookup.ts \u2014 hash-only GETs, no content upload); the OAuth authorization URL is opened in the system browser, not via plugin-http. The https://* entry exists for the RFC 8058 one-click unsubscribe POST (task 18.3, security/unsubscribe.ts): its targets are List-Unsubscribe URLs owned by arbitrary mailing-list servers, so the host set is unbounded by design \u2014 the request itself is user-initiated, form-encoded (`List-Unsubscribe=One-Click`), and carries no credentials or message content. sql:default is read-only (close/load/select); sql:allow-execute is required because the DB layer writes (migrations, message ingestion, settings) through database.execute \u2014 without it every write is ACL-denied in the packaged app (the mock harness masks this by replacing plugin-sql). fs:allow-open exists for data portability (tasks 19.2\u201319.4): the mbox exporter streams through a plugin-fs file handle (`open`, src/services/data-portability/mbox.ts) \u2014 its sibling write commands (write/remove) already ride fs:allow-appdata-write-recursive's write-all set, but `open` sits in the fs command model's read family and needs this permission. The command stays path-scope-gated at runtime \u2014 the dialog plugin adds every picked/saved path to the fs scope for the session (unpersisted; see @tauri-apps/plugin-dialog dist-js) \u2014 so no $HOME scope is granted. The import parser reads picked .eml/.mbox files Rust-side (mail_import.rs std::fs) and needs no fs permission at all.",
+  "description": "Capability for the main window. Notes: opener:allow-open-path exists for the attachments feature (src/services/attachments/file-actions.ts) \u2014 opening downloaded/cache files with the OS default app. It is path-scoped to $APPDATA/** (the attachment cache subtree the feature actually opens); the mock/dev note that it 'cannot be narrowed' is outdated \u2014 tauri-plugin-opener supports path scopes and every openPath call site targets <appData>/attachment_cache. http:default is limited to the Google API hosts the Gmail REST client calls (token-manager.ts, gmail-api.ts, add-gmail.ts) plus www.virustotal.com for the opt-in attachment malware hash lookup (src/services/attachments/malware-lookup.ts \u2014 hash-only GETs, no content upload); the OAuth authorization URL is opened in the system browser, not via plugin-http. The https://* entry exists for the RFC 8058 one-click unsubscribe POST (task 18.3, security/unsubscribe.ts): its targets are List-Unsubscribe URLs owned by arbitrary mailing-list servers, so the host set is unbounded by design \u2014 the request itself is user-initiated, form-encoded (`List-Unsubscribe=One-Click`), and carries no credentials or message content. sql:default is read-only (close/load/select); sql:allow-execute is required because the DB layer writes (migrations, message ingestion, settings) through database.execute \u2014 without it every write is ACL-denied in the packaged app (the mock harness masks this by replacing plugin-sql). fs:allow-open exists for data portability (tasks 19.2\u201319.4): the mbox exporter streams through a plugin-fs file handle (`open`, src/services/data-portability/mbox.ts) \u2014 its sibling write commands (write/remove) already ride fs:allow-appdata-write-recursive's write-all set, but `open` sits in the fs command model's read family and needs this permission. The command stays path-scope-gated at runtime \u2014 the dialog plugin adds every picked/saved path to the fs scope for the session (unpersisted; see @tauri-apps/plugin-dialog dist-js) \u2014 so no $HOME scope is granted. The import parser reads picked .eml/.mbox files Rust-side (mail_import.rs std::fs) and needs no fs permission at all. The five window/webview entries after start-dragging exist for the composer pop-out window (batch C2, composer-popout.tsx + services/desktop/popout.ts openComposerPopout): the window is created from the JS WebviewWindow API with a `popout-composer-<draftKey>` label (already covered by the popout-* window pattern above) — allow-create-webview-window creates it, allow-get-all-windows powers the getByLabel reuse check, and show/set-focus/unminimize focus an existing composer pop-out instead of stacking a second one.",
   "windows": [
-    "main"
+    "main",
+    "popout-*"
   ],
   "permissions": [
     "core:default",
@@ -42,6 +43,17 @@
     "fs:allow-appdata-write-recursive",
     "fs:allow-open",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "autostart:default",
+    "deep-link:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:window:allow-unminimize",
+    "core:window:allow-get-all-windows",
+    "core:webview:allow-create-webview-window"
   ]
 }

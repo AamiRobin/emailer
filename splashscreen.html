@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Emailer</title>
+    <!--
+      Splash screen (task 1.7, spec mailbox-ui "Splash screen"): shown
+      immediately at cold start while the main webview loads and the
+      database boots. Pure static markup — no script, so it satisfies the
+      strict CSP (no inline script hashes needed) and can never error.
+      The window closes from the Rust side: shell-ready via the
+      close_splashscreen command, or the hard timeout (lib.rs).
+    -->
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #fafafa;
+      }
+      @media (prefers-color-scheme: dark) {
+        html,
+        body {
+          background: #171717;
+        }
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        color: #171717;
+        -webkit-user-select: none;
+        user-select: none;
+        cursor: default;
+      }
+      @media (prefers-color-scheme: dark) {
+        body {
+          color: #fafafa;
+        }
+      }
+      .box {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+      }
+      .logo {
+        width: 72px;
+        height: 72px;
+        border-radius: 18px;
+        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
+      }
+      .name {
+        font-size: 19px;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+      .spinner {
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        border: 2px solid rgba(0, 0, 0, 0.14);
+        border-top-color: rgba(0, 0, 0, 0.55);
+        animation: spin 0.9s linear infinite;
+      }
+      @media (prefers-color-scheme: dark) {
+        .spinner {
+          border-color: rgba(255, 255, 255, 0.18);
+          border-top-color: rgba(255, 255, 255, 0.7);
+        }
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="box" aria-label="Emailer is starting">
+      <img class="logo" src="/icon.png" alt="" draggable="false" />
+      <div class="name">Emailer</div>
+      <div class="spinner" role="status" aria-label="Loading"></div>
+    </div>
+  </body>
+</html>

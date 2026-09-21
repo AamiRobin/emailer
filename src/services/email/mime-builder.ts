@@ -239,6 +239,108 @@ function attachmentPart(attachment: OutgoingAttachment): string {
   ].join(CRLF)
 }
 
+// ---- Inline body images (batch C2) ----
+
+/**
+ * One inline image extracted from the composer's body HTML at MIME build
+ * time. The composer keeps `data:image/...;base64,` srcs everywhere
+ * (editor, drafts, undo snapshots); only this builder rewrites them to
+ * `cid:` references and emits the matching multipart/related parts.
+ */
+export interface InlineImagePart {
+  /** Content-ID header value WITH angle brackets ("<img-...@emailer>"). */
+  contentIdHeader: string
+  /** The cid: reference the HTML src was rewritten to (no brackets). */
+  contentId: string
+  mimeType: string
+  contentBase64: string
+  filename: string
+}
+
+/** Subtype → file extension for the inline part's name parameter. */
+function extensionForImageType(mimeType: string): string {
+  const subtype = mimeType.split("/")[1]?.split(".")[0] ?? "bin"
+  return subtype === "jpeg" ? "jpg" : subtype
+}
+
+const INLINE_IMAGE_ID_DOMAIN = "emailer"
+
+/**
+ * Extract every double-quoted `data:image/...;base64,` src from the body
+ * HTML, rewrite each to `src="cid:<generated id>"` and report the parts
+ * the builder must emit. Pure and order-stable: the parts come back in
+ * first-appearance order. Everything else in the HTML passes through
+ * byte-identical, so a body without data: images round-trips unchanged.
+ */
+export function extractInlineImages(html: string): {
+  html: string
+  images: InlineImagePart[]
+} {
+  const images: InlineImagePart[] = []
+  const rewritten = html.replace(
+    /src="data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)"/gi,
+    (_match, mimeType: string, base64: string) => {
+      const id = `img-${randomHex(8)}@${INLINE_IMAGE_ID_DOMAIN}`
+      images.push({
+        contentIdHeader: `<${id}>`,
+        contentId: id,
+        mimeType: mimeType.toLowerCase(),
+        contentBase64: base64,
+        filename: `image-${images.length + 1}.${extensionForImageType(mimeType.toLowerCase())}`,
+      })
+      return `src="cid:${id}"`
+    }
+  )
+  return { html: rewritten, images }
+}
+
+/** Cheap existence check (the imap provider routes such sends through the
+ * TS-built MIME instead of the Rust builder, which emits no related
+ * parts). */
+export function hasInlineImages(html: string | undefined | null): boolean {
+  return !!html && /src="data:image\/[^;]+;base64,/i.test(html)
+}
+
+/** One inline image part: base64 body, Content-ID for the cid: refs,
+ * Content-Disposition inline (NOT attachment — the decomposer and every
+ * receiving client key on the disposition). */
+function inlineImagePart(image: InlineImagePart): string {
+  const filename = formatFilenameParam(image.filename)
+  return [
+    `Content-Type: ${image.mimeType}; name=${filename}`,
+    `Content-Transfer-Encoding: base64`,
+    `Content-ID: ${image.contentIdHeader}`,
+    `Content-Disposition: inline; filename=${filename}`,
+    "",
+    wrapBase64Lines(image.contentBase64),
+  ].join(CRLF)
+}
+
+/**
+ * The multipart/related wrapper (batch C2): the alternative block (whose
+ * HTML carries the cid: refs) as part #1, one inline image part per
+ * extracted image after it. The caller owns the boundary so it can emit
+ * the matching top-level Content-Type.
+ */
+function relatedPart(
+  alternative: string,
+  images: InlineImagePart[],
+  boundary: string
+): string {
+  return [
+    `Content-Type: multipart/related; boundary="${boundary}"`,
+    "",
+    [
+      `--${boundary}${CRLF}${alternative}`,
+      ...images.map(
+        (image) => `--${boundary}${CRLF}${inlineImagePart(image)}`
+      ),
+    ].join(CRLF) +
+      CRLF +
+      `--${boundary}--`,
+  ].join(CRLF)
+}
+
 /**
  * The multipart/alternative body (generated plain text + HTML) as one
  * nested MIME part: the whole message when there are no attachments, and
@@ -265,8 +367,12 @@ function alternativePart(input: SendEmailInput, boundary: string): string {
  * multipart/alternative: the plain-text part is the explicit textBody or
  * one generated from the HTML; the HTML part is included when provided.
  * With attachments (task 8.5) that block is wrapped in multipart/mixed
- * with one base64 part per attachment. Bcc is kept in the MIME headers
- * (Gmail's messages.send delivers to MIME Bcc recipients).
+ * with one base64 part per attachment. With inline images (batch C2) the
+ * data-URL srcs in the HTML are extracted into Content-ID'd parts: the
+ * alternative block then nests inside multipart/related (top level when
+ * there are no attachments, inside the mixed wrapper otherwise — the
+ * standard mixed{related{alternative}} shape). Bcc is kept in the MIME
+ * headers (Gmail's messages.send delivers to MIME Bcc recipients).
  *
  * Design D10 (task 16.2): when the input carries `fromAlias`, the From
  * HEADER is built from the alias (address + display name) — send-as —
@@ -276,6 +382,16 @@ function alternativePart(input: SendEmailInput, boundary: string): string {
  */
 export function buildMimeMessage(input: SendEmailInput): BuiltMime {
   const messageId = input.messageId ?? generateMessageId(input.from.email)
+
+  // Inline images (batch C2): rewrite the body once, up front. When no
+  // data:image src is present the html string comes back identical, so
+  // the no-inline output stays byte-compatible with earlier versions.
+  const extracted = input.htmlBody
+    ? extractInlineImages(input.htmlBody)
+    : { html: input.htmlBody, images: [] as InlineImagePart[] }
+  const effective: SendEmailInput =
+    extracted.images.length > 0 ? { ...input, htmlBody: extracted.html } : input
+  const inlineImages = extracted.images
 
   const headers: string[] = []
   headers.push(`From: ${formatAddress(input.fromAlias ?? input.from)}`)
@@ -299,18 +415,47 @@ export function buildMimeMessage(input: SendEmailInput): BuiltMime {
   headers.push(`Message-ID: ${messageId}`)
   headers.push("MIME-Version: 1.0")
 
-  const attachments = input.attachments ?? []
+  const attachments = effective.attachments ?? []
   let body: string
-  if (attachments.length === 0) {
+  if (attachments.length === 0 && inlineImages.length === 0) {
     const boundary = `emailer_${randomHex(16)}`
     headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`)
-    body = alternativePart(input, boundary)
-  } else {
+    body = alternativePart(effective, boundary)
+  } else if (attachments.length === 0) {
+    // Inline images only: related at the top level.
+    const relatedBoundary = `emailer_${randomHex(16)}`
+    headers.push(
+      `Content-Type: multipart/related; boundary="${relatedBoundary}"`
+    )
+    body = relatedPart(
+      alternativePart(effective, `emailer_${randomHex(16)}`),
+      inlineImages,
+      relatedBoundary
+    )
+  } else if (inlineImages.length === 0) {
     const boundary = `emailer_${randomHex(16)}`
     headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`)
     body =
       [
-        `--${boundary}${CRLF}${alternativePart(input, `emailer_${randomHex(16)}`)}`,
+        `--${boundary}${CRLF}${alternativePart(effective, `emailer_${randomHex(16)}`)}`,
+        ...attachments.map(
+          (attachment) => `--${boundary}${CRLF}${attachmentPart(attachment)}`
+        ),
+      ].join(CRLF) +
+      CRLF +
+      `--${boundary}--`
+  } else {
+    // Attachments AND inline images: mixed{related{alternative}, images},
+    // then the file attachments.
+    const boundary = `emailer_${randomHex(16)}`
+    headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`)
+    body =
+      [
+        `--${boundary}${CRLF}${relatedPart(
+          alternativePart(effective, `emailer_${randomHex(16)}`),
+          inlineImages,
+          `emailer_${randomHex(16)}`
+        )}`,
         ...attachments.map(
           (attachment) => `--${boundary}${CRLF}${attachmentPart(attachment)}`
         ),
@@ -568,6 +713,13 @@ export function decomposeMimeMessage(mime: string): DecomposedMimeMessage {
   let partHeaders: string[] = []
   let partBody: string[] = []
   let inPartHeaders = false
+  /** Inline image parts (batch C2), collected for the cid: → data:
+   * restoration below (htmlBody may appear before its image parts). */
+  const inlineImages: {
+    contentId: string
+    mimeType: string
+    contentBase64: string
+  }[] = []
   const flushPart = (): void => {
     if (partHeaders.length === 0 && partBody.length === 0) return
     const headers = parseHeaderMap(partHeaders)
@@ -597,6 +749,18 @@ export function decomposeMimeMessage(mime: string): DecomposedMimeMessage {
       // Same decode as the html branch (base64 + UTF-8, the only shape
       // this app's builder emits) — shared with processor.ts.
       result.textBody = decodeBase64Utf8(base64)
+    } else if (/^image\//i.test(contentType.split(";")[0]?.trim() ?? "")) {
+      // Inline body images (batch C2): disposition inline, Content-ID
+      // addressed. Collected here, substituted into htmlBody after the
+      // walk (the alternative block precedes the image parts).
+      const mimeType = contentType.split(";")[0]?.trim() ?? ""
+      const contentId = (headers["content-id"] ?? "")
+        .trim()
+        .replace(/^<+/, "")
+        .replace(/>+$/, "")
+      if (contentId !== "") {
+        inlineImages.push({ contentId, mimeType, contentBase64: base64 })
+      }
     }
     partHeaders = []
     partBody = []
@@ -634,6 +798,19 @@ export function decomposeMimeMessage(mime: string): DecomposedMimeMessage {
     partBody.push(line)
   }
   flushPart()
+
+  // Inline images (batch C2): map every cid: ref back to its data URL so
+  // the edit round-trip keeps the pictures — the composer body carries
+  // data: srcs and never cid: ones.
+  if (result.htmlBody && inlineImages.length > 0) {
+    for (const image of inlineImages) {
+      const escaped = image.contentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      result.htmlBody = result.htmlBody.replace(
+        new RegExp(`cid:${escaped}`, "g"),
+        `data:${image.mimeType};base64,${image.contentBase64}`
+      )
+    }
+  }
 
   return result
 }

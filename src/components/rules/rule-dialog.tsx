@@ -22,11 +22,18 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { getExecutor } from "@/services/db/executor"
-import type { RuleAction, RuleActionType, RuleRow } from "@/services/rules"
+import type {
+  Category,
+  RuleAction,
+  RuleActionType,
+  RuleRow,
+} from "@/services/rules"
+import { CATEGORIES } from "@/services/rules"
 import { createRule, parseActionsJson, updateRule } from "@/services/rules"
 
 import {
   ACTION_TYPE_OPTIONS,
+  CATEGORY_LABELS,
   CRITERIA_HELP,
   queryFromCriteriaJson,
 } from "./rule-actions-ui"
@@ -61,13 +68,14 @@ function splitLabels(input: string): string[] {
 }
 
 /** One action row in the dialog's local draft state — the type-specific
- * payloads (labels, folder) ride along as raw strings, split/trimmed only
- * at save time. */
+ * payloads (labels, folder, category) ride along as raw strings, split/
+ * trimmed only at save time. */
 interface ActionDraft {
   key: string
   type: RuleActionType
   labels: string
   folder: string
+  category: string
 }
 
 let draftKeySequence = 0
@@ -78,7 +86,13 @@ function nextDraftKey(): string {
 }
 
 function newActionDraft(type: RuleActionType = "archive"): ActionDraft {
-  return { key: nextDraftKey(), type, labels: "", folder: "" }
+  return {
+    key: nextDraftKey(),
+    type,
+    labels: "",
+    folder: "",
+    category: "primary",
+  }
 }
 
 function draftsFromActions(actions: RuleAction[]): ActionDraft[] {
@@ -88,6 +102,8 @@ function draftsFromActions(actions: RuleAction[]): ActionDraft[] {
     type: action.type,
     labels: (action.labels ?? []).join(", "),
     folder: action.folder ?? "",
+    // parseActionsJson only admits known categories; default for safety.
+    category: action.category ?? "primary",
   }))
 }
 
@@ -116,6 +132,8 @@ export function RuleDialog({
   accountId,
   target,
   initialCriteria = "",
+  initialName = "",
+  initialActions,
   onOpenChange,
   onSaved,
 }: {
@@ -124,11 +142,18 @@ export function RuleDialog({
   /** Criteria the form starts from in add mode — the search row prefills
    * it with the active query; Settings adds with it empty. */
   initialCriteria?: string
+  /** Add-mode prefill for the rule name (parity-round-2 task 2.5: the
+   * natural-language candidate's translated name). */
+  initialName?: string
+  /** Add-mode prefill for the action rows (task 2.5: the translated
+   * candidate's actions, all pre-validated by the rule-assist service).
+   * Empty/omitted starts with one default row, as before. */
+  initialActions?: RuleAction[]
   onOpenChange: (open: boolean) => void
   onSaved: () => void
 }) {
   const editing = target.mode === "edit" ? target.rule : null
-  const [name, setName] = useState(editing?.name ?? "")
+  const [name, setName] = useState(editing?.name ?? initialName)
   const initial = initialCriteriaState(
     editing ? queryFromCriteriaJson(editing.criteria_json) : initialCriteria
   )
@@ -136,7 +161,11 @@ export function RuleDialog({
   const [criteria, setCriteria] = useState(initial.criteria)
   const [advanced, setAdvanced] = useState(initial.advanced)
   const [drafts, setDrafts] = useState<ActionDraft[]>(() =>
-    draftsFromActions(editing ? parseActionsJson(editing.actions_json) : [])
+    draftsFromActions(
+      editing
+        ? parseActionsJson(editing.actions_json)
+        : (initialActions ?? [])
+    )
   )
   const [enabled, setEnabled] = useState(editing ? editing.enabled === 1 : true)
   const [saving, setSaving] = useState(false)
@@ -201,6 +230,9 @@ export function RuleDialog({
       }
       if (draft.type === "move") {
         return { type: draft.type, folder: draft.folder.trim() }
+      }
+      if (draft.type === "set_category") {
+        return { type: draft.type, category: draft.category as Category }
       }
       return { type: draft.type }
     })
@@ -472,6 +504,31 @@ export function RuleDialog({
                     }
                     placeholder="Folder path, e.g. Archive/2024"
                   />
+                )}
+                {draft.type === "set_category" && (
+                  // Task 3.4 (design D4): the category the rule names.
+                  // Always has a value (the draft defaults to primary), so
+                  // no filled-check gates saving.
+                  <Select
+                    value={draft.category}
+                    onValueChange={(value) =>
+                      updateDraft(draft.key, { category: value ?? "primary" })
+                    }
+                  >
+                    <SelectTrigger
+                      aria-label={`Action ${index + 1} category`}
+                      className="w-40 shrink-0"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {CATEGORIES.map((category) => (
+                        <SelectItem key={category} value={category}>
+                          {CATEGORY_LABELS[category]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 )}
                 <Button
                   type="button"

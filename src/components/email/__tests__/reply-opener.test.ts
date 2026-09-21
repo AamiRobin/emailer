@@ -7,7 +7,11 @@ import {
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
 import { saveDraft } from "@/services/composer/drafts"
+import {
+  syncDraftAttachmentBytes,
+} from "@/services/composer/draft-attachments"
 import { setSignature } from "@/services/composer/signatures"
+import { setAttachmentBytes, getAttachmentBytes, clearAttachmentBytes } from "@/components/composer/attachment-bytes"
 import { updateMessage } from "@/services/db/messages"
 import {
   setAccountStoreExecutor,
@@ -90,6 +94,7 @@ beforeEach(() => {
 afterEach(async () => {
   // Let in-flight promise chains settle against the live executor.
   await new Promise((resolve) => setTimeout(resolve, 0))
+  clearAttachmentBytes()
   setThreadListStoreExecutor(null)
   setAccountStoreExecutor(null)
   setFolderCountsStoreExecutor(null)
@@ -326,5 +331,141 @@ describe("draft resume (openDraftForResume / resumeDraft)", () => {
     expect(resumed).toBe(false)
     expect(useComposerStore.getState().open).toBe(false)
     expect(useUiStore.getState().composerOpen).toBe(false)
+  })
+
+  it("resumes persisted attachment bytes into the session registry", async () => {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+    setAttachmentBytes("att-1", new Uint8Array([9, 8]))
+    await syncDraftAttachmentBytes(executor, accountId, "draft-key-bytes", [
+      {
+        id: "att-1",
+        name: "notes.txt",
+        size: 2,
+        mimeType: "text/plain",
+      },
+    ])
+    const saved = await saveDraft(executor, {
+      accountId,
+      draftKey: "draft-key-bytes",
+      draft: {
+        to: [],
+        cc: [],
+        bcc: [],
+        subject: "bytes",
+        bodyHtml: "",
+        attachments: [{ filename: "notes.txt", size: 2 }],
+      },
+    })
+    // Session loss: the registry must be repopulated from the store.
+    clearAttachmentBytes()
+
+    const resumed = await resumeDraft(executor, saved.id)
+
+    expect(resumed).toBe(true)
+    const composer = useComposerStore.getState()
+    expect(composer.attachments).toEqual([
+      { id: "att-1", name: "notes.txt", size: 2, mimeType: "text/plain" },
+    ])
+    expect(getAttachmentBytes("att-1")).toEqual(new Uint8Array([9, 8]))
+  })
+
+  it("drops a corrupt stored attachment with a warning and resumes the draft", async () => {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+    await syncDraftAttachmentBytes(executor, accountId, "draft-key-corrupt", [
+      { id: "att-bad", name: "bad.bin", size: 2 },
+    ])
+    const saved = await saveDraft(executor, {
+      accountId,
+      draftKey: "draft-key-corrupt",
+      draft: {
+        to: [],
+        cc: [],
+        bcc: [],
+        subject: "keep the text",
+        bodyHtml: "<p>text</p>",
+        attachments: [{ filename: "bad.bin", size: 2 }],
+      },
+    })
+    await executor.execute(
+      "UPDATE draft_attachments SET content_base64 = '!!!' WHERE id = 'att-bad'"
+    )
+
+    const resumed = await resumeDraft(executor, saved.id)
+
+    expect(resumed).toBe(true)
+    const composer = useComposerStore.getState()
+    // The attachment is gone; the draft itself is fully intact.
+    expect(composer.attachments).toEqual([])
+    expect(composer.subject).toBe("keep the text")
+    expect(composer.html).toBe("<p>text</p>")
+  })
+})
+
+describe("signature selection defaults (batch C1, fix 3)", () => {
+  it("a reply prefill selects the account's embedded signature", async () => {
+    const { threadId } = await seedReplyThread()
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+    await setSignature(executor, accountId, "<p>Best, Me</p>")
+
+    await openReplyForThread({ threadId, replyAll: false })
+
+    const composer = useComposerStore.getState()
+    expect(composer.html).toContain("Best, Me")
+    expect(composer.signatureSelection).toBe(accountId)
+  })
+
+  it("a reply without an account signature selects No signature", async () => {
+    const { threadId } = await seedReplyThread()
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+
+    await openReplyForThread({ threadId, replyAll: false })
+
+    expect(useComposerStore.getState().signatureSelection).toBeNull()
+  })
+
+  it("resume reflects the stored managed block in the selection", async () => {
+    const { threadId } = await seedReplyThread()
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+    const withBlock = await saveDraft(executor, {
+      accountId,
+      draftKey: "draft-key-sig-1",
+      draft: {
+        to: [],
+        cc: [],
+        bcc: [],
+        subject: "signed",
+        bodyHtml:
+          '<p>text</p><div class="emailer-signature"><p>Best, Me</p></div>',
+        threadId,
+      },
+    })
+    const withoutBlock = await saveDraft(executor, {
+      accountId,
+      draftKey: "draft-key-sig-2",
+      draft: {
+        to: [],
+        cc: [],
+        bcc: [],
+        subject: "unsigned",
+        bodyHtml: "<p>text</p>",
+        threadId,
+      },
+    })
+
+    await resumeDraft(executor, withBlock.id)
+    expect(useComposerStore.getState().signatureSelection).toBe(accountId)
+
+    await resumeDraft(executor, withoutBlock.id)
+    expect(useComposerStore.getState().signatureSelection).toBeNull()
   })
 })

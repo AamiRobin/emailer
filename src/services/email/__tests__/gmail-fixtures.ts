@@ -42,6 +42,8 @@ export interface MockReply {
   status?: number
   json?: unknown
   text?: string
+  /** Extra response headers (e.g. Retry-After for throttle fixtures). */
+  headers?: Record<string, string>
 }
 
 export type MockRouteHandler = (request: RecordedRequest) => MockReply
@@ -104,7 +106,7 @@ export function createFetchMock(): FetchMock {
     const reply = route.handler(calls[calls.length - 1])
     return new Response(reply.text ?? JSON.stringify(reply.json ?? {}), {
       status: reply.status ?? 200,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...reply.headers },
     })
   }
 

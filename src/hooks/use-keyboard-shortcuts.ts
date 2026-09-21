@@ -17,6 +17,7 @@ import { getExecutor } from "@/services/db/executor"
 import type { SqlExecutor } from "@/services/db/executor"
 import type { ThreadRow } from "@/services/db/threads"
 import { triggerRefresh } from "@/services/sync/scheduler"
+import { printThread } from "@/services/renderer/print"
 import { useAccountStore } from "@/stores/account-store"
 import { useComposerStore } from "@/stores/composer-store"
 import { useFolderCountsStore } from "@/stores/folder-counts-store"
@@ -30,6 +31,7 @@ import {
 } from "@/stores/thread-list-store"
 import { useUiStore } from "@/stores/ui-store"
 import { openReplyForThread } from "@/components/email/reply-opener"
+import { getComposerKeyActions } from "@/components/composer/composer-key-actions"
 import { getSnoozePresets } from "@/services/email-actions/snooze"
 import { snoozeThreadsWithRefresh } from "@/components/email/snooze-flow"
 
@@ -52,8 +54,13 @@ import { snoozeThreadsWithRefresh } from "@/components/email/snooze-flow"
  *    steps aside (shortcut-bindings store's captureActive).
  * 3. While the help overlay is open, only Esc ("dismiss") passes.
  * 4. While the composer is open or the palette is open, everything else
- *    is ignored — those surfaces own their own keys (the composer keeps
- *    its Esc handling; nothing is duplicated here).
+ *    is ignored — those surfaces own their keys. The composer registers
+ *    its scoped bindings with the hook (fix 2): Cmd/Ctrl+Enter sends via
+ *    the same guarded entry point as the Send button, Esc minimizes to
+ *    the tray chip keeping the draft (batch C2; the X button is the
+ *    save-and-close path), and `c` restores a minimized composer instead
+ *    of stacking a new compose; nested popovers and dialogs inside the
+ *    composer close themselves first (gates 3/3.25).
  * 5. While a rendered dialog (block-sender, split, apply-now, scheduled
  *    sends, … — anything carrying role="dialog"/"alertdialog") is open,
  *    everything but the palette toggle above stands down: list actions
@@ -61,13 +68,17 @@ import { snoozeThreadsWithRefresh } from "@/components/email/snooze-flow"
  *    eat the focused dialog button's Enter. Checked at keydown time — a
  *    querySelector per keystroke is cheap and always current, the same
  *    trade-off as the composerOpen/palette state gates beside it.
- * 6. While focus is inside an input / textarea / select / contenteditable,
+ * 6. Find in message (task 1.1) sits with the palette: a menu-combo that
+ *    fires even when focus is in an input (it cannot collide with typing),
+ *    but only with a thread open — it drives the reading-pane find bar
+ *    (ui-store.readingPaneFindOpen; Esc closes it when focus is elsewhere).
+ * 7. While focus is inside an input / textarea / select / contenteditable,
  *    typing is never hijacked (the matcher also refuses plain keys when
  *    a menu modifier is held, and ignores auto-repeat except j/k); a key
  *    pressed on a focused interactive widget (button / link / summary /
  *    role="button") is never stolen either — that widget's Enter is its
  *    activation key.
- * 7. List bindings (navigate / open / archive / trash / read / star /
+ * 8. List bindings (navigate / open / archive / trash / read / star /
  *    snooze / reply) additionally require a thread-list context (view is
  *    folder/label/search — not settings) and a selected thread; thread
  *    actions no-op without an active account. Account-scoped actions run
@@ -146,6 +157,37 @@ function isInteractiveTarget(target: EventTarget | null): boolean {
 function isModalDialogOpen(): boolean {
   return (
     document.querySelector('[role="dialog"], [role="alertdialog"]') !== null
+  )
+}
+
+/**
+ * The composer's one nested surface that is NOT a Base UI popup: the To/
+ * Cc/Bcc contact-suggestion listbox is a plain role="listbox" div under
+ * the field, and its own Esc (and Enter) handling must run before the
+ * composer's — the user closing a suggestion list is not asking to save
+ * the draft and quit. Queried at keydown time like isModalDialogOpen;
+ * the composer's other popovers (snippet picker, schedule menu, link
+ * editor) render role="dialog" popups and are covered by that gate.
+ */
+function isComposerListboxOpen(): boolean {
+  return document.querySelector('[role="listbox"]') !== null
+}
+
+/**
+ * Whether the event's target sits inside the composer surface (the
+ * section carries data-testid="composer-surface"; the shell's overlay
+ * wraps it). The centered card is non-modal — the pointer reaches the
+ * mailbox behind the overlay — so "a composer is open" no longer implies
+ * "the composer owns the keys": with focus in the list behind, the list
+ * keeps its shortcuts (gate 3.25 routes by focus). Composer popovers
+ * (snippet picker, schedule menu, link editor) portal OUTSIDE the
+ * surface but render role="dialog" and are caught by the modal gate
+ * above; the bare suggestion listbox is caught by isComposerListboxOpen.
+ */
+function isFocusInsideComposer(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    target.closest('[data-testid="composer-surface"]') !== null
   )
 }
 
@@ -289,10 +331,78 @@ export function useKeyboardShortcuts({
 
       // 3. Other modal surfaces own their keys entirely: a rendered
       // dialog first (its buttons' Enter must activate, and actions must
-      // not reach the thread behind it), then the store-gated surfaces.
+      // not reach the thread behind it), then the palette.
       if (isModalDialogOpen()) return
-      if (useUiStore.getState().composerOpen) return
       if (usePaletteStore.getState().open) return
+
+      // 3.25 Composer-local bindings (fix 2, minimized semantics batch C2;
+      // focus-routing for the non-modal card): Cmd/Ctrl+Enter sends —
+      // exactly the Send click, so its disabled/invalid state is honored by
+      // the registered handler itself — and Esc MINIMIZES the composer: the
+      // draft stays open behind the shell's tray chip (autosave keeps
+      // running); only the close (X) button still saves-and-closes. `c`
+      // while minimized RESTORES the surface (and refocuses it) instead of
+      // stacking a new compose over the hidden draft. The modal gate above
+      // already stood down while a Base UI popover/dialog is open (their
+      // popups render role="dialog", and their own Esc closes THEM first);
+      // the bare suggestion listbox gets the same courtesy explicitly.
+      // With the centered card (the default) focus can sit in the mail
+      // BEHIND the overlay — the pointer passes straight through it now —
+      // and then the list keeps its keys: everything falls through to the
+      // gates below, except `c`, which is swallowed (restoring a minimized
+      // draft, otherwise a no-op) because stacking a second openNew over
+      // the single draft would clobber it. Esc and Cmd/Ctrl+Enter behind
+      // the card do nothing: neither minimizes nor sends "from the list".
+      if (useUiStore.getState().composerOpen) {
+        if (isComposerListboxOpen()) return
+        const composerOwnsKeys =
+          useUiStore.getState().composerMode === "full" ||
+          isFocusInsideComposer(event.target)
+        if (composerOwnsKeys) {
+          if (id === "send-message") {
+            event.preventDefault()
+            event.stopPropagation()
+            getComposerKeyActions()?.send()
+            return
+          }
+          if (id === "dismiss" || id === "close-composer") {
+            event.preventDefault()
+            event.stopPropagation()
+            getComposerKeyActions()?.minimize()
+            return
+          }
+          if (id === "compose") {
+            event.preventDefault()
+            if (useComposerStore.getState().minimized) {
+              getComposerKeyActions()?.restore()
+            }
+            return
+          }
+          return
+        }
+        // Focus is in the mail behind the non-modal card: only `c` is
+        // special (see above); everything else falls through — gate 4
+        // still guards typing/focused widgets, and the list bindings keep
+        // their thread-list context.
+        if (id === "compose") {
+          event.preventDefault()
+          if (useComposerStore.getState().minimized) {
+            getComposerKeyActions()?.restore()
+          }
+          return
+        }
+      }
+
+      // 3.5 Find in message (task 1.1): opens the reading-pane find bar
+      // for the open thread. Like the palette above, a menu-combo binding
+      // that also fires while focus sits in an input (a plain "f" can
+      // never match it). No thread open → no-op.
+      if (id === "find-in-message") {
+        if (useUiStore.getState().activeThread === null) return
+        event.preventDefault()
+        useUiStore.getState().setReadingPaneFindOpen(true)
+        return
+      }
 
       // 4. Never hijack typing — or a focused interactive widget.
       if (isEditableTarget(event.target)) return
@@ -430,6 +540,17 @@ export function useKeyboardShortcuts({
           })
           return
         }
+        case "print-thread": {
+          // Print the whole open thread (task 1.10); per-message printing
+          // lives in the reading pane's print menu. No thread open → no-op.
+          const openThread = useUiStore.getState().activeThread
+          if (openThread === null) return
+          event.preventDefault()
+          void printThread(openThread, { kind: "thread" }).catch((error) => {
+            console.warn("[use-keyboard-shortcuts] print failed", error)
+          })
+          return
+        }
         case "focus-search": {
           event.preventDefault()
           // Shell contract: the header search field carries
@@ -449,8 +570,14 @@ export function useKeyboardShortcuts({
           return
         }
         case "dismiss":
-          // Nothing modal is open (handled above); Esc stays untouched
-          // for whatever has focus.
+          // With the find bar open, Esc is ITS close key (the input's own
+          // handler covers focus inside the bar — this is the anywhere-
+          // else case). Otherwise nothing modal is open and Esc stays
+          // untouched for whatever has focus.
+          if (useUiStore.getState().readingPaneFindOpen) {
+            event.preventDefault()
+            useUiStore.getState().setReadingPaneFindOpen(false)
+          }
           return
       }
     }

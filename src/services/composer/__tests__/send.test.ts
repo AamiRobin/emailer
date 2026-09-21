@@ -58,6 +58,11 @@ vi.mock("../../crypto/pgp-keys", async (importOriginal) => ({
     isDecrypted: () => true,
   })),
 }))
+// The sent chime is a seam of its own (task 1.5): the send flow requests
+// it fire-and-forget, so substitute a spy instead of the WebAudio path.
+vi.mock("../../notifications/sounds", () => ({
+  playSentSound: vi.fn(),
+}))
 
 import {
   encryptMime,
@@ -70,6 +75,7 @@ import {
   PgpKeyError,
   publicKeysSettingKey,
 } from "../../crypto/pgp-keys"
+import { playSentSound } from "../../notifications/sounds"
 import { getDraft, saveDraft } from "../drafts"
 import {
   EmptyMessageError,
@@ -268,6 +274,7 @@ function fakeImapProvider(
     trash: unused("trash"),
     moveToFolder: unused("moveToFolder"),
     deleteForever: unused("deleteForever"),
+    getMessageSource: unused("getMessageSource"),
     sendMessage: unused("sendMessage"),
     appendMessage: unused("appendMessage"),
     testConnection: () => Promise.resolve({ success: true, message: "ok" }),
@@ -319,6 +326,7 @@ function fakeGmailProvider(
     trash: unused("trash"),
     moveToFolder: unused("moveToFolder"),
     deleteForever: unused("deleteForever"),
+    getMessageSource: unused("getMessageSource"),
     sendMessage: unused("sendMessage"),
     appendMessage: unused("appendMessage"),
     testConnection: () => Promise.resolve({ success: true, message: "ok" }),
@@ -1046,6 +1054,40 @@ describe("sendComposerDraft", () => {
       const rows = await listOperationsByStatus(executor, "pending", accountId)
       expect(rows).toHaveLength(1)
       expect(rows[0]?.status).toBe("pending")
+    })
+  })
+
+  describe("sent-confirmation sound seam (task 1.5, D12)", () => {
+    beforeEach(() => {
+      vi.mocked(playSentSound).mockClear()
+    })
+
+    it("an accepted ONLINE send plays the sent chime exactly once", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedSentLabel(executor, accountId, "gmail")
+      useOnlineStore.getState().setOnline(true)
+
+      const result = await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+      })
+      expect(result.status).toBe("queued")
+      expect(playSentSound).toHaveBeenCalledTimes(1)
+    })
+
+    it("an offline-queued send never plays it (the queue toast is not a sent confirmation)", async () => {
+      const accountId = await createAccount(executor, "gmail")
+      await seedSentLabel(executor, accountId, "gmail")
+      useOnlineStore.getState().setOnline(false)
+
+      const result = await sendComposerDraft({
+        executor,
+        accountId,
+        payload: composerPayload(),
+      })
+      expect(result.status).toBe("queued")
+      expect(playSentSound).not.toHaveBeenCalled()
     })
   })
 

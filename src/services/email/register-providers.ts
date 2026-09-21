@@ -1,4 +1,5 @@
 import { registerGmailProvider } from "./gmail-provider"
+import { registerMicrosoftGraphProvider } from "./microsoft-graph-provider"
 
 /**
  * Registers every provider implementation shipped with the app in the
@@ -9,6 +10,7 @@ import { registerGmailProvider } from "./gmail-provider"
  */
 export function registerEmailProviders(): void {
   registerGmailProvider()
+  registerMicrosoftGraphProvider()
 }
 
 // Side-effect registration so a bare `import "./email/register-providers"`

@@ -1,5 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest"
 
+import { putAiCache } from "../../ai/cache"
+import { saveWritingStyleProfile } from "../../ai/writing-style"
 import {
   createAccount,
   createGmailLabel,
@@ -20,7 +22,8 @@ import {
  * Task 5.5: removal cascades to ALL local mail data of the account and
  * never touches other accounts. Runs against the real v1 schema (FKs ON)
  * through the node:sqlite executor; the store reload runs against the
- * same database via setAccountStoreExecutor.
+ * same database via setAccountStoreExecutor. Task 4.3: the non-cascaded
+ * AI stores (cache rows + writing-style profile) are purged explicitly.
  */
 
 let executor: TestExecutor
@@ -157,5 +160,41 @@ describe("removeAccount", () => {
       "SELECT id FROM accounts WHERE is_active = 1"
     )
     expect(flagged.map((row) => row.id)).toEqual([second])
+  })
+
+  it("purges the AI cache rows and style profile of the removed account only (task 4.3)", async () => {
+    const removed = await createAccount(executor, "gmail")
+    const kept = await createAccount(executor, "imap")
+    await putAiCache(executor, {
+      provider: "anthropic",
+      model: "claude-sonnet",
+      kind: "summary",
+      input: `thread-of-${removed}`,
+      output: "removed summary",
+      accountId: removed,
+    })
+    await putAiCache(executor, {
+      provider: "anthropic",
+      model: "claude-sonnet",
+      kind: "summary",
+      input: `thread-of-${kept}`,
+      output: "kept summary",
+      accountId: kept,
+    })
+    await saveWritingStyleProfile(executor, removed, '{"tone":"formal"}', 3)
+    await saveWritingStyleProfile(executor, kept, '{"tone":"casual"}', 5)
+
+    await removeAccount(removed, { executor })
+
+    // Cache rows and profile derived from the removed account are gone;
+    // the other account's AI data is untouched.
+    const cacheRows = await executor.select<{ output: string }>(
+      "SELECT output FROM ai_cache"
+    )
+    expect(cacheRows.map((row) => row.output)).toEqual(["kept summary"])
+    const profiles = await executor.select<{ account_id: string }>(
+      "SELECT account_id FROM writing_style_profiles"
+    )
+    expect(profiles.map((row) => row.account_id)).toEqual([kept])
   })
 })

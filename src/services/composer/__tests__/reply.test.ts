@@ -38,6 +38,7 @@ function makeMessage(overrides: Partial<MessageRow> = {}): MessageRow {
     has_attachments: 0,
     parts_json: null,
     created_at: 0,
+    auth_results: null,
     ...overrides,
   }
 }

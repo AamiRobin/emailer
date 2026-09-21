@@ -53,6 +53,22 @@ async function doInit(): Promise<void> {
 }
 
 /**
+ * Close the shared database handle and forget it (task 1.7): the
+ * "delete all local data" flow closes the plugin's pool BEFORE the Rust
+ * wipe deletes the file — an open SQLite file cannot be unlinked on
+ * Windows — and the app relaunches into first-run right after. A
+ * subsequent getDb() throws until initDatabase() runs again (the
+ * delete-all flow's failure path re-inits explicitly).
+ */
+export async function closeDatabase(): Promise<void> {
+  if (!db) return
+  const database = db
+  db = null
+  initPromise = null
+  await database.close()
+}
+
+/**
  * Generic versioned runner: applies MIGRATIONS entries in order, skipping
  * versions already recorded in _migrations. Each migration runs inside one
  * transaction together with its bookkeeping row so it is all-or-nothing.
@@ -76,6 +92,13 @@ async function applyMigration(
   database: Database,
   migration: Migration
 ): Promise<void> {
+  // FK-off window (see Migration.foreignKeysOff): the pragma cannot run
+  // inside a transaction, so it is toggled on the connection around the
+  // migration's own BEGIN/COMMIT — and restored best-effort afterwards.
+  const foreignKeysOff = migration.foreignKeysOff === true
+  if (foreignKeysOff) {
+    await database.execute("PRAGMA foreign_keys = OFF")
+  }
   await database.execute("BEGIN")
   try {
     for (const statement of migration.statements) {
@@ -91,5 +114,11 @@ async function applyMigration(
     // was fatal to the connection
     await database.execute("ROLLBACK").catch(() => {})
     throw error
+  } finally {
+    if (foreignKeysOff) {
+      await database.execute("PRAGMA foreign_keys = ON").catch(() => {
+        // Restoring is best-effort; the next init retries it anyway.
+      })
+    }
   }
 }

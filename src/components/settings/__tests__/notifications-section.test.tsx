@@ -44,6 +44,11 @@ import {
   addNotificationRule,
   listNotificationRules,
 } from "@/services/db/notification-rules"
+import {
+  getNewMailSoundEnabled,
+  getSentSoundEnabled,
+  setNewMailSoundPreference,
+} from "@/services/settings/preferences"
 import { useAccountStore } from "@/stores/account-store"
 import { NotificationsSection } from "../notifications-section"
 
@@ -211,5 +216,45 @@ describe("NotificationsSection", () => {
     const rows = await listNotificationRules(executor, accountId)
     expect(rows.map((row) => row.id)).not.toContain(doomed)
     expect(rows).toHaveLength(1)
+  })
+})
+
+describe("NotificationsSection sound toggles (task 1.5)", () => {
+  it("shows the defaults (new-mail on, sent off) and persists flips", async () => {
+    render(<NotificationsSection />)
+
+    const newMail = await screen.findByRole("switch", {
+      name: "New-mail sound",
+    })
+    const sent = screen.getByRole("switch", { name: "Sent-message sound" })
+    await waitFor(() => {
+      expect(newMail.getAttribute("aria-checked")).toBe("true")
+    })
+    expect(sent.getAttribute("aria-checked")).toBe("false")
+
+    fireEvent.click(newMail)
+    await waitFor(() => {
+      expect(newMail.getAttribute("aria-checked")).toBe("false")
+    })
+    expect(await getNewMailSoundEnabled(executor)).toBe(false)
+
+    fireEvent.click(sent)
+    await waitFor(() => {
+      expect(sent.getAttribute("aria-checked")).toBe("true")
+    })
+    expect(await getSentSoundEnabled(executor)).toBe(true)
+  })
+
+  it("reflects persisted rows on mount", async () => {
+    await setNewMailSoundPreference(executor, false)
+
+    render(<NotificationsSection />)
+
+    const newMail = await screen.findByRole("switch", {
+      name: "New-mail sound",
+    })
+    await waitFor(() => {
+      expect(newMail.getAttribute("aria-checked")).toBe("false")
+    })
   })
 })

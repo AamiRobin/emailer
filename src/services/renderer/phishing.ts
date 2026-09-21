@@ -71,7 +71,13 @@
  */
 
 export type PhishingFindingKind =
-  "link-mismatch" | "display-name-spoof" | "confusable-domain"
+  | "link-mismatch"
+  | "display-name-spoof"
+  | "confusable-domain"
+  // Not produced by analyzePhishing (task 2.2, design D10): the synthetic
+  // kind mail-display folds into the banner when the message's stored
+  // Authentication-Results verdict carries a DMARC failure.
+  | "dmarc-fail"
 
 export interface PhishingFinding {
   kind: PhishingFindingKind

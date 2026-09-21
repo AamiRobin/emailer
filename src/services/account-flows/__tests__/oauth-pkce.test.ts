@@ -4,6 +4,8 @@ import { openUrl } from "@tauri-apps/plugin-opener"
 
 import {
   GOOGLE_AUTH_ENDPOINT,
+  GMAIL_SCOPES,
+  GOOGLE_CALENDAR_SCOPE,
   OAUTH_LOOPBACK_PORT,
   buildGoogleAuthUrl,
   createCodeChallenge,
@@ -104,6 +106,32 @@ describe("buildGoogleAuthUrl", () => {
       )
     ).toBe("me@gmail.com")
   })
+
+  // Task 5.1, design D5 — the scope guarantee: the DEFAULT (mail) flow
+  // never requests the calendar scope. The scope list lives where the URL
+  // is built (TS-side), so this is the authoritative test of the guarantee;
+  // the Rust oauth.rs tests cover relaying whatever grant Google echoes
+  // back verbatim.
+  it("never requests the calendar scope in the default mail flow", () => {
+    const params = paramsOf(buildGoogleAuthUrl(input))
+    const scopes = params.get("scope")?.split(" ") ?? []
+    expect(scopes).toEqual(GMAIL_SCOPES)
+    expect(params.get("scope")).not.toContain(GOOGLE_CALENDAR_SCOPE)
+  })
+
+  it("requests the calendar scope only when explicitly passed (calendar connect)", () => {
+    const params = paramsOf(
+      buildGoogleAuthUrl({
+        ...input,
+        scopes: [...GMAIL_SCOPES, GOOGLE_CALENDAR_SCOPE],
+      })
+    )
+    const scopes = params.get("scope")?.split(" ") ?? []
+    expect(scopes).toContain(GOOGLE_CALENDAR_SCOPE)
+    // The calendar scope is ADDED to the mail grant, not swapped for it.
+    expect(scopes).toEqual(expect.arrayContaining(GMAIL_SCOPES))
+    expect(scopes).toHaveLength(GMAIL_SCOPES.length + 1)
+  })
 })
 
 describe("runGoogleConsent — loopback round-trip", () => {
@@ -117,8 +145,15 @@ describe("runGoogleConsent — loopback round-trip", () => {
     })
   }
 
-  function mockInvoke(): void {
+  function mockInvoke(options?: { portBusy?: boolean }): void {
     invokeMock.mockImplementation(((command: string) => {
+      if (command === "find_free_loopback_port") {
+        // The probe is asked for the FIXED registered port (Google
+        // requirement) — busy means fail fast.
+        return options?.portBusy
+          ? Promise.reject(new Error("loopback port 17248 is not available"))
+          : Promise.resolve(OAUTH_LOOPBACK_PORT)
+      }
       if (command === "start_oauth_server") return pendingServer()
       if (command === "cancel_oauth_server") return Promise.resolve(true)
       return Promise.reject(new Error(`unexpected command: ${command}`))
@@ -134,6 +169,43 @@ describe("runGoogleConsent — loopback round-trip", () => {
 
   beforeEach(() => {
     mockInvoke()
+  })
+
+  it("probes the fixed registered port before opening the browser", async () => {
+    const flow = runGoogleConsent({ clientId: "cid", openDelayMs: 0 })
+    const url = await openAuthUrl()
+    expect(invokeMock).toHaveBeenCalledWith("find_free_loopback_port", {
+      preferred: OAUTH_LOOPBACK_PORT,
+    })
+    resolveServer?.({
+      port: OAUTH_LOOPBACK_PORT,
+      code: "4/0OK",
+      state: url.searchParams.get("state"),
+      error: null,
+      errorDescription: null,
+    })
+    await expect(flow).resolves.toMatchObject({ code: "4/0OK" })
+  })
+
+  it("fails fast with the typed port-busy error when the port is taken", async () => {
+    mockInvoke({ portBusy: true })
+    const error = await runGoogleConsent({
+      clientId: "cid",
+      openDelayMs: 0,
+    }).then(
+      () => null,
+      (thrown: unknown) => thrown
+    )
+    expect(error).toMatchObject({
+      name: "OauthFlowError",
+      code: "port-busy",
+      message: expect.stringContaining("port is in use"),
+    })
+    // The browser was never opened and no server wait was registered.
+    expect(openUrlMock).not.toHaveBeenCalled()
+    expect(
+      invokeMock.mock.calls.some((call) => call[0] === "start_oauth_server")
+    ).toBe(false)
   })
 
   it("starts the loopback server, opens the browser and returns the code", async () => {
@@ -160,6 +232,30 @@ describe("runGoogleConsent — loopback round-trip", () => {
       redirectUri: `http://127.0.0.1:${OAUTH_LOOPBACK_PORT}`,
       codeVerifier: expect.any(String),
     })
+  })
+
+  it("requests exactly the scopes it was given (task 5.1 calendar connect)", async () => {
+    const flow = runGoogleConsent({
+      clientId: "cid",
+      scopes: [...GMAIL_SCOPES, GOOGLE_CALENDAR_SCOPE],
+      openDelayMs: 0,
+    })
+    const url = await openAuthUrl()
+    expect(url.searchParams.get("scope")?.split(" ")).toEqual([
+      ...GMAIL_SCOPES,
+      GOOGLE_CALENDAR_SCOPE,
+    ])
+
+    resolveServer?.({
+      port: OAUTH_LOOPBACK_PORT,
+      code: "4/0CAL",
+      state: url.searchParams.get("state"),
+      error: null,
+      errorDescription: null,
+      // Google echoes the granted scopes back; relayed on the callback.
+      scope: "https://mail.google.com/ email https://www.googleapis.com/auth/calendar",
+    })
+    await expect(flow).resolves.toMatchObject({ code: "4/0CAL" })
   })
 
   it("rejects with consent-denied when Google reports an error", async () => {

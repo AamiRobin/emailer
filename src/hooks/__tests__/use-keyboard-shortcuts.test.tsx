@@ -182,6 +182,8 @@ beforeEach(() => {
     view: DEFAULT_VIEW,
     sidebarCollapsed: false,
     composerOpen: false,
+    composerMode: "centered",
+    readingPaneFindOpen: false,
     activeThread: null,
     readingPane: "right",
   })
@@ -483,8 +485,8 @@ describe("useKeyboardShortcuts — compose and reply", () => {
     expect(useUiStore.getState().composerOpen).toBe(false)
   })
 
-  it("no keys pass through while the composer is open", () => {
-    useUiStore.setState({ composerOpen: true })
+  it("no keys pass through while the full-screen composer is open", () => {
+    useUiStore.setState({ composerOpen: true, composerMode: "full" })
     renderHarness()
     press("e")
     press("c")
@@ -492,6 +494,60 @@ describe("useKeyboardShortcuts — compose and reply", () => {
     expect(archiveThread).not.toHaveBeenCalled()
     expect(useComposerStore.getState().open).toBe(false)
     expect(helpState()).toBe("false")
+  })
+})
+
+describe("useKeyboardShortcuts — non-modal centered composer", () => {
+  it("list keys flow through to the mail behind the centered card", async () => {
+    useUiStore.setState({ composerOpen: true, composerMode: "centered" })
+    useComposerStore.setState({
+      open: true,
+      activeAccountId: "acc1",
+      subject: "open draft",
+      minimized: false,
+    })
+    renderHarness()
+    press("j")
+    expect(useUiStore.getState().activeThread).toBe("t1")
+    press("e")
+    await waitFor(() => expect(archiveThread).toHaveBeenCalledTimes(1))
+    expect(archiveThread).toHaveBeenCalledWith(
+      expect.anything(),
+      "acc1",
+      "t1"
+    )
+  })
+
+  it("Esc and Cmd/Ctrl+Enter behind the card do not reach the composer", () => {
+    useUiStore.setState({ composerOpen: true, composerMode: "centered" })
+    useComposerStore.setState({
+      open: true,
+      activeAccountId: "acc1",
+      subject: "open draft",
+      minimized: false,
+    })
+    renderHarness()
+    press("Escape")
+    press("Enter", { ctrlKey: true })
+    expect(useComposerStore.getState().minimized).toBe(false)
+    // The draft is untouched — neither key drove the composer surface.
+    expect(useComposerStore.getState().open).toBe(true)
+    expect(useComposerStore.getState().subject).toBe("open draft")
+  })
+
+  it("`c` behind the card restores a minimized draft, never stacks a new one", () => {
+    useUiStore.setState({ composerOpen: true, composerMode: "centered" })
+    useComposerStore.setState({
+      open: true,
+      activeAccountId: "acc1",
+      subject: "open draft",
+      minimized: false,
+    })
+    renderHarness()
+    press("c")
+    // openNew would have reset the subject — the swallow kept the draft.
+    expect(useComposerStore.getState().open).toBe(true)
+    expect(useComposerStore.getState().subject).toBe("open draft")
   })
 })
 
@@ -757,5 +813,36 @@ describe("useKeyboardShortcuts — dialogs and focused widgets", () => {
     renderHarness()
     press("j")
     expect(useUiStore.getState().activeThread).toBe("t1")
+  })
+})
+
+describe("useKeyboardShortcuts — find in message (task 1.1)", () => {
+  it("Cmd/Ctrl+F opens the reading-pane find bar when a thread is open", () => {
+    useUiStore.setState({ activeThread: "t1" })
+    renderHarness()
+    press("f", { ctrlKey: true })
+    expect(useUiStore.getState().readingPaneFindOpen).toBe(true)
+    press("f", { metaKey: true })
+    expect(useUiStore.getState().readingPaneFindOpen).toBe(true)
+  })
+
+  it("opens even while focus is in an input (menu-combo exemption)", () => {
+    useUiStore.setState({ activeThread: "t1" })
+    renderHarness()
+    press("f", { ctrlKey: true }, screen.getByTestId("search-input"))
+    expect(useUiStore.getState().readingPaneFindOpen).toBe(true)
+  })
+
+  it("does nothing without an open thread", () => {
+    renderHarness()
+    press("f", { ctrlKey: true })
+    expect(useUiStore.getState().readingPaneFindOpen).toBe(false)
+  })
+
+  it("Escape closes the bar when focus is outside it", () => {
+    useUiStore.setState({ activeThread: "t1", readingPaneFindOpen: true })
+    renderHarness()
+    press("Escape")
+    expect(useUiStore.getState().readingPaneFindOpen).toBe(false)
   })
 })

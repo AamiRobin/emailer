@@ -1,5 +1,10 @@
 import { create } from "zustand"
 
+import { accountHue } from "@/components/email/account-hue"
+import {
+  listAccountColorSources,
+  type AccountColorSource,
+} from "@/services/db/account-profiles"
 import { UNREAD_BADGE_THREAD_EXCLUSION } from "@/services/db/accounts"
 import type { SqlExecutor } from "@/services/db/executor"
 import { getExecutor } from "@/services/db/executor"
@@ -33,9 +38,17 @@ import { useUiStore } from "@/stores/ui-store"
  * setAccountStoreExecutor() (tauri-plugin-sql cannot run under vitest).
  * These are the minimal queries the switcher needs — the shared accounts
  * query module (src/services/db/accounts.ts) lands with task 5.3.
+ *
+ * Profile colors (parity-round-2 task 4.4, design D10): the store also
+ * resolves each account's effective color — the per-account override,
+ * else the profile's color, else the account's generated hue — into the
+ * `effectiveColors` map at load time and exposes effectiveColor() for
+ * consumers (the thread-list markers). refreshProfileColors() re-resolves
+ * after a profiles edit without a full account reload; profiles CRUD
+ * never touches accounts themselves, so a color-only refresh suffices.
  */
 
-export type AccountType = "gmail" | "imap"
+export type AccountType = "gmail" | "imap" | "microsoft"
 export type AccountStatus = "active" | "auth-error"
 
 export interface AccountInfo {
@@ -53,6 +66,13 @@ export interface AccountInfo {
 interface AccountState {
   accounts: AccountInfo[]
   activeAccountId: string | null
+  /**
+   * Effective color (CSS color string) per account id — the resolution of
+   * the override → profile-color → generated-hue chain, precomputed at
+   * load so consumers read a plain map. Rebuilt by reload() and
+   * refreshProfileColors().
+   */
+  effectiveColors: Record<string, string>
   /** True once init() (or reload()) has loaded accounts from the database. */
   loaded: boolean
   /** Idempotent single-flight load for app startup; later calls are no-ops. */
@@ -63,6 +83,14 @@ interface AccountState {
   setActive(id: string): Promise<void>
   /** Re-run the unread aggregate into the current account list. */
   refreshUnreadCounts(): Promise<void>
+  /**
+   * Re-resolve the effective-color map after a profiles edit (assignment,
+   * override, profile create/rename/re-color/delete) without reloading
+   * the accounts themselves — profiles never change account rows.
+   */
+  refreshProfileColors(): Promise<void>
+  /** The account's effective color, or null when the id is unknown. */
+  effectiveColor(accountId: string): string | null
 }
 
 interface AccountRow {
@@ -88,6 +116,34 @@ function toAccountInfo(row: AccountRow, unreadCount: number): AccountInfo {
 }
 
 /**
+ * The effective-color chain (accounts spec "Account profiles and colors"):
+ * the per-account override wins, else the profile's color, else the
+ * account's individual/generated color — the same deterministic djb2 hue
+ * the account badges derive (account-hue.ts), so an unprofiled account's
+ * marker agrees with its unified-inbox badge.
+ */
+export function resolveEffectiveColor(
+  accountId: string,
+  source: Pick<AccountColorSource, "profile_color" | "color_override">
+): string {
+  return (
+    source.color_override ??
+    source.profile_color ??
+    `hsl(${accountHue(accountId)} 55% 50%)`
+  )
+}
+
+function buildEffectiveColors(
+  sources: AccountColorSource[]
+): Record<string, string> {
+  const colors: Record<string, string> = {}
+  for (const source of sources) {
+    colors[source.account_id] = resolveEffectiveColor(source.account_id, source)
+  }
+  return colors
+}
+
+/**
  * The one per-account unread aggregate, shared by loadAccounts() and
  * refreshUnreadCounts() so the two copies can never drift. Besides
  * is_read = 0 it applies UNREAD_BADGE_THREAD_EXCLUSION (db/accounts.ts):
@@ -106,7 +162,11 @@ const UNREAD_BY_ACCOUNT_SQL = `
 
 async function loadAccounts(
   executor: SqlExecutor
-): Promise<{ accounts: AccountInfo[]; persistedActiveId: string | null }> {
+): Promise<{
+  accounts: AccountInfo[]
+  persistedActiveId: string | null
+  effectiveColors: Record<string, string>
+}> {
   const rows = await executor.select<AccountRow>(
     `SELECT id, type, email, display_name, status, last_sync_at, is_active
      FROM accounts
@@ -122,9 +182,16 @@ async function loadAccounts(
   const accounts = rows.map((row) =>
     toAccountInfo(row, unreadByAccount.get(row.id) ?? 0)
   )
+  const effectiveColors = buildEffectiveColors(
+    await listAccountColorSources(executor)
+  )
   // Last active account flag; first row wins if multiple are flagged.
   const persisted = rows.find((row) => row.is_active === 1)
-  return { accounts, persistedActiveId: persisted?.id ?? null }
+  return {
+    accounts,
+    persistedActiveId: persisted?.id ?? null,
+    effectiveColors,
+  }
 }
 
 /** is_active row → first active-status account → none. */
@@ -165,10 +232,13 @@ export function setAccountStoreExecutor(executor: SqlExecutor | null): void {
 }
 
 async function runLoad(): Promise<void> {
-  const { accounts, persistedActiveId } = await loadAccounts(resolveExecutor())
+  const { accounts, persistedActiveId, effectiveColors } = await loadAccounts(
+    resolveExecutor()
+  )
   useAccountStore.setState({
     accounts,
     activeAccountId: restoreActiveId(accounts, persistedActiveId),
+    effectiveColors,
     loaded: true,
   })
 }
@@ -176,6 +246,7 @@ async function runLoad(): Promise<void> {
 export const useAccountStore = create<AccountState>((set, get) => ({
   accounts: [],
   activeAccountId: null,
+  effectiveColors: {},
   loaded: false,
 
   init: () => {
@@ -229,6 +300,15 @@ export const useAccountStore = create<AccountState>((set, get) => ({
       return changed ? { accounts } : state
     })
   },
+
+  refreshProfileColors: async () => {
+    const effectiveColors = buildEffectiveColors(
+      await listAccountColorSources(resolveExecutor())
+    )
+    set({ effectiveColors })
+  },
+
+  effectiveColor: (accountId) => get().effectiveColors[accountId] ?? null,
 }))
 
 /** Startup hook for the shell: idempotent, and DB failures are logged and

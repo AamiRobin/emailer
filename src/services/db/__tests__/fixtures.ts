@@ -24,7 +24,7 @@ export function at(offsetSeconds: number): number {
 
 export async function createAccount(
   executor: SqlExecutor,
-  type: "gmail" | "imap" = "gmail"
+  type: "gmail" | "imap" | "microsoft" = "gmail"
 ): Promise<string> {
   const id = uid("acc")
   await executor.execute(

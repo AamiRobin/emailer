@@ -9,6 +9,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover"
 import type { SnippetRow } from "@/services/db/snippets"
+import { snippetVariableIdsInBody } from "@/services/composer/snippet-variables"
 import { insertSnippetBody } from "./snippet-insert"
 
 /**
@@ -17,6 +18,12 @@ import { insertSnippetBody } from "./snippet-insert"
  * position (insertSnippetBody) and closes the menu. The empty state points
  * at the settings section that owns snippet CRUD. The keyboard
  * shortcut-expansion entry point lives in snippet-insert.ts.
+ *
+ * Task 2.4 (design D11): entries whose body uses `{{variable}}`
+ * placeholders say so — a compact one-line hint with the number of
+ * DISTINCT variables, since insertion prompts for any the compose context
+ * can't fill. Deliberately just a hint (this is a quick-insert surface);
+ * the full variable documentation lives in Settings → Snippets.
  */
 export function SnippetPicker({
   editor,
@@ -55,35 +62,50 @@ export function SnippetPicker({
             aria-label="Snippets"
             className="max-h-64 overflow-y-auto"
           >
-            {snippets.map((snippet) => (
-              <li key={snippet.id}>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-auto w-full flex-col items-start gap-0.5 px-2 py-1.5"
-                  aria-label={`Insert ${snippet.name}`}
-                  onClick={() => {
-                    if (!editor) return
-                    insertSnippetBody(editor, snippet.body)
-                    setOpen(false)
-                  }}
-                >
-                  <span className="flex w-full items-center gap-2">
-                    <span className="min-w-0 truncate text-[0.8rem] font-medium">
-                      {snippet.name}
+            {snippets.map((snippet) => {
+              // Distinct ids only: a repeated variable is one prompt, so
+              // the hint counts prompts the same way insertion does.
+              const variableIds = snippetVariableIdsInBody(snippet.body)
+              return (
+                <li key={snippet.id}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-auto w-full flex-col items-start gap-0.5 px-2 py-1.5"
+                    aria-label={`Insert ${snippet.name}`}
+                    onClick={() => {
+                      if (!editor) return
+                      insertSnippetBody(editor, snippet.body)
+                      setOpen(false)
+                    }}
+                  >
+                    <span className="flex w-full items-center gap-2">
+                      <span className="min-w-0 truncate text-[0.8rem] font-medium">
+                        {snippet.name}
+                      </span>
+                      {snippet.shortcut ? (
+                        <kbd className="inline-flex min-w-6 items-center justify-center rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-xs font-medium text-foreground">
+                          {snippet.shortcut}
+                        </kbd>
+                      ) : null}
                     </span>
-                    {snippet.shortcut ? (
-                      <kbd className="inline-flex min-w-6 items-center justify-center rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-xs font-medium text-foreground">
-                        {snippet.shortcut}
-                      </kbd>
-                    ) : null}
-                  </span>
-                  <span className="w-full truncate text-xs font-normal text-muted-foreground">
-                    {snippet.body}
-                  </span>
-                </Button>
-              </li>
-            ))}
+                    <span className="w-full truncate text-xs font-normal text-muted-foreground">
+                      {snippet.body}
+                    </span>
+                    {variableIds.length > 0 && (
+                      <span
+                        data-testid="snippet-variable-hint"
+                        className="w-full truncate text-xs font-normal text-muted-foreground"
+                      >
+                        {variableIds.length}{" "}
+                        {variableIds.length === 1 ? "variable" : "variables"} —
+                        you'll be asked for any we can't fill
+                      </span>
+                    )}
+                  </Button>
+                </li>
+              )
+            })}
           </ul>
         )}
       </PopoverContent>

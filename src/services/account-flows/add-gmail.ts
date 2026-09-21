@@ -39,19 +39,29 @@ const GMAIL_PROFILE_ENDPOINT =
 
 export type GmailFlowStep = "consent" | "exchange" | "profile" | "save"
 
-/** User denied consent on Google's screen (retryable, nothing saved). */
+/** User denied consent on the provider's screen (retryable, nothing saved). */
 export class ConsentDeniedError extends Error {
   readonly googleError?: string
   readonly googleErrorDescription?: string
+  /** Provider-neutral aliases (the Microsoft flow sets these instead). */
+  readonly providerError?: string
+  readonly providerErrorDescription?: string
 
   constructor(
     message: string,
-    options?: { googleError?: string; googleErrorDescription?: string }
+    options?: {
+      googleError?: string
+      googleErrorDescription?: string
+      providerError?: string
+      providerErrorDescription?: string
+    }
   ) {
     super(message)
     this.name = "ConsentDeniedError"
     this.googleError = options?.googleError
     this.googleErrorDescription = options?.googleErrorDescription
+    this.providerError = options?.providerError
+    this.providerErrorDescription = options?.providerErrorDescription
   }
 }
 

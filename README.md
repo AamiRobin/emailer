@@ -40,22 +40,41 @@ work offline, and sync runs quietly in the background when you're online.
 
 ## Features
 
-- **Gmail and every major IMAP provider** — Gmail over its REST API with
-  OAuth; IMAP/SMTP with server auto-discovery for Outlook, Yahoo, iCloud,
-  Fastmail, GMX, Zoho and AOL — each with its brand icon across the app
+- **Gmail, Microsoft 365 and every major IMAP provider** — Gmail over its
+  REST API with OAuth; Microsoft 365 / Outlook.com over Graph with modern
+  sign-in; IMAP/SMTP with server auto-discovery for Outlook, Yahoo,
+  iCloud, Fastmail, GMX, Zoho and AOL — each with its brand icon across
+  the app
 - **Local-first storage** — everything lives on this machine; messages,
-  search and drafts work offline and sync resumes when you're back
+  search and drafts work offline and sync resumes when you're back.
+  Settings → Storage breaks down the disk usage, and a two-step reset
+  deletes all local data — your mail servers are never touched
 - **Unified inbox** — combine all accounts into one list (with per-account
-  color attribution) or work per folder; priority inbox included
+  color attribution) or work per folder; priority inbox included.
+  Profiles give groups of accounts a shared color that marks threads in
+  cross-account lists
 - **Search that keeps up** — full-text search with operators: `from:`,
   `to:`, `label:`, `is:starred`, `larger:5m`, `before:2026-01-01` — and
-  negations like `-from:newsletter@` or `-has:attachment`
+  negations like `-from:newsletter@` or `-has:attachment`. Accent folding
+  means "be don dep" still finds "Bé Dọn Dẹp", and when a plain query
+  finds nothing, a relaxed retry surfaces near-misses
+- **Find and inspect** — `Cmd/Ctrl+F` searches inside the open thread
+  with a live match count, and View source shows the untouched RFC 822
+  original, read-only with exact copy
 - **Reply tracking** — nudges resurface threads you haven't answered;
   follow-up reminders resurface threads that weren't answered *to you*
-- **Local automation** — rules, junk filter, blocked senders and
-  auto-archive run locally on every sync
+- **Local automation** — rules (built by hand or from a plain-language
+  description), junk filter, blocked senders and auto-archive run
+  locally on every sync
 - **A composer that gets out of the way** — rich text, snippets,
   attachments, per-account signatures, and an undo-send window
+- **Optional AI on your terms** — summaries, smart replies and Ask My
+  Inbox through the provider you configure, including a fully local
+  Ollama; per-surface model tiers, quick replies that never send by
+  themselves, and a token usage meter kept on this machine
+- **CardDAV contacts** — connect a Nextcloud, Radicale or provider
+  address book; synced contacts autocomplete just like local ones, and
+  the app password is sealed on the device
 - **Encryption** — per-account OpenPGP keys with encrypt/decrypt in both
   the composer and the reader
 - **Attachment security** — optional VirusTotal hash lookup before an
@@ -116,6 +135,27 @@ The app requests the `https://mail.google.com/` and `email` scopes and
 receives the OAuth callback on a local loopback listener
 (`http://127.0.0.1:17248`). Tokens are stored encrypted on this machine
 and never leave it except to talk to Google's API directly.
+
+### Connecting a Microsoft 365 account
+
+Microsoft 365 / Outlook.com accounts (work, school or personal — Outlook,
+Hotmail, Live) go through Microsoft Entra sign-in with **your own** free
+app registration — Emailer ships no bundled Microsoft app:
+
+1. In the [Azure portal](https://portal.azure.com/), register an app
+   (type *"Accounts in any organizational directory and personal Microsoft
+   accounts"*) and add `http://localhost:17248` as a redirect URI under
+   the **Mobile and desktop applications** platform. No client secret is
+   needed.
+2. In Emailer: **Add account → Microsoft 365 / Outlook.com**, paste the
+   Application (client) ID, and sign in in the browser window that opens.
+3. Work or school accounts may require admin approval for the
+   registration — if sign-in reports that admin approval is needed, ask
+   your IT administrator to grant it.
+
+Tokens are sealed on this machine and auto-refreshed there; Outlook
+calendars connect separately from calendar settings through a second,
+calendar-scoped sign-in.
 
 ### Run in a browser with mock data
 

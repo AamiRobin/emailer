@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+// The desktop-preference writers push their values to Rust commands; in
+// the vitest runtime the real core module has no Tauri IPC, so resolve
+// the commands as the app would (null success) — the assertions target
+// the settings-table round-trips.
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(async () => null),
+}))
 
 import type { SqlExecutor } from "@/services/db/executor"
 import {
@@ -8,6 +16,7 @@ import {
   DEFAULT_FOLLOW_UP_DAYS,
   DEFAULT_NUDGE_DAYS,
   getAccentPreference,
+  getComposerModePreference,
   getDensity,
   getFollowUpDays,
   getFontScale,
@@ -21,6 +30,7 @@ import {
   getAttachmentGuardSuppressed,
   getEmptySubjectGuardSuppressed,
   setAttachmentGuardSuppressedPreference,
+  setComposerModePreference,
   setEmptySubjectGuardSuppressedPreference,
   setAccentPreference,
   setDensityPreference,
@@ -45,10 +55,19 @@ import {
   getJunkFilterEnabled,
   junkFilterEnabledSettingKey,
   setJunkFilterEnabledPreference,
+  getGravatarEnabled,
+  setGravatarEnabledPreference,
   getMalwareLookupEnabled,
   getMalwareLookupApiKey,
   setMalwareLookupEnabledPreference,
   setMalwareLookupApiKeyPreference,
+  getCloseAction,
+  isCloseAction,
+  setCloseActionPreference,
+  getComposeShortcut,
+  setComposeShortcutPreference,
+  getMarkReadOnOpen,
+  setMarkReadOnOpenPreference,
 } from "../preferences"
 import {
   createTestExecutor,
@@ -185,6 +204,46 @@ describe("reading pane position", () => {
       ["mail.readingPane", JSON.stringify("floating")]
     )
     expect(await getReadingPanePreference(executor)).toBe("right")
+  })
+
+  it("applyBootPreferences restores the persisted position", async () => {
+    useUiStore.setState({ readingPane: "hidden" })
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["mail.readingPane", JSON.stringify("bottom")]
+    )
+    await applyBootPreferences(executor)
+    expect(useUiStore.getState().readingPane).toBe("bottom")
+  })
+})
+
+describe("composer surface size", () => {
+  it("defaults to centered and round-trips into the ui-store", async () => {
+    expect(await getComposerModePreference(executor)).toBe("centered")
+    // The ui-store default is the same centered card (fresh installs).
+    useUiStore.setState({ composerMode: "centered" })
+
+    await setComposerModePreference(executor, "full")
+    expect(await getComposerModePreference(executor)).toBe("full")
+    expect(useUiStore.getState().composerMode).toBe("full")
+  })
+
+  it("falls back to centered when the stored value is unknown", async () => {
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["mail.composerMode", JSON.stringify("docked")]
+    )
+    expect(await getComposerModePreference(executor)).toBe("centered")
+  })
+
+  it("applyBootPreferences restores the persisted mode", async () => {
+    useUiStore.setState({ composerMode: "centered" })
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["mail.composerMode", JSON.stringify("full")]
+    )
+    await applyBootPreferences(executor)
+    expect(useUiStore.getState().composerMode).toBe("full")
   })
 })
 
@@ -500,6 +559,56 @@ describe("malware hash-lookup preferences (task 18.9)", () => {
   })
 })
 
+describe("close action (task 1.2, desktop integration)", () => {
+  it("defaults to quit and round-trips", async () => {
+    expect(await getCloseAction(executor)).toBe("quit")
+
+    await setCloseActionPreference(executor, "hide")
+    expect(await getCloseAction(executor)).toBe("hide")
+
+    await setCloseActionPreference(executor, "quit")
+    expect(await getCloseAction(executor)).toBe("quit")
+  })
+
+  it("falls back to quit when the stored value is corrupt", async () => {
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["desktop.closeAction", JSON.stringify("minimize")]
+    )
+    expect(await getCloseAction(executor)).toBe("quit")
+  })
+
+  it("isCloseAction accepts only the two enum values", () => {
+    expect(isCloseAction("hide")).toBe(true)
+    expect(isCloseAction("quit")).toBe(true)
+    expect(isCloseAction("minimize")).toBe(false)
+    expect(isCloseAction(null)).toBe(false)
+  })
+})
+
+describe("global compose shortcut (task 1.5)", () => {
+  it("defaults to null and round-trips an accelerator", async () => {
+    expect(await getComposeShortcut(executor)).toBeNull()
+
+    await setComposeShortcutPreference(executor, "CmdOrCtrl+Shift+E")
+    expect(await getComposeShortcut(executor)).toBe("CmdOrCtrl+Shift+E")
+
+    await setComposeShortcutPreference(executor, null)
+    expect(await getComposeShortcut(executor)).toBeNull()
+  })
+
+  it("reads corrupt rows and blanks as null (no registration)", async () => {
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["desktop.composeShortcut", JSON.stringify(42)]
+    )
+    expect(await getComposeShortcut(executor)).toBeNull()
+
+    await setComposeShortcutPreference(executor, "   ")
+    expect(await getComposeShortcut(executor)).toBeNull()
+  })
+})
+
 describe("applyBootPreferences", () => {
   it("sets the tokens and feeds the reading pane into the ui-store", async () => {
     await setDensityPreference(executor, "compact")
@@ -615,6 +724,26 @@ describe("applyBootPreferences", () => {
     expect(await getJunkFilterEnabled(executor, "acc-1")).toBe(false)
   })
 
+  it("gravatar opt-in: default off, global round-trip (task 2.5, design D12)", async () => {
+    expect(await getGravatarEnabled(executor)).toBe(false)
+
+    await setGravatarEnabledPreference(executor, true)
+    expect(await getGravatarEnabled(executor)).toBe(true)
+
+    await setGravatarEnabledPreference(executor, false)
+    expect(await getGravatarEnabled(executor)).toBe(false)
+  })
+
+  it("reads corrupt or non-boolean gravatar rows as off (privacy default)", async () => {
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["contacts.gravatarEnabled", JSON.stringify("yes")]
+    )
+    // Off is the privacy default: a hash of the address must never be
+    // sent to gravatar.com because a row went corrupt.
+    expect(await getGravatarEnabled(executor)).toBe(false)
+  })
+
   it("keeps the defaults when the executor fails", async () => {
     const failing: SqlExecutor = {
       select: () => Promise.reject(new Error("no database")),
@@ -626,5 +755,38 @@ describe("applyBootPreferences", () => {
     expect(document.documentElement.style.getPropertyValue("--density")).toBe(
       ""
     )
+  })
+})
+
+describe("mark-as-read on open (task 1.4, settings spec)", () => {
+  let executor: TestExecutor
+
+  beforeEach(() => {
+    executor = createTestExecutor()
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("defaults to on, round-trips, and persists across re-reads", async () => {
+    // default: the historical behavior — opening marks read
+    expect(await getMarkReadOnOpen(executor)).toBe(true)
+
+    await setMarkReadOnOpenPreference(executor, false)
+    expect(await getMarkReadOnOpen(executor)).toBe(false)
+    // a fresh read of the same row (next launch) keeps the choice
+    expect(await getMarkReadOnOpen(executor)).toBe(false)
+
+    await setMarkReadOnOpenPreference(executor, true)
+    expect(await getMarkReadOnOpen(executor)).toBe(true)
+  })
+
+  it("reads corrupt or non-boolean rows as on (the historical default)", async () => {
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["mail.markReadOnOpen", JSON.stringify("off")]
+    )
+    expect(await getMarkReadOnOpen(executor)).toBe(true)
   })
 })

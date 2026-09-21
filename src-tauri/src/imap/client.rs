@@ -1020,6 +1020,43 @@ pub async fn fetch_attachment(
     Ok(encode_base64(&data))
 }
 
+/// Fetch one message's complete raw RFC 822 source by UID ("View source",
+/// parity-round-2 task 1.2). The full message is fetched with the same
+/// `BODY.PEEK[]` full-message fetch the body sync uses — no \Seen side
+/// effect, so viewing the source never alters read state — and the bytes
+/// come back standard-base64-encoded for the JSON bridge (a lossy UTF-8
+/// string could silently corrupt 8-bit MIME); decoding happens TS-side.
+pub async fn fetch_source(
+    session: &mut ImapSession,
+    folder: &str,
+    uid: u32,
+) -> Result<String, String> {
+    select_folder(session, folder).await?;
+
+    let uid_str = uid.to_string();
+    let fetches = with_timeout(
+        async {
+            let mut stream = session
+                .uid_fetch(&uid_str, "BODY.PEEK[]")
+                .await
+                .map_err(|e| format!("UID FETCH source {folder} uid={uid} failed: {e}"))?;
+            collect_fetches(&mut stream, &format!("UID FETCH source {folder} uid={uid}")).await
+        },
+        IMAP_FETCH_TIMEOUT,
+        &format!("UID FETCH source {folder} uid={uid}"),
+    )
+    .await?;
+
+    let fetch = fetches
+        .first()
+        .ok_or_else(|| format!("no FETCH response for UID {uid} in {folder}"))?;
+    let raw = fetch
+        .body()
+        .ok_or_else(|| format!("UID {uid} in {folder} has no body"))?;
+
+    Ok(encode_base64(raw))
+}
+
 // ---------- Folder management (CREATE / RENAME / DELETE) ----------
 
 /// Validate a mailbox name for the folder-management commands: non-empty
@@ -1233,6 +1270,15 @@ pub(crate) fn parse_raw_message(
     let list_unsubscribe = raw_header("List-Unsubscribe");
     let list_unsubscribe_post = raw_header("List-Unsubscribe-Post");
 
+    // Authentication-Results (task 2.1, design D10): parsed HERE at
+    // ingestion, not at display time — the badge must render from the
+    // compact stored verdict without re-parsing raw headers. All raw
+    // headers of the message go in so every (possibly repeated)
+    // Authentication-Results header consolidates (worst value wins, see
+    // auth_results::parse_auth_results); mail-parser keeps duplicates,
+    // unlike `header_raw` which returns only the first.
+    let auth_results = super::auth_results::parse_auth_results(message.headers_raw());
+
     let text_body = message.body_text(0).map(|s| s.to_string());
     let html_body = message.body_html(0).map(|s| s.to_string());
 
@@ -1279,6 +1325,7 @@ pub(crate) fn parse_raw_message(
         references,
         list_unsubscribe,
         list_unsubscribe_post,
+        auth_results,
         subject,
         from: addresses(message.from()),
         to: addresses(message.to()),
@@ -1780,6 +1827,34 @@ mod tests {
             .expect("parse should succeed");
         assert_eq!(msg.list_unsubscribe, None);
         assert_eq!(msg.list_unsubscribe_post, None);
+    }
+
+    #[test]
+    fn parse_consolidates_authentication_results_headers() {
+        // Task 2.1 (design D10): two Authentication-Results headers, the
+        // later hop failing SPF — the worst value must win per mechanism.
+        let raw = concat!(
+            "From: Bank <no-reply@bank.example>\r\n",
+            "Authentication-Results: mx1.example.com;\r\n",
+            "  spf=pass; dkim=pass; dmarc=pass\r\n",
+            "Authentication-Results: mx2.example.com;\r\n",
+            "  spf=fail (forwarded); dmarc=fail header.from=bank.example\r\n",
+            "Subject: your statement\r\n",
+            "\r\n",
+            "body"
+        );
+        let msg = parse_raw_message(raw.as_bytes(), 5, vec![], None).expect("parse should succeed");
+        assert_eq!(
+            msg.auth_results.as_deref(),
+            Some("spf=fail;dkim=pass;dmarc=fail")
+        );
+    }
+
+    #[test]
+    fn parse_without_authentication_results_leaves_it_none() {
+        let msg = parse_raw_message(b"Subject: plain\r\n\r\njust text", 1, vec![], None)
+            .expect("parse should succeed");
+        assert_eq!(msg.auth_results, None);
     }
 
     #[test]

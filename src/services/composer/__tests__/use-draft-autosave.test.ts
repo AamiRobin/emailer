@@ -236,6 +236,7 @@ describe("useDraftAutosave", () => {
         }
         return executor.execute(sql, params)
       },
+      applyMigration: (version) => executor.applyMigration(version),
       close: () => executor.close(),
     }
     renderAutosave({ executor: flakyExecutor })

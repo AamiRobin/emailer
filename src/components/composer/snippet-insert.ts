@@ -2,7 +2,13 @@ import { Extension } from "@tiptap/core"
 import type { Editor } from "@tiptap/react"
 import { Plugin, PluginKey } from "@tiptap/pm/state"
 
+import {
+  substituteSnippetVariables,
+  type SnippetVariableContext,
+} from "@/services/composer/snippet-variables"
 import type { SnippetRow } from "@/services/db/snippets"
+import { useAccountStore } from "@/stores/account-store"
+import { useComposerStore } from "@/stores/composer-store"
 
 /**
  * Snippet insertion for the composer (task 6.2). Both entry points share
@@ -27,6 +33,14 @@ import type { SnippetRow } from "@/services/db/snippets"
  *   word-boundary anchored (the trailing non-space run before the caret).
  *   A snippet without a shortcut is only reachable via the menu;
  *   duplicate shortcuts keep the first (alphabetically-named) row.
+ *
+ * Task 2.3 (design D11) adds a `{{variable}}` substitution pass over the
+ * plain body BEFORE the HTML conversion on both paths: known context
+ * variables fill silently. On the menu path the unresolved ids collect
+ * into ONE injected prompt (see setSnippetVariablePrompt) and the answers
+ * apply to all occurrences before insertion; on the keyboard path the
+ * prompt cannot run (see the comment in the handler) and unresolved ids
+ * stay literal `{{id}}` text.
  */
 
 /** Snippet bodies are plain text (settings Textarea). A single block (no
@@ -54,9 +68,75 @@ function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;")
 }
 
-/** Insert a snippet body as HTML at the current cursor position. */
+/**
+ * The compose context substitution resolves against (task 2.3, design
+ * D11): the first To-recipient as typed, plus the composing account's
+ * identity (the composer's active account, falling back to the shell's —
+ * the same resolution composer.tsx uses). Read from the stores at
+ * insertion time: snippets insert from click/keydown handlers, never
+ * mid-render, so getState() is the right access path (same discipline as
+ * the shortcut map below).
+ */
+function snippetVariableContext(): SnippetVariableContext {
+  const composer = useComposerStore.getState()
+  const accounts = useAccountStore.getState()
+  const accountId = composer.activeAccountId ?? accounts.activeAccountId
+  const account = accountId
+    ? accounts.accounts.find((candidate) => candidate.id === accountId)
+    : undefined
+  return {
+    recipient: composer.to[0] ?? null,
+    myName: account?.displayName ?? null,
+    myEmail: account?.email ?? null,
+  }
+}
+
+/**
+ * The unknown-variable prompt, injected by the composer (task 2.3, design
+ * D11): receives the unique unresolved ids in first-appearance order and
+ * resolves with the collected answers (id → value), or null when the
+ * dialog was cancelled (nothing inserts). Module-level like the shortcut
+ * map so this module stays React-free — composer.tsx owns the dialog
+ * state and swaps the implementation on mount; tests can install their
+ * own or leave it unset.
+ */
+export type SnippetVariablePrompt = (
+  variables: string[]
+) => Promise<Record<string, string> | null>
+
+let snippetVariablePrompt: SnippetVariablePrompt | null = null
+
+/** Install/remove the prompt flow (the composer's mount effect; tests). */
+export function setSnippetVariablePrompt(
+  prompt: SnippetVariablePrompt | null
+): void {
+  snippetVariablePrompt = prompt
+}
+
+/** Insert a snippet body as HTML at the current cursor position, with
+ * `{{variable}}` substitution first (task 2.3, design D11): known
+ * variables fill from the compose context, unresolved ones collect into
+ * ONE prompt and each answer applies to all occurrences before the text
+ * converts to HTML. Synchronous fast path when nothing needs asking (the
+ * common case, which also keeps the insert-at-caret behavior observable
+ * synchronously); the prompting path continues asynchronously off the
+ * click handler. Cancelling the prompt inserts nothing. */
 export function insertSnippetBody(editor: Editor, body: string): void {
-  editor.chain().focus().insertContent(snippetBodyToHtml(body)).run()
+  const context = snippetVariableContext()
+  const { text, unknownVariables } = substituteSnippetVariables(body, context)
+  if (unknownVariables.length === 0 || !snippetVariablePrompt) {
+    // Nothing to ask (or no prompt flow installed — tests, or a host that
+    // never mounted the dialog): insert as substituted, with unresolved
+    // placeholders left literal rather than dropping the snippet.
+    editor.chain().focus().insertContent(snippetBodyToHtml(text)).run()
+    return
+  }
+  void snippetVariablePrompt(unknownVariables).then((answers) => {
+    // The composer (and its editor) can unmount while the dialog is open.
+    if (answers === null || editor.isDestroyed) return
+    const resolved = substituteSnippetVariables(body, context, answers).text
+    editor.chain().focus().insertContent(snippetBodyToHtml(resolved)).run()
+  })
 }
 
 /** Shortcut → snippet lookup the expansion plugin consults per keystroke.
@@ -122,11 +202,22 @@ export function createSnippetExpansion(): Extension {
 
               event.preventDefault()
               const from = $from.pos - shortcut.length
+              // Substitution on the keyboard path too (task 2.3, design
+              // D11) — but WITHOUT prompting: a keydown handler must return
+              // synchronously and a dialog round-trip cannot, so ids
+              // without a context value stay literal `{{id}}` in the
+              // expanded text — visible, editable placeholders. The menu
+              // path (insertSnippetBody) is the one that MUST show the
+              // prompt dialog.
+              const { text } = substituteSnippetVariables(
+                snippet.body,
+                snippetVariableContext()
+              )
               editor
                 .chain()
                 .focus()
                 .deleteRange({ from, to: $from.pos })
-                .insertContent(snippetBodyToHtml(snippet.body))
+                .insertContent(snippetBodyToHtml(text))
                 .run()
               return true
             },

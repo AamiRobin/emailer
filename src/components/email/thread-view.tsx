@@ -4,27 +4,47 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type RefObject,
 } from "react"
 import {
+  AppWindow,
   Archive,
   Ban,
   BellOff,
   Check,
+  ChevronDown,
   Clock,
+  PanelRight,
+  Printer,
+  ListChecks,
+  ListPlus,
   ListTodo,
   Mail,
   MailOpen,
   Pin,
+  RefreshCw,
   Reply,
+  ScrollText,
   StickyNote,
   Star,
   Trash2,
+  WandSparkles,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Separator } from "@/components/ui/separator"
 import { Textarea } from "@/components/ui/textarea"
+import { isAiConfigured, isSurfaceEnabled } from "@/services/ai/settings"
+import { getThreadSummary } from "@/services/ai/summaries"
+import { isTauriRuntime, openThreadInPopout } from "@/services/desktop/popout"
+import { printThread } from "@/services/renderer/print"
 import { getAccount, toEmailAccount } from "@/services/db/accounts"
 import type { BlockedSenderAction } from "@/services/db/blocked-senders"
 import type { SqlExecutor } from "@/services/db/executor"
@@ -47,6 +67,7 @@ import {
   trashThread,
 } from "@/services/email-actions/thread-actions"
 import { setThreadNote } from "@/services/email-actions/notes"
+import { getMarkReadOnOpen } from "@/services/settings/preferences"
 import { useFolderCountsStore } from "@/stores/folder-counts-store"
 import {
   parseThreadParticipants,
@@ -56,16 +77,24 @@ import { useAccountStore } from "@/stores/account-store"
 import type { Recipient } from "@/stores/composer-store"
 import { useUiStore } from "@/stores/ui-store"
 import { addThreadToTodos } from "@/components/layout/use-todos"
+import { buildTaskPrefill } from "@/components/layout/use-tasks"
 import { BlockSenderDialog } from "./block-sender-dialog"
 import { blockSenderWithRefresh } from "./block-sender-flow"
+import { ContactSidebar } from "./contact-sidebar"
+import { CreateTaskDialog } from "./create-task-dialog"
 import { MailDisplay } from "./mail-display"
 import { openReplyForThread } from "./reply-opener"
+import { SmartReplyDialog } from "./smart-reply-dialog"
+import { QuickReplyChips } from "./quick-reply-chips"
 import { SnoozeMenu } from "./snooze-menu"
 import { snoozeThreadsWithRefresh } from "./snooze-flow"
 import {
   applyThreadStatesWithRefresh,
   type ThreadStateKind,
 } from "./thread-state-flow"
+import { TaskExtractionDialog } from "./task-extraction-dialog"
+import { FindBar } from "./find-bar"
+import { FindSession, FindSessionContext } from "./find-session"
 
 /**
  * ThreadView — the real reading-pane content (tasks 7.1/7.3/7.4/7.5-UI).
@@ -104,11 +133,47 @@ import {
  * additions join them: "Add to Todos" (task 15.2, the shared todos flow
  * in layout/use-todos — idempotent via UNIQUE(thread_id)) and the private
  * note toggle (task 15.1) revealing the auto-saving ThreadNotes editor
- * pinned under the toolbar. "Block sender" (task 18.2, the mail-security
+ * pinned under the toolbar. "Create task" (task 5.7, tasks spec "Task
+ * from email") opens the prefill/confirm conversion dialog
+ * (create-task-dialog.tsx); confirming writes a tasks row with the
+ * source back-links through the shared use-tasks flow and deliberately
+ * never touches the thread's inbox state. "Block sender" (task 18.2, the mail-security
  * spec's "Block from the reading pane" scenario) renders only when the
  * thread has a usable cached sender (the context menu's availability
  * condition) and opens the shared confirm dialog behind the SAME block
  * flow as the thread-list context menu (block-sender-flow.ts).
+ *
+ * AI task suggestions (task 4.8, ai-assistance spec "Task extraction"):
+ * a "Suggest tasks" toolbar button — rendered ONLY when AI is configured
+ * and the taskExtraction surface is enabled (async best-effort flag load,
+ * default hidden per the spec's hide-when-unconfigured posture) — opens
+ * the review dialog (task-extraction-dialog.tsx). Suggestions are created
+ * exclusively through the accepted-suggestion seam
+ * (services/tasks/create.ts); rejecting or closing creates nothing.
+ *
+ * Thread summary (task 4.4, ai-assistance spec "Thread summaries"): a
+ * "Summarize thread" toolbar button beside it — same hide-when-
+ * unavailable posture (isAiConfigured + the summaries surface toggle) —
+ * toggles the collapsible summary panel between the subject and the
+ * message list (ThreadSummaryPanel below). The panel runs through
+ * services/ai/summaries.getThreadSummary, which caches under the
+ * thread's message-id set (design D2): an unchanged thread re-opens hit
+ * the cache and render instantly, a new message changes the set and the
+ * next request generates fresh — the spec's invalidation. Provider
+ * failures render inline with Retry; the panel's Regenerate re-runs the
+ * refresh path, and when the loaded message set no longer matches the
+ * summary's, a "thread changed" hint points at it.
+ *
+ * Contact sidebar (task 2.7, contacts spec "Contact sidebar", design D14):
+ * a toolbar toggle (default CLOSED) reveals a fixed-width right-hand
+ * column beside the message list — flex layout, so the list shrinks and
+ * nothing is covered. The column (contact-sidebar.tsx) shows the
+ * thread's original sender (first message chronologically — the sidebar's
+ * mapping of the spec's "current message's sender"), their avatar, a
+ * compose-to action and the recent threads with that address, each
+ * activating the same ui-store selection as the thread list. The toggle
+ * state lives in ThreadView so it survives thread switches within a
+ * session while still defaulting to closed on every mount.
  *
  * Inline reply (task 7.6): a muted one-line affordance below the message
  * list expands into a compact summary (resolved To/Cc, Re: subject) whose
@@ -120,11 +185,36 @@ import {
  * reply (not reply-all); see reply-opener.ts for the composer-store
  * bridge ordering contract shared with the list's context menu and the
  * keyboard binding.
+ *
+ * Find in message (task 1.1, design D5): Ctrl/Cmd+F (the global binding,
+ * or the same keys pressed inside a body frame — the frames forward them
+ * through the bridge) opens a floating find bar over the message column.
+ * Search executes INSIDE the expanded messages' sandboxed frames via the
+ * safe-email-frame postMessage bridge (find-session.ts coordinates): all
+ * matches are highlighted, the count shows "n of m", next/previous wrap
+ * across frames, Escape/close clears the highlights and never moves the
+ * reading position. Collapsed messages' bodies are not searched — the bar
+ * reports their count as "N in collapsed messages" — and composed reply
+ * areas/notes live outside every frame, so they are excluded naturally.
+ * Search is purely local DOM work: no network, no image unblocking.
  */
 
 export function ThreadView() {
   const activeThread = useUiStore((state) => state.activeThread)
   const activeAccountId = useAccountStore((state) => state.activeAccountId)
+  // Bumped by the cross-window bridge (1.9) when the open thread changes
+  // in another window: the key remount re-reads thread + messages from
+  // SQLite, converging read state / labels / archive in place.
+  const activeThreadRevision = useUiStore((state) => state.activeThreadRevision)
+  /**
+   * Task 2.7 (contacts spec "Contact sidebar"): the sidebar's open state
+   * lives HERE — above the keyed ThreadViewContent — so the toggle
+   * persists across thread switches within a session instead of resetting
+   * on every remount. Still local state, and still DEFAULT CLOSED on
+   * every mount: the message body is never displaced until the user
+   * opens the sidebar (the spec's toggleability requirement).
+   */
+  const [contactSidebarOpen, setContactSidebarOpen] = useState(false)
 
   if (!activeThread || !activeAccountId) {
     return (
@@ -137,9 +227,11 @@ export function ThreadView() {
   }
   return (
     <ThreadViewContent
-      key={`${activeAccountId}:${activeThread}`}
+      key={`${activeAccountId}:${activeThread}:${activeThreadRevision}`}
       threadId={activeThread}
       accountId={activeAccountId}
+      contactSidebarOpen={contactSidebarOpen}
+      onToggleContactSidebar={() => setContactSidebarOpen((open) => !open)}
     />
   )
 }
@@ -156,9 +248,15 @@ interface ThreadViewState {
 function ThreadViewContent({
   threadId,
   accountId,
+  contactSidebarOpen,
+  onToggleContactSidebar,
 }: {
   threadId: string
   accountId: string
+  /** Task 2.7: whether the reading-pane contact sidebar column is shown
+   * (owned by ThreadView — see the note there). */
+  contactSidebarOpen: boolean
+  onToggleContactSidebar: () => void
 }) {
   const [state, setState] = useState<ThreadViewState>({
     loaded: null,
@@ -191,7 +289,63 @@ function ThreadViewContent({
   /** The reading-pane block sender (task 18.2): the confirm dialog's
    * open state — mounted fresh per open, like the context menu's. */
   const [blockOpen, setBlockOpen] = useState(false)
+  /** Task-from-email conversion (task 5.7): the prefill/confirm dialog's
+   * open state — mounted fresh per open (the block dialog's pattern). */
+  const [createTaskOpen, setCreateTaskOpen] = useState(false)
+  /** Task extraction (task 4.8): whether the AI affordance may appear at
+   * all (loaded best-effort below — default OFF, the spec's hide posture),
+   * and the review dialog's open state. */
+  const [aiTasksAvailable, setAiTasksAvailable] = useState(false)
+  const [extractOpen, setExtractOpen] = useState(false)
+  /** Thread summary (task 4.4): the same best-effort availability flag
+   * for the summaries surface, plus the panel's open state (the panel
+   * exists only after the user asks for it; its content state lives in
+   * ThreadSummaryPanel). */
+  const [aiSummariesAvailable, setAiSummariesAvailable] = useState(false)
+  const [summaryOpen, setSummaryOpen] = useState(false)
+  /** Smart replies (task 4.5): the same best-effort availability flag for
+   * the smartReplies surface, plus the dialog's open state (the dialog is
+   * mounted fresh per open so the profile probe re-runs). */
+  const [aiRepliesAvailable, setAiRepliesAvailable] = useState(false)
+  const [smartReplyOpen, setSmartReplyOpen] = useState(false)
   const [pendingAction, setPendingAction] = useState<string | null>(null)
+
+  // ---- Find in message (task 1.1, design D5) -----------------------------
+  //
+  // One session per keyed mount: the highlight state lives inside the
+  // expanded messages' sandboxed frames, so a thread switch unmounts both
+  // and the search is simply over — the clean close the spec asks for.
+  // The session coordinates over the postMessage bridge (find-session.ts);
+  // the bar reads its snapshot via useSyncExternalStore.
+  const [findSession] = useState(
+    () =>
+      new FindSession({
+        // Frame key reach-through (Ctrl/Cmd+F and Escape pressed inside a
+        // body frame never reach the global listener) maps onto the
+        // ui-store flag; the flag drives open/close in the effect below.
+        onRequestOpen: () => useUiStore.getState().setReadingPaneFindOpen(true),
+        onRequestEscape: () =>
+          useUiStore.getState().setReadingPaneFindOpen(false),
+      })
+  )
+  const findSnapshot = useSyncExternalStore(
+    findSession.subscribe,
+    findSession.getSnapshot
+  )
+  const findOpen = useUiStore((state) => state.readingPaneFindOpen)
+
+  // Disposal resets the flag so a remount never resurrects an empty bar.
+  useEffect(() => {
+    return () => {
+      findSession.dispose()
+      useUiStore.getState().setReadingPaneFindOpen(false)
+    }
+  }, [findSession])
+
+  useEffect(() => {
+    if (findOpen) findSession.open()
+    else findSession.close()
+  }, [findOpen, findSession])
 
   // Thread opens already marked read — the once-per-open guard (a ref
   // survives React StrictMode's double effect invocation).
@@ -199,6 +353,24 @@ function ThreadViewContent({
 
   const thread = state.loaded?.thread ?? null
   const messages = state.loaded?.messages ?? []
+  // Collapsed messages' bodies are not searched (their frames do not
+  // exist); the bar reports how many of them carry one ("N in collapsed
+  // messages"). Composed reply areas and notes live in the shell DOM —
+  // outside every frame — so they are excluded by construction. The memo
+  // reads the loaded payload directly so `messages`'s `?? []` fallback
+  // (a new array every render) cannot churn the memo identity.
+  const collapsedBodyCount = useMemo(
+    () =>
+      (state.loaded?.messages ?? []).filter(
+        (message) =>
+          !expandedIds.has(message.id) &&
+          (message.body_html !== null || message.body_text !== null)
+      ).length,
+    [state.loaded, expandedIds]
+  )
+  useEffect(() => {
+    findSession.setCollapsedCount(collapsedBodyCount)
+  }, [findSession, collapsedBodyCount])
   const disabled = thread === null || pendingAction !== null
   /**
    * Task 9.2 (unified inbox): account-scoped operations target the open
@@ -218,6 +390,27 @@ function ThreadViewContent({
    */
   const blockSenderEmail = thread
     ? (parseThreadParticipants(thread.participants)[0]?.email ?? null)
+    : null
+  /**
+   * Task 2.7 sidebar sender: the contacts spec's "current message's
+   * sender" maps to the thread's ORIGINAL sender — messages load in
+   * chronological order, so the FIRST message's from-header is the
+   * identity the correspondence is anchored to (contrast: the block
+   * sender affordance above targets the NEWEST message's cached sender).
+   */
+  const sidebarSenderEmail = messages[0]?.from_address ?? null
+  const sidebarSenderName = messages[0]?.from_name ?? null
+  /**
+   * Task 5.7 conversion prefill (tasks spec "Task from email"): the
+   * thread subject as the title, the NEWEST message's snippet as the
+   * notes (capped by buildTaskPrefill). Computed at dialog-open render —
+   * the dialog is mounted fresh per open, so this is its starting state.
+   */
+  const taskPrefill = thread
+    ? buildTaskPrefill(
+        thread.subject,
+        messages[messages.length - 1]?.snippet ?? thread.snippet
+      )
     : null
 
   useEffect(() => {
@@ -342,6 +535,91 @@ function ThreadViewContent({
     })
   }, [])
 
+  // Task 4.8 (ai-assistance spec "No provider configured" + "Disable a
+  // single surface"): the "Suggest tasks" affordance renders ONLY when AI
+  // is configured AND the taskExtraction surface is enabled. Best-effort
+  // flag load like the todos lookup above — any failure (no executor,
+  // settings read error) leaves the default false, i.e. hidden, which is
+  // exactly the spec's fail-toward-hidden posture for AI affordances.
+  useEffect(() => {
+    let cancelled = false
+    try {
+      const executor = getExecutor()
+      void (async () => {
+        try {
+          const [configured, surface] = await Promise.all([
+            isAiConfigured(executor),
+            isSurfaceEnabled(executor, "taskExtraction"),
+          ])
+          if (!cancelled) setAiTasksAvailable(configured && surface)
+        } catch {
+          if (!cancelled) setAiTasksAvailable(false)
+        }
+      })()
+    } catch {
+      // No executor (plain vite, tests without a db override) — hidden.
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [threadId])
+
+  // Task 4.4 (ai-assistance spec "No provider configured" + "Disable a
+  // single surface"): the "Summarize thread" affordance renders ONLY when
+  // AI is configured AND the summaries surface is enabled — the same
+  // best-effort flag load and fail-toward-hidden posture as the task
+  // extraction flag above.
+  useEffect(() => {
+    let cancelled = false
+    try {
+      const executor = getExecutor()
+      void (async () => {
+        try {
+          const [configured, surface] = await Promise.all([
+            isAiConfigured(executor),
+            isSurfaceEnabled(executor, "summaries"),
+          ])
+          if (!cancelled) setAiSummariesAvailable(configured && surface)
+        } catch {
+          if (!cancelled) setAiSummariesAvailable(false)
+        }
+      })()
+    } catch {
+      // No executor (plain vite, tests without a db override) — hidden.
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [threadId])
+
+  // Task 4.5 (ai-assistance spec "No provider configured" + "Disable a
+  // single surface"): the "Smart reply" affordance renders ONLY when AI is
+  // configured AND the smartReplies surface is enabled — the same
+  // best-effort flag load and fail-toward-hidden posture as the task
+  // extraction and summaries flags above.
+  useEffect(() => {
+    let cancelled = false
+    try {
+      const executor = getExecutor()
+      void (async () => {
+        try {
+          const [configured, surface] = await Promise.all([
+            isAiConfigured(executor),
+            isSurfaceEnabled(executor, "smartReplies"),
+          ])
+          if (!cancelled) setAiRepliesAvailable(configured && surface)
+        } catch {
+          if (!cancelled) setAiRepliesAvailable(false)
+        }
+      })()
+    } catch {
+      // No executor (plain vite, tests without a db override) — hidden.
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [threadId])
+
   const handleAllowSender = useCallback(
     (senderEmail: string) => {
       const normalized = normalizeSenderEmail(senderEmail)
@@ -413,6 +691,16 @@ function ThreadViewContent({
     },
     [threadId, owningAccountId]
   )
+
+  /**
+   * Sidebar row activation (task 2.7): select the clicked thread — the
+   * pane reloads through the same ui-store selection the thread list
+   * uses (the keyed content remounts; the toggle itself survives in
+   * ThreadView, so the sidebar stays open beside the new thread).
+   */
+  const openSidebarThread = useCallback((nextThreadId: string) => {
+    useUiStore.getState().setActiveThread(nextThreadId)
+  }, [])
 
   /**
    * Toolbar snooze (task 2.3): the shared snooze flow (service + toast +
@@ -534,6 +822,15 @@ function ThreadViewContent({
           >
             {thread.subject || "(no subject)"}
           </h2>
+          {/* Task 4.4: the AI summary panel sits between the subject and
+              the message list, exists only while toggled open, and loads
+              on mount (cache hits render instantly — design D2). */}
+          {summaryOpen && (
+            <ThreadSummaryPanel
+              threadId={threadId}
+              currentMessageIds={messages.map((message) => message.id)}
+            />
+          )}
           <div className="pt-2">
             {messages.map((message) => (
               <div
@@ -558,6 +855,18 @@ function ThreadViewContent({
               </div>
             ))}
           </div>
+          {/* Task 2.4 (parity-round-2): quick-reply chips above the inline
+              reply affordance. Self-gating — the component renders nothing
+              unless AI is configured and the quickReplies surface is on —
+              and insert-only: a chip opens the composer prefilled as an
+              editable reply, nothing sends automatically. */}
+          {messages.length > 0 && (
+            <QuickReplyChips
+              threadId={threadId}
+              accountId={owningAccountId}
+              disabled={disabled}
+            />
+          )}
           {/* Task 7.6: inline reply affordance below the message list. */}
           {messages.length > 0 && (
             <InlineReply
@@ -578,6 +887,61 @@ function ThreadViewContent({
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center p-2">
         <div className="flex items-center gap-1">
+          {isTauriRuntime() && (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    data-testid="toolbar-print"
+                    disabled={disabled}
+                    title="Print"
+                  >
+                    <Printer className="size-4" />
+                    <span className="sr-only">Print</span>
+                  </Button>
+                }
+              />
+              <DropdownMenuContent align="end" data-testid="print-menu">
+                <DropdownMenuItem
+                  onClick={() => {
+                    const latest = messages[messages.length - 1]
+                    if (latest) {
+                      void printThread(threadId, {
+                        kind: "message",
+                        messageId: latest.id,
+                      }).catch(() => {})
+                    }
+                  }}
+                >
+                  Print this message
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => {
+                    void printThread(threadId, { kind: "thread" }).catch(
+                      () => {}
+                    )
+                  }}
+                >
+                  Print whole thread
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+          {isTauriRuntime() && (
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="toolbar-open-in-window"
+              disabled={disabled}
+              title="Open in new window"
+              onClick={() => openThreadInPopout(threadId)}
+            >
+              <AppWindow className="size-4" />
+              <span className="sr-only">Open in new window</span>
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -731,6 +1095,23 @@ function ThreadViewContent({
               {isTodo ? "In Todos" : "Add to Todos"}
             </span>
           </Button>
+          {/* Task 5.7: convert the thread into a task (tasks spec "Task
+              from email") — opens the prefill/confirm dialog; confirming
+              writes a tasks row with the source back-links and leaves the
+              thread's inbox state untouched. A sibling of the Todos
+              affordance above, so the icon differs (ListPlus vs the Todos
+              check-list) while sitting in the same group. */}
+          <Button
+            variant="ghost"
+            size="icon"
+            data-testid="toolbar-create-task"
+            disabled={disabled}
+            title="Create task"
+            onClick={() => setCreateTaskOpen(true)}
+          >
+            <ListPlus className="size-4" />
+            <span className="sr-only">Create task</span>
+          </Button>
           {/* Task 15.1: toggle the private note editor. Emphasized while a
               note exists so a closed editor is still discoverable. */}
           <Button
@@ -748,6 +1129,82 @@ function ThreadViewContent({
             <span className="sr-only">
               {hasNote ? "Edit note" : "Add a note"}
             </span>
+          </Button>
+          {/* Task 4.8: AI task suggestions (ai-assistance spec "Task
+              extraction"). Rendered ONLY when AI is configured and the
+              taskExtraction surface is enabled (see the availability
+              effect — absent otherwise, never a disabled error state);
+              opens the review dialog where nothing is created until the
+              user accepts a suggestion. */}
+          {aiTasksAvailable && (
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="toolbar-extract-tasks"
+              disabled={disabled}
+              title="Suggest tasks"
+              onClick={() => setExtractOpen(true)}
+            >
+              <ListChecks className="size-4" />
+              <span className="sr-only">Suggest tasks</span>
+            </Button>
+          )}
+          {/* Task 4.4: AI thread summary (ai-assistance spec "Thread
+              summaries"). Rendered ONLY when AI is configured and the
+              summaries surface is enabled (see the availability effect —
+              never a disabled error state); toggles the summary panel
+              between the subject and the message list. A view toggle like
+              the note editor, not a thread mutation. */}
+          {aiSummariesAvailable && (
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="toolbar-summarize"
+              disabled={disabled}
+              aria-pressed={summaryOpen}
+              title="Summarize thread"
+              onClick={() => setSummaryOpen((open) => !open)}
+            >
+              <ScrollText className="size-4" />
+              <span className="sr-only">Summarize thread</span>
+            </Button>
+          )}
+          {/* Task 4.5: AI smart reply (ai-assistance spec "Writing-style
+              smart replies"). Rendered ONLY when AI is configured and the
+              smartReplies surface is enabled (see the availability effect —
+              absent otherwise, never a disabled error state); opens the
+              smart-reply dialog where the suggestion is built first as a
+              consent/build step when no writing-style profile exists, and
+              is inserted into the composer as an EDITABLE draft only when
+              the user clicks "Use reply". */}
+          {aiRepliesAvailable && (
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="toolbar-smart-reply"
+              disabled={disabled}
+              title="Smart reply"
+              onClick={() => setSmartReplyOpen(true)}
+            >
+              <WandSparkles className="size-4" />
+              <span className="sr-only">Smart reply</span>
+            </Button>
+          )}
+          {/* Task 2.7: toggle the reading-pane contact sidebar. A view
+              toggle like the note editor, not a thread mutation — it only
+              flips the local open flag (default CLOSED, so the body is
+              never displaced until asked for). */}
+          <Button
+            variant="ghost"
+            size="icon"
+            data-testid="toolbar-contact-sidebar"
+            disabled={disabled}
+            aria-pressed={contactSidebarOpen}
+            title="Contact sidebar"
+            onClick={onToggleContactSidebar}
+          >
+            <PanelRight className="size-4" />
+            <span className="sr-only">Contact sidebar</span>
           </Button>
           {/* Task 18.2: the reading-pane Block sender entry (the mail-
               security spec's "Block from the reading pane" scenario) —
@@ -787,17 +1244,53 @@ function ThreadViewContent({
         </div>
       </div>
       <Separator />
-      {/* Task 15.1: the collapsible private-note editor, pinned under the
-          toolbar so a note stays visible above the messages while open.
-          Closing (or switching threads) flushes a pending auto-save. */}
-      {notesOpen && thread && (
-        <ThreadNotes
-          threadId={threadId}
-          initialNote={thread.note ?? null}
-          onHasNoteChange={setHasNote}
-        />
-      )}
-      {renderBody()}
+      {/* Task 2.7: body row. The message column and the optional contact
+          sidebar share the height via flex — the sidebar SHRINKS the list
+          beside it (never overlays it), and mounts only when toggled on
+          (default closed, so the default reading experience is unchanged;
+          it needs a loaded thread AND a usable sender address). */}
+      <div className="flex min-h-0 flex-1">
+        {/* Task 1.1: the find session is scoped to the message column —
+            exactly the subtree whose frames carry searchable bodies. The
+            bar floats over the column's top-right so opening and closing
+            it never reflows the thread (reading position is preserved). */}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <FindSessionContext.Provider value={findSession}>
+            {/* Task 15.1: the collapsible private-note editor, pinned under
+                the toolbar so a note stays visible above the messages while
+                open. Closing (or switching threads) flushes a pending
+                auto-save. */}
+            {notesOpen && thread && (
+              <ThreadNotes
+                threadId={threadId}
+                initialNote={thread.note ?? null}
+                onHasNoteChange={setHasNote}
+              />
+            )}
+            {findOpen && !state.loading && !state.loadFailed && (
+              <FindBar
+                snapshot={findSnapshot}
+                onTermChange={(term) => findSession.search(term)}
+                onNext={() => findSession.goNext()}
+                onPrevious={() => findSession.goPrevious()}
+                onClose={() =>
+                  useUiStore.getState().setReadingPaneFindOpen(false)
+                }
+              />
+            )}
+            {renderBody()}
+          </FindSessionContext.Provider>
+        </div>
+        {contactSidebarOpen && thread && sidebarSenderEmail && (
+          <ContactSidebar
+            email={sidebarSenderEmail}
+            name={sidebarSenderName}
+            accountId={owningAccountId}
+            excludeThreadId={threadId}
+            onOpenThread={openSidebarThread}
+          />
+        )}
+      </div>
       {/* Task 18.2: the block confirm dialog, mounted fresh per open and
           unmounted on close — the choice made here persists at block time
           (same pattern as the context menu's dialog). Blocking targets the
@@ -810,6 +1303,44 @@ function ThreadViewContent({
           open
           onOpenChange={setBlockOpen}
           onConfirm={confirmBlockSender}
+        />
+      )}
+      {/* Task 5.7: the task-from-email conversion dialog behind the
+          toolbar button. Mounted only while open so the fields always
+          start at the prefill: the thread subject as the title and the
+          NEWEST message's snippet as the notes (capped in
+          buildTaskPrefill). Confirming runs the shared conversion flow,
+          which writes the tasks row only — the thread's inbox state is
+          never touched. */}
+      {createTaskOpen && taskPrefill && (
+        <CreateTaskDialog
+          threadId={threadId}
+          accountId={owningAccountId}
+          defaultTitle={taskPrefill.title}
+          defaultNotes={taskPrefill.notes}
+          open
+          onOpenChange={setCreateTaskOpen}
+        />
+      )}
+      {/* Task 4.8: the review dialog behind "Suggest tasks". Mounted only
+          while open so every open re-runs the (cached) extraction fresh. */}
+      {extractOpen && (
+        <TaskExtractionDialog
+          threadId={threadId}
+          open
+          onOpenChange={setExtractOpen}
+        />
+      )}
+      {/* Task 4.5: the smart-reply dialog behind the wand button. Mounted
+          only while open so every open re-probes the writing-style profile
+          (consent card first when none is stored). Targets the thread's
+          OWNING account, like every account-scoped toolbar action. */}
+      {smartReplyOpen && (
+        <SmartReplyDialog
+          threadId={threadId}
+          accountId={owningAccountId}
+          open
+          onOpenChange={setSmartReplyOpen}
         />
       )}
     </div>
@@ -1127,6 +1658,268 @@ function ThreadNotes({
 }
 
 // ---------------------------------------------------------------------------
+// Thread summary panel (task 4.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * The panel's content state machine (task 4.4): loading → one of
+ * shown / empty / error. The `shown` phase keeps the summary's cache
+ * identity — the D2 cache key plus the message ids it covers — so the
+ * panel can tell when the open thread's message set no longer matches
+ * what the summary was generated from.
+ */
+type ThreadSummaryPhase =
+  | { phase: "loading" }
+  | {
+      phase: "shown"
+      summary: string
+      cached: boolean
+      cacheKey: string
+      messageIds: string[]
+      model: string
+    }
+  | { phase: "empty" }
+  | { phase: "error"; message: string; retryable: boolean }
+
+/**
+ * The reading pane's AI summary panel (task 4.4, ai-assistance spec
+ * "Thread summaries"). Mounted only while toggled open (the toolbar's
+ * Summarize button); loads through services/ai/summaries.getThreadSummary
+ * on mount — a cache hit (same message-id set, same model — design D2)
+ * resolves without a provider round-trip and renders instantly, a miss
+ * generates fresh, which is also exactly what happens after a new message
+ * arrives (the changed id set misses: the spec's invalidation, surfaced
+ * as the fresh summary the next click shows).
+ *
+ * The header keeps the explicit "AI summary" label plus a "Generated by
+ * {model}" hint (the spec's indicate-AI-content requirement), a collapse
+ * toggle, and a Regenerate button — the service's refresh path, which
+ * skips the cache read and overwrites the entry for the same identity.
+ * Provider failures render inline with Retry (spec "Provider outage");
+ * when the loaded messages no longer match the summary's message set, a
+ * "thread changed" hint points at Regenerate. Note the loaded set only
+ * changes across remounts today (the cross-window revision key), where
+ * the panel unmounts too — the hint is cheap insurance for live updates
+ * and documents the staleness signal either way.
+ */
+function ThreadSummaryPanel({
+  threadId,
+  currentMessageIds,
+}: {
+  threadId: string
+  /** The open thread's message ids as loaded by the reading pane — the
+   * staleness hint compares these with the summary's. */
+  currentMessageIds: string[]
+}) {
+  const [state, setState] = useState<ThreadSummaryPhase>({ phase: "loading" })
+  const [collapsed, setCollapsed] = useState(false)
+  // Monotonic request id: only the newest load may land (a slow first
+  // summary must not overwrite a completed Regenerate).
+  const requestRef = useRef(0)
+
+  /**
+   * Run one summary load WITHOUT touching the loading phase: the mount
+   * effect calls this directly (initial state is already "loading", and
+   * an effect must not setState synchronously), landing every outcome
+   * through the async callbacks below. Event handlers go through `load`.
+   */
+  const runLoad = useCallback(
+    (refresh: boolean) => {
+      const requestId = ++requestRef.current
+      void Promise.resolve()
+        .then(() =>
+          getThreadSummary(
+            getExecutor(),
+            threadId,
+            refresh ? { refresh: true } : undefined
+          )
+        )
+        .then((result) => {
+          if (requestRef.current !== requestId) return
+          if (result.kind === "summary") {
+            setState({
+              phase: "shown",
+              summary: result.summary,
+              cached: result.cached,
+              // Kept alongside per the panel-state contract: a later
+              // recomputed key that differs means the thread's message
+              // set changed since this summary was stored.
+              cacheKey: result.cacheKey,
+              messageIds: result.messageIds,
+              model: result.model,
+            })
+          } else if (result.kind === "empty") {
+            setState({ phase: "empty" })
+          } else if (result.kind === "unavailable") {
+            // Defensive — the toolbar hides when this is true.
+            setState({
+              phase: "error",
+              message:
+                result.reason === "not-configured"
+                  ? "AI assistance is not configured."
+                  : "The summaries surface is disabled.",
+              retryable: false,
+            })
+          } else {
+            setState({
+              phase: "error",
+              message: result.message,
+              retryable: result.retryable,
+            })
+          }
+        })
+        .catch((error) => {
+          // getThreadSummary resolves all its own outcomes; this only
+          // guards executor-level surprises. Never left loading.
+          if (requestRef.current !== requestId) return
+          setState({
+            phase: "error",
+            message: error instanceof Error ? error.message : String(error),
+            retryable: true,
+          })
+        })
+    },
+    [threadId]
+  )
+
+  /** Event-handler entry (Regenerate / Retry): reset to the loading
+   * phase, then run the load. */
+  const load = useCallback(
+    (refresh: boolean) => {
+      setState({ phase: "loading" })
+      runLoad(refresh)
+    },
+    [runLoad]
+  )
+
+  useEffect(() => {
+    runLoad(false)
+  }, [runLoad])
+
+  // Staleness signal: the summary's message set vs. the reading pane's
+  // loaded set. Within the D2 key the id set is the varying part, so set
+  // equality is key equality here (same model within a mount).
+  const stale =
+    state.phase === "shown" &&
+    state.messageIds.join("\n") !== currentMessageIds.join("\n")
+
+  return (
+    <div data-testid="thread-summary" className="px-6 pt-4">
+      <div className="rounded-lg border border-border bg-muted/30 p-3">
+        <div className="flex items-center gap-1.5">
+          <ScrollText
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-muted-foreground"
+          />
+          <button
+            type="button"
+            data-testid="thread-summary-toggle"
+            className="text-xs font-medium text-muted-foreground hover:text-foreground"
+            onClick={() => setCollapsed((value) => !value)}
+          >
+            AI summary
+          </button>
+          {state.phase === "shown" && (
+            <span className="min-w-0 truncate text-xs text-muted-foreground/70">
+              Generated by {state.model}
+              {state.cached ? " · cached" : ""} — AI-generated, may be imperfect
+            </span>
+          )}
+          <span className="ml-auto flex items-center gap-0.5">
+            {state.phase === "shown" && (
+              <Button
+                variant="ghost"
+                size="icon"
+                data-testid="thread-summary-regenerate"
+                className="size-6"
+                title="Regenerate summary"
+                onClick={() => load(true)}
+              >
+                <RefreshCw className="size-3.5" />
+                <span className="sr-only">Regenerate summary</span>
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6"
+              title={collapsed ? "Expand summary" : "Collapse summary"}
+              onClick={() => setCollapsed((value) => !value)}
+            >
+              <ChevronDown
+                className={collapsed ? "size-3.5" : "size-3.5 rotate-180"}
+              />
+              <span className="sr-only">
+                {collapsed ? "Expand summary" : "Collapse summary"}
+              </span>
+            </Button>
+          </span>
+        </div>
+        {!collapsed && (
+          <div className="pt-2">
+            {state.phase === "loading" && (
+              <div
+                data-testid="thread-summary-loading"
+                className="text-sm text-muted-foreground"
+              >
+                Summarizing the conversation…
+              </div>
+            )}
+            {state.phase === "shown" && (
+              <>
+                {stale && (
+                  <div
+                    data-testid="thread-summary-stale"
+                    className="pb-2 text-xs text-muted-foreground"
+                  >
+                    The thread changed since this summary — Regenerate for the
+                    latest messages.
+                  </div>
+                )}
+                <p
+                  data-testid="thread-summary-text"
+                  className="text-sm whitespace-pre-wrap"
+                >
+                  {state.summary}
+                </p>
+              </>
+            )}
+            {state.phase === "empty" && (
+              <div
+                data-testid="thread-summary-empty"
+                className="text-sm text-muted-foreground"
+              >
+                No messages to summarize.
+              </div>
+            )}
+            {state.phase === "error" && (
+              <div
+                data-testid="thread-summary-error"
+                className="flex flex-col items-start gap-2"
+              >
+                <span className="text-sm text-destructive">
+                  {state.message}
+                </span>
+                {state.retryable && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    data-testid="thread-summary-retry"
+                    onClick={() => load(false)}
+                  >
+                    Retry
+                  </Button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1151,9 +1944,13 @@ async function lookupSenderAllowed(
 
 /**
  * Mark the thread read once per open when it had unread messages, then
- * refresh the list/folder caches. The guard ref survives StrictMode's
- * double effect invocation; a failed mutation releases the guard so the
- * next open retries.
+ * refresh the list/folder caches. Gated by the mark-as-read-on-open
+ * reading preference (task 1.4, default on): with the toggle off the
+ * open leaves the unread state untouched — manual mark read/unread
+ * controls and the rules engine's mark_read action go straight through
+ * setThreadRead and are never gated by this. The guard ref survives
+ * StrictMode's double effect invocation; a failed mutation (or a
+ * disabled toggle) releases the guard so the next open retries.
  */
 function markThreadReadOnOpen(
   executor: SqlExecutor,
@@ -1167,13 +1964,26 @@ function markThreadReadOnOpen(
   const guardKey = `${accountId}:${threadId}`
   if (guard.current?.has(guardKey)) return
   guard.current?.add(guardKey)
-  setThreadRead(executor, accountId, threadId, true)
-    .then(() => Promise.all([refreshThreadList(), refreshFolderIndicators()]))
-    .then(() => {
+  void (async () => {
+    // Preference read: a failed read keeps the historical behavior
+    // (fail toward marking read — the pre-1.4 semantics).
+    let enabled = true
+    try {
+      enabled = await getMarkReadOnOpen(executor)
+    } catch (error) {
+      console.warn("[thread-view] mark-read-on-open preference read failed", error)
+    }
+    if (!enabled) {
+      guard.current?.delete(guardKey)
+      return
+    }
+    try {
+      await setThreadRead(executor, accountId, threadId, true)
+      await Promise.all([refreshThreadList(), refreshFolderIndicators()])
       onComplete()
-    })
-    .catch((error) => {
+    } catch (error) {
       console.warn("[thread-view] mark-read-on-open failed", error)
       guard.current?.delete(guardKey)
-    })
+    }
+  })()
 }

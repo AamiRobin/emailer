@@ -1,31 +1,33 @@
-//! Unread badge (task 4.6). Sets the macOS dock icon badge from the
-//! frontend via tauri's built-in `WebviewWindow::set_badge_count` (no
-//! extra crates needed). Other platforms are a deliberate no-op: Linux
-//! and Windows show the per-account unread counts in the account
-//! switcher UI instead — Windows taskbar overlay icons are out of scope
-//! for this task (tauri itself marks `set_badge_count` unsupported on
-//! Windows).
+//! Unread badge (task 4.6; tray tooltip extension task 1.2). The frontend
+//! pushes the total unread count here at the end of every sync pass:
+//!
+//! - macOS: dock icon badge via tauri's built-in
+//!   `WebviewWindow::set_badge_count` (no extra crates needed);
+//! - all platforms with a tray: the tray tooltip becomes
+//!   "Emailer — N unread" (desktop.rs), which is how Linux/Windows show
+//!   the count outside the app — Windows taskbar overlay icons are out
+//!   of scope (tauri marks `set_badge_count` unsupported on Windows).
 
-#[cfg(target_os = "macos")]
-use tauri::WebviewWindow;
+use tauri::{AppHandle, WebviewWindow};
 
-/// Set the dock badge to `count` unread messages; `0` clears it.
-#[cfg(target_os = "macos")]
+use crate::desktop;
+
 #[tauri::command]
-pub fn set_unread_badge(window: WebviewWindow, count: u32) -> Result<(), String> {
-    window
+pub fn set_unread_badge(app: AppHandle, window: WebviewWindow, count: u32) -> Result<(), String> {
+    desktop::update_tray_unread(&app, count);
+
+    #[cfg(target_os = "macos")]
+    return window
         .set_badge_count(if count > 0 {
             Some(i64::from(count))
         } else {
             None
         })
-        .map_err(|error| error.to_string())
-}
+        .map_err(|error| error.to_string());
 
-/// No-op off macOS (see module docs): the badge is dock-only by design.
-#[cfg(not(target_os = "macos"))]
-#[tauri::command]
-pub fn set_unread_badge(count: u32) -> Result<(), String> {
-    let _ = count;
-    Ok(())
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        Ok(())
+    }
 }

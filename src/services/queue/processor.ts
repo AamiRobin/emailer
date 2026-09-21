@@ -21,6 +21,7 @@ import type {
   SendEmailInput,
 } from "../email/types"
 import { ProviderAuthError } from "../email/types"
+import { GraphApiError } from "../email/graph-api"
 import type { GmailTokenEnvelope } from "../email/token-manager"
 import { createTokenSource } from "../email/token-manager"
 import { createGmailClient } from "../email/gmail-api"
@@ -83,6 +84,10 @@ import "../email/register-providers"
  *   only that account — its ops stay 'pending' and are skipped for the
  *   session until resumeAccountOperations() is called by the account
  *   auth-error flow (task 5.6).
+ * - Permanent Graph rejections: a Graph 404 (message gone server-side),
+ *   400 or 403 can never succeed on replay — the op completes as terminal
+ *   'failed' on the first attempt (error recorded once, no retries) and
+ *   the batch continues past it.
  * - Idempotency: flag/label/placement operations are idempotent (see
  *   operation.ts), so replaying after a crash or ambiguous failure is
  *   safe; `send` relies on a caller-supplied Message-ID for deduplication.
@@ -373,10 +378,55 @@ async function processAccountBatch(
 }
 
 /**
+ * Graph rejections that can NEVER succeed on replay: 404 (the message was
+ * moved or deleted on another device — `ErrorItemNotFound`), 400 (the
+ * request itself is invalid) and 403 (permission denied). Such an op
+ * completes as terminal 'failed' on the FIRST attempt — the error is
+ * recorded once, and the batch continues past it — instead of burning the
+ * retry budget on backoff noise before landing in the same place.
+ */
+function isTerminalGraphFailure(error: unknown): boolean {
+  return (
+    error instanceof GraphApiError &&
+    (error.status === 400 || error.status === 403 || error.status === 404)
+  )
+}
+
+/**
+ * Park an operation in terminal 'failed': the error is recorded once, a
+ * send_mime op's scheduled row is stamped failed with the same sanitized
+ * message, and the batch may continue past the op.
+ */
+async function finalizeFailedOperation(
+  executor: SqlExecutor,
+  row: PendingOperationRow,
+  message: string,
+  result: QueueRunResult,
+  scheduledSendId: string | null
+): Promise<void> {
+  await markOperationFailed(executor, row.id, message)
+  // Task 10.2: a send_mime op reaching a terminal state fails its
+  // scheduled row with the same sanitized error (the user re-sends
+  // manually).
+  if (scheduledSendId !== null) {
+    const applied = await markScheduledSendFailed(
+      executor,
+      scheduledSendId,
+      message
+    )
+    // Terminal transition: the Scheduled dialog must re-query (the row
+    // left the pending group for the failed history). Best-effort.
+    if (applied) notifyScheduledSendsTerminal()
+  }
+  retryAt.delete(row.id)
+  result.failed += 1
+}
+
+/**
  * Record one failed execution and decide the batch's fate. Returns true
  * when the account's batch must stop (auth pause or FIFO hold on a
- * transient failure); false when the failed op is terminal (cap reached)
- * and the batch may continue past it.
+ * transient failure); false when the failed op is terminal (permanent
+ * Graph rejection or cap reached) and the batch may continue past it.
  */
 async function handleOperationFailure(
   executor: SqlExecutor,
@@ -397,23 +447,21 @@ async function handleOperationFailure(
     pauseAccount(accountId, result)
     return true
   }
+  if (isTerminalGraphFailure(error)) {
+    // Permanent Graph rejection (404/400/403): fail-fast terminal on the
+    // first attempt — recorded once, no retries.
+    await finalizeFailedOperation(executor, row, message, result, scheduledSendId)
+    return false
+  }
   const attempts = await incrementOperationAttempts(executor, row.id)
   if (attempts >= MAX_OPERATION_ATTEMPTS) {
-    await markOperationFailed(executor, row.id, message)
-    // Task 10.2: a send_mime op parked at the cap fails its scheduled row
-    // with the same sanitized error (the user re-sends manually).
-    if (scheduledSendId !== null) {
-      const applied = await markScheduledSendFailed(
-        executor,
-        scheduledSendId,
-        message
-      )
-      // Terminal transition: the Scheduled dialog must re-query (the row
-      // left the pending group for the failed history). Best-effort.
-      if (applied) notifyScheduledSendsTerminal()
-    }
-    retryAt.delete(row.id)
-    result.failed += 1
+    await finalizeFailedOperation(
+      executor,
+      row,
+      message,
+      result,
+      scheduledSendId
+    )
     return false
   }
   await requeueOperationForRetry(executor, row.id, message)

@@ -21,6 +21,13 @@ import type { ContactRef } from "@/services/db/messages"
 import { updateMessage } from "@/services/db/messages"
 import { recomputeThreadCaches } from "@/services/db/threads"
 import { setSignature } from "@/services/composer/signatures"
+import { setMarkReadOnOpenPreference } from "@/services/settings/preferences"
+import {
+  addProvider,
+  setActiveProvider,
+  setAiEnabled,
+  setSurfaceEnabled,
+} from "@/services/ai/settings"
 import {
   setAccountStoreExecutor,
   useAccountStore,
@@ -422,6 +429,56 @@ describe("mark-read-on-open", () => {
     await openThread(threadId)
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(threadActions.setThreadRead).not.toHaveBeenCalled()
+  })
+
+  it("keeps the thread unread when the mark-as-read-on-open toggle is off (task 1.4)", async () => {
+    const { threadId } = await seedMixedThread()
+    await setMarkReadOnOpenPreference(executor, false)
+    render(
+      <StrictMode>
+        <ThreadView />
+      </StrictMode>
+    )
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+    await waitFor(() => {
+      expect(screen.getByTestId("thread-subject")).not.toBeNull()
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(threadActions.setThreadRead).not.toHaveBeenCalled()
+    // the rows are untouched — the unread message is still unread
+    const rows = await executor.select<{ is_read: number }>(
+      "SELECT is_read FROM messages WHERE thread_id = $1",
+      [threadId]
+    )
+    expect(rows.some((row) => row.is_read === 0)).toBe(true)
+  })
+
+  it("marks read again once the toggle is back on — the choice persists", async () => {
+    const { threadId } = await seedMixedThread()
+    await setMarkReadOnOpenPreference(executor, false)
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(threadActions.setThreadRead).not.toHaveBeenCalled()
+
+    // the persisted row is the only state — flipping it back on (as the
+    // settings section would, possibly next launch) restores the mark
+    await setMarkReadOnOpenPreference(executor, true)
+    cleanup()
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+    await waitFor(() => {
+      expect(threadActions.setThreadRead).toHaveBeenCalledTimes(1)
+    })
+    expect(threadActions.setThreadRead).toHaveBeenCalledWith(
+      executor,
+      accountId,
+      threadId,
+      true
+    )
   })
 })
 
@@ -1332,5 +1389,63 @@ describe("reading-pane block sender (task 18.2)", () => {
 
     expect(screen.queryByTestId("toolbar-block-sender")).toBeNull()
     expect(screen.queryByTestId("block-sender-dialog")).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Smart reply toolbar affordance (task 4.5)
+// ---------------------------------------------------------------------------
+
+describe("smart reply toolbar affordance (task 4.5)", () => {
+  it("is hidden when AI is not configured", async () => {
+    const { threadId } = await seedMixedThread()
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    expect(screen.queryByTestId("toolbar-smart-reply")).toBeNull()
+  })
+
+  it("is hidden when the smartReplies surface is disabled", async () => {
+    const { threadId } = await seedMixedThread()
+    await setAiEnabled(executor, true)
+    const created = await addProvider(executor, {
+      kind: "anthropic",
+      label: "Work",
+      model: "claude-sonnet-4-5",
+    })
+    await setActiveProvider(executor, created.id)
+    await setSurfaceEnabled(executor, "smartReplies", false)
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    expect(screen.queryByTestId("toolbar-smart-reply")).toBeNull()
+  })
+
+  it("renders when AI is configured and the surface is on; opens the consent-first dialog", async () => {
+    const { threadId } = await seedMixedThread()
+    await setAiEnabled(executor, true)
+    const created = await addProvider(executor, {
+      kind: "anthropic",
+      label: "Work",
+      model: "claude-sonnet-4-5",
+    })
+    await setActiveProvider(executor, created.id)
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    // Gated render: absent until the (async, best-effort) flag load lands,
+    // present once AI is configured and the surface is on.
+    await screen.findByTestId("toolbar-smart-reply")
+
+    fireEvent.click(screen.getByTestId("toolbar-smart-reply"))
+
+    // No writing-style profile exists in this fresh db → the dialog's
+    // consent card comes first, with the sent-mail analysis copy.
+    const consent = await screen.findByTestId("smart-reply-consent")
+    expect(consent.textContent).toMatch(/analyzes your recent sent messages/)
+    expect(consent.textContent).toMatch(/Nothing is sent automatically/)
   })
 })

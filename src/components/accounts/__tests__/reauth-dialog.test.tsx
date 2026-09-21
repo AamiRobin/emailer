@@ -13,6 +13,7 @@ import {
   OauthCancelledError,
   reauthGmailAccount,
   reauthImapPassword,
+  reauthMicrosoftAccount,
 } from "@/services/account-flows"
 import { ReauthDialog } from "../reauth-dialog"
 
@@ -28,6 +29,7 @@ import { ReauthDialog } from "../reauth-dialog"
 vi.mock("@/services/account-flows", () => ({
   reauthGmailAccount: vi.fn().mockResolvedValue({ accountId: "acc-1" }),
   reauthImapPassword: vi.fn().mockResolvedValue({ accountId: "acc-1" }),
+  reauthMicrosoftAccount: vi.fn().mockResolvedValue({ accountId: "acc-1" }),
   cancelOauthWait: vi.fn().mockResolvedValue(false),
   OauthCancelledError: class OauthCancelledError extends Error {
     constructor() {
@@ -51,9 +53,10 @@ vi.mock("@/services/account-flows", () => ({
 
 const reauthGmailMock = vi.mocked(reauthGmailAccount)
 const reauthImapMock = vi.mocked(reauthImapPassword)
+const reauthMicrosoftMock = vi.mocked(reauthMicrosoftAccount)
 
 function makeAccount(
-  type: "gmail" | "imap",
+  type: "gmail" | "imap" | "microsoft",
   overrides: Partial<AccountInfo> = {}
 ): AccountInfo {
   return {
@@ -200,5 +203,41 @@ describe("ReauthDialog", () => {
     expect(
       screen.getByRole("button", { name: "Continue in browser" })
     ).toBeTruthy()
+  })
+})
+
+describe("ReauthDialog — microsoft variant (parity-round-2, task 3.5)", () => {
+  it("renders the microsoft branch: Application ID + consent rerun", async () => {
+    const onOpenChange = vi.fn()
+    renderDialog(makeAccount("microsoft"), onOpenChange)
+
+    expect(screen.getByText(/Microsoft reports this account/)).toBeTruthy()
+    expect(screen.getByLabelText(/Application \(client\) ID/)).toBeTruthy()
+
+    fireEvent.change(
+      screen.getByLabelText(/Application \(client\) ID/),
+      { target: { value: "ms-client-9" } }
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Continue in browser" }))
+
+    await waitFor(() => {
+      expect(reauthMicrosoftMock).toHaveBeenCalledWith("acc-1", {
+        clientId: "ms-client-9",
+        onProgress: expect.any(Function),
+      })
+    })
+    await waitFor(() => {
+      expect(onOpenChange).toHaveBeenCalledWith(false)
+    })
+  })
+
+  it("validates an empty Application ID without calling the orchestrator", () => {
+    renderDialog(makeAccount("microsoft"), vi.fn())
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in browser" }))
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Enter your Microsoft app registration"
+    )
+    expect(reauthMicrosoftMock).not.toHaveBeenCalled()
   })
 })

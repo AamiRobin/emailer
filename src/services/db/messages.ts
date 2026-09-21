@@ -44,6 +44,12 @@ export interface MessageInput {
   bodyText?: string
   /** raw headers, JSON-encoded */
   headers?: string
+  /**
+   * Compact SPF/DKIM/DMARC verdicts (task 2.1, design D10) —
+   * "spf=pass;dkim=fail;dmarc=none", parsed at ingestion; absent = the
+   * message carried no Authentication-Results (no badge).
+   */
+  authResults?: string
   sizeEstimate?: number
   isRead?: boolean
   isFlagged?: boolean
@@ -81,6 +87,8 @@ export interface MessageRow {
   has_attachments: number
   parts_json: string | null
   created_at: number
+  /** Compact auth verdicts (task 2.1, D10); NULL = no Authentication-Results. */
+  auth_results: string | null
 }
 
 export interface AttachmentRow {
@@ -142,11 +150,11 @@ export async function insertMessage(
       id, thread_id, account_id, gmail_message_id, imap_uid, imap_folder,
       message_id_header, in_reply_to, references_header, subject, from_name,
       from_address, to_json, cc_json, bcc_json, date, snippet, body_html,
-      body_text, headers, size_estimate, is_read, is_flagged,
+      body_text, headers, auth_results, size_estimate, is_read, is_flagged,
       has_attachments, parts_json
     ) VALUES (
       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
+      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
     )`,
     [
       input.id,
@@ -169,6 +177,7 @@ export async function insertMessage(
       input.bodyHtml ?? null,
       input.bodyText ?? null,
       input.headers ?? null,
+      input.authResults ?? null,
       input.sizeEstimate ?? null,
       boolToInt(input.isRead),
       boolToInt(input.isFlagged),
@@ -222,6 +231,7 @@ export interface MessagePatch {
   bodyHtml?: string | null
   bodyText?: string | null
   headers?: string | null
+  authResults?: string | null
   to?: ContactRef[] | null
   cc?: ContactRef[] | null
   bcc?: ContactRef[] | null
@@ -241,6 +251,7 @@ const PATCH_COLUMNS: Record<keyof MessagePatch, string> = {
   bodyHtml: "body_html",
   bodyText: "body_text",
   headers: "headers",
+  authResults: "auth_results",
   to: "to_json",
   cc: "cc_json",
   bcc: "bcc_json",
@@ -261,6 +272,7 @@ function encodePatch(key: keyof MessagePatch, patch: MessagePatch): unknown {
     case "bodyHtml":
     case "bodyText":
     case "headers":
+    case "authResults":
     case "sizeEstimate":
     case "imapFolder":
     case "date":
@@ -424,6 +436,7 @@ export async function upsertMessageByProviderId(
     bodyHtml: input.bodyHtml ?? null,
     bodyText: input.bodyText ?? null,
     headers: input.headers ?? null,
+    authResults: input.authResults ?? null,
     sizeEstimate: input.sizeEstimate ?? null,
     to: input.to ?? null,
     cc: input.cc ?? null,

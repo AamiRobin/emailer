@@ -1,4 +1,8 @@
 import type { SqlExecutor } from "../db/executor"
+import {
+  categorizationInputFromEvent,
+  categorizeIncomingMessages,
+} from "../categorization/ingestion"
 import { reconcileProvisionalSent } from "../composer/send"
 import { getAccount } from "../db/accounts"
 import { findLabelByImapFolder, getLabel, insertLabel } from "../db/labels"
@@ -45,6 +49,7 @@ import {
 import { listBlockedSenders } from "../db/blocked-senders"
 import { listDeliverySchedules } from "../settings/delivery-schedules"
 import { loadJunkFilterConfig } from "../security/junk-filter"
+import { recordSubscriptionActivity } from "../security/subscription-detection"
 import {
   findMessageByImapUid,
   findThreadByMessageIdHeader,
@@ -782,6 +787,30 @@ async function storeFolderMessages(
     accountEmail,
     newEvents.map((entry) => entry.event)
   )
+  // Automatic categorization (task 3.3, design D4, the hook flow's
+  // SEVENTH consumer): user-rule category → list-header heuristics →
+  // sender override read → default Primary, written to threads.category
+  // keep-first. MUST run before the new-mail count below is finalized —
+  // that count is what the scheduler forwards to notifyNewMail, so the
+  // categories exist before any notification fires. Never touches the
+  // outcomes or the count.
+  await categorizeIncomingMessages(
+    executor,
+    newEvents.map((entry) => categorizationInputFromEvent(entry.event))
+  )
+  // Subscription detection (task 3.6, design D13, the hook flow's EIGHTH
+  // consumer): mail carrying List-Unsubscribe headers marks its sender as
+  // a detected newsletter — the manager's entry is created/refreshed and
+  // an unsubscribed sender's new mail flips it to "resumed" (the spec's
+  // sender-resumed scenario). Same seam as categorization: after the
+  // persistence + filing above, before the new-mail count below is
+  // finalized; it writes only the subscriptions settings row, never the
+  // outcomes or the count.
+  await recordSubscriptionActivity(
+    executor,
+    accountId,
+    newEvents.map((entry) => entry.event)
+  )
   const outcomeByRowId = new Map(
     outcomes.map((outcome) => [outcome.messageRowId, outcome])
   )
@@ -886,6 +915,9 @@ function toMessageInput(
     bodyHtml: message.htmlBody,
     bodyText: message.textBody,
     sizeEstimate: message.size,
+    // Task 2.1 (design D10): compact SPF/DKIM/DMARC verdicts parsed at
+    // ingestion (Rust-side for IMAP), stored for the auth badge.
+    authResults: message.authResults,
     isRead: message.flags.includes("\\Seen"),
     isFlagged: message.flags.includes("\\Flagged"),
     hasAttachments: message.attachments.length > 0,

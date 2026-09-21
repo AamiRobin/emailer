@@ -1,4 +1,6 @@
 import type { SqlExecutor } from "../db/executor"
+import type { Category } from "../categorization/classify"
+import { CATEGORIES } from "../categorization/classify"
 import type { LabelRow } from "../db/labels"
 import { findLabelByImapFolder } from "../db/labels"
 import { getAccount } from "../db/accounts"
@@ -24,7 +26,8 @@ import { enqueueMove } from "../queue/operation"
  * user having performed the action on the thread.
  *
  * Action vocabulary (spec: archive, add label, star, mark read, trash,
- * mark-as-spam, move-to-folder for IMAP):
+ * mark-as-spam, move-to-folder for IMAP, plus the task 3.4 category
+ * action for mail-organization "Automatic categorization"):
  * - archive / trash / mark_read / star — thread-level, both providers.
  * - mark_as_spam — the same spam placement the toolbar's spam action takes
  *   (markSpam): gmail adds the SPAM label and queues `add_labels ["SPAM"]`;
@@ -49,6 +52,17 @@ import { enqueueMove } from "../queue/operation"
  *   local move is skipped but the `move` op is still queued, mirroring the
  *   archive/trash degradation in thread-actions (the server applies by
  *   path; the local copy catches up at the next sync).
+ * - set_category — `category` names one of the five inbox categories
+ *   (task 3.4, design D4). NOT a delivery action: categorization is a
+ *   separate consumer of the ingestion hook, not something applyRuleActions
+ *   performs. The executor below SKIPS it explicitly (it never appears in
+ *   the applied list and never suppresses the announcement); the value is
+ *   consumed by runIngestionRules, which stamps the named category on the
+ *   event for the categorization pass (rules/ingestion.ts →
+ *   categorization/ingestion.ts). "Apply now" (task 11.4) drives the same
+ *   executor, so the action deliberately no-ops there too — a category
+ *   rule reaches existing mail only through the task 3.4 backfill's
+ *   deterministic engine, not through action replay.
  *
  * A rule acts on the new MESSAGE'S THREAD (Gmail filter semantics): the
  * whole conversation moves/stars/reads with the message, exactly as when
@@ -64,6 +78,7 @@ export type RuleActionType =
   | "remove_labels"
   | "move"
   | "mark_as_spam"
+  | "set_category"
 
 /** The closed action vocabulary parseActionsJson accepts. */
 export const RULE_ACTION_TYPES: readonly RuleActionType[] = [
@@ -75,6 +90,7 @@ export const RULE_ACTION_TYPES: readonly RuleActionType[] = [
   "remove_labels",
   "move",
   "mark_as_spam",
+  "set_category",
 ]
 
 export interface RuleAction {
@@ -83,6 +99,8 @@ export interface RuleAction {
   labels?: string[]
   /** move: full destination folder path (imap accounts). */
   folder?: string
+  /** set_category: the inbox category the rule names (task 3.4, design D4). */
+  category?: Category
 }
 
 /**
@@ -155,6 +173,20 @@ export function parseActionsJson(actionsJson: string): RuleAction[] {
         continue
       }
       actions.push({ type, folder })
+      continue
+    }
+    if (type === "set_category") {
+      const category = (entry as { category?: unknown }).category
+      if (
+        typeof category !== "string" ||
+        !CATEGORIES.includes(category as Category)
+      ) {
+        console.warn(
+          "[rules] set_category action without a known category; skipped"
+        )
+        continue
+      }
+      actions.push({ type, category: category as Category })
       continue
     }
     actions.push({ type })
@@ -233,6 +265,13 @@ export async function applyRuleActions(
         if (await applyMove(executor, accountId, threadId, action.folder)) {
           applied.push("move")
         }
+        break
+      case "set_category":
+        // Explicitly ignored at DELIVERY time (task 3.4): categorization is
+        // the categorization pass's consumer, not a delivery action — the
+        // category was already stamped onto the event by runIngestionRules
+        // before this executor ran (see the module comment). It must never
+        // land in `applied` (it would wrongly suppress or report).
         break
     }
   }

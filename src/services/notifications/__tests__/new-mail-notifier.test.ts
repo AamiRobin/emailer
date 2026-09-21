@@ -6,6 +6,7 @@ import {
   sendNotification,
 } from "@tauri-apps/plugin-notification"
 import { getNotificationsEnabled, setSetting } from "../../db/settings"
+import { playNewMailSound } from "../sounds"
 import {
   notifyNewMail,
   resetNewMailNotifierForTests,
@@ -16,6 +17,12 @@ vi.mock("@tauri-apps/plugin-notification", () => ({
   isPermissionGranted: vi.fn(async () => true),
   requestPermission: vi.fn(async () => "granted"),
   sendNotification: vi.fn(),
+}))
+
+// Sound seam (task 1.5): mocked so the notifier tests can assert the
+// chime fires exactly when the banner does.
+vi.mock("../sounds", () => ({
+  playNewMailSound: vi.fn(async () => {}),
 }))
 
 vi.mock("../../db/settings", () => ({
@@ -36,6 +43,7 @@ const permissionMock = vi.mocked(isPermissionGranted)
 const requestPermissionMock = vi.mocked(requestPermission)
 const enabledSettingMock = vi.mocked(getNotificationsEnabled)
 const setSettingMock = vi.mocked(setSetting)
+const soundMock = vi.mocked(playNewMailSound)
 
 const EVENT = {
   accountId: "acc-1",
@@ -46,11 +54,15 @@ const EVENT = {
 describe("new-mail notifier", () => {
   beforeEach(() => {
     resetNewMailNotifierForTests()
-    sendMock.mockClear()
+    // mockReset (not mockClear): the "swallows send failures" test
+    // installs a throwing implementation, and implementations survive
+    // mockClear — the notifier's sound seam must not inherit it.
+    sendMock.mockReset()
     permissionMock.mockClear()
     requestPermissionMock.mockClear()
     enabledSettingMock.mockClear()
     setSettingMock.mockClear()
+    soundMock.mockClear()
     enabledSettingMock.mockResolvedValue(true)
   })
 
@@ -199,5 +211,59 @@ describe("new-mail notifier", () => {
     })
 
     await expect(notifyNewMail(EVENT)).resolves.toBeUndefined()
+  })
+
+  // ---- Sound seam (task 1.5, settings spec "Suppressed message stays
+  // silent") ------------------------------------------------------------
+
+  it("plays the new-mail sound exactly when the notification is shown", async () => {
+    await notifyNewMail(EVENT)
+    expect(sendMock).toHaveBeenCalledTimes(1)
+    expect(soundMock).toHaveBeenCalledTimes(1)
+
+    // A second account inside a fresh coalescing window: both fire again.
+    await notifyNewMail({ ...EVENT, accountId: "acc-2" })
+    expect(sendMock).toHaveBeenCalledTimes(2)
+    expect(soundMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("plays neither banner nor sound when notifications are disabled", async () => {
+    enabledSettingMock.mockResolvedValue(false)
+
+    await notifyNewMail(EVENT)
+
+    expect(sendMock).not.toHaveBeenCalled()
+    expect(soundMock).not.toHaveBeenCalled()
+  })
+
+  it("plays neither banner nor sound when the count is zero", async () => {
+    // The sync engines zero the count for "never notify"-ruled and muted
+    // messages BEFORE the notifier is reached — notifyNewMail(0) is the
+    // mock-level stand-in for that seam.
+    await notifyNewMail({ ...EVENT, count: 0 })
+
+    expect(sendMock).not.toHaveBeenCalled()
+    expect(soundMock).not.toHaveBeenCalled()
+  })
+
+  it("plays no sound when the OS notification itself failed", async () => {
+    sendMock.mockImplementation(() => {
+      throw new Error("no notification center")
+    })
+
+    await notifyNewMail(EVENT)
+
+    expect(soundMock).not.toHaveBeenCalled()
+  })
+
+  it("plays no sound for a coalesced (suppressed) repeat", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(5_000_000)
+
+    await notifyNewMail(EVENT)
+    await notifyNewMail(EVENT) // inside the 60s window
+
+    expect(sendMock).toHaveBeenCalledTimes(1)
+    expect(soundMock).toHaveBeenCalledTimes(1)
   })
 })

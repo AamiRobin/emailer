@@ -7,7 +7,10 @@ import {
   writeFile as fsWriteFile,
 } from "@tauri-apps/plugin-fs"
 
-import { decryptCredentials } from "../crypto/credentials"
+import {
+  decryptCredentials,
+  encryptCredentials,
+} from "../crypto/credentials"
 import {
   clearCacheEntry,
   getAttachment,
@@ -17,14 +20,21 @@ import {
   touchCacheAccess,
   totalCacheSize,
 } from "../db/attachments"
+import { updateCredentials } from "../db/accounts"
+import { getExecutor } from "../db/executor"
 import type { SqlExecutor } from "../db/executor"
 import type { AttachmentRow, MessageRow } from "../db/messages"
 import { createGmailClient } from "../email/gmail-api"
+import { createGraphClient } from "../email/graph-api"
 import type { ImapParams } from "../email/invoke"
 import {
   createTokenSource,
   type GmailTokenEnvelope,
 } from "../email/token-manager"
+import {
+  createMicrosoftTokenSource,
+  type MicrosoftTokenEnvelope,
+} from "../email/microsoft-token-manager"
 import type { EmailAccount, ProviderCredentials } from "../email/types"
 import { ProviderAuthError } from "../email/types"
 
@@ -51,6 +61,13 @@ export const CACHE_DIR = "attachment_cache"
 
 /** D15 total-size cap, global across accounts. */
 export const DEFAULT_MAX_CACHE_BYTES = 200 * 1024 * 1024
+
+/**
+ * Graph only inlines `contentBytes` for file attachments of roughly 3 MB
+ * and below; anything larger (or a list form without the field) must be
+ * downloaded from the raw `$value` endpoint instead.
+ */
+export const MAX_INLINE_CONTENTBYTES_BYTES = 3 * 1024 * 1024
 
 /** The message fields the fetch seam needs (mirrors MessageRow columns). */
 export type AttachmentMessageSource = Pick<
@@ -204,6 +221,73 @@ async function fetchGmailAttachment(
   return base64UrlToBytes(result.data)
 }
 
+async function fetchMicrosoftAttachment(
+  account: EmailAccount,
+  message: AttachmentMessageSource,
+  attachment: AttachmentRow
+): Promise<Uint8Array> {
+  if (!message.gmail_message_id) {
+    // The Graph message id lives in the provider-id column (the same
+    // opaque-id channel gmail uses).
+    throw new Error("microsoft attachment is missing the server message id")
+  }
+  if (!attachment.provider_part_id) {
+    throw new Error("attachment row has no provider part id")
+  }
+  const envelope = await decryptCredentials<MicrosoftTokenEnvelope>(
+    account.credentialsJson ?? null
+  )
+  if (!envelope?.refreshToken) {
+    throw new ProviderAuthError(
+      account.id,
+      "microsoft",
+      "no stored Microsoft token; re-authorization is required"
+    )
+  }
+  // Same construction as the graph provider: token source caches and
+  // single-flights, and force=true on the 401 retry triggers a refresh.
+  // Entra ROTATES refresh tokens — the persist hook re-seals the rotated
+  // envelope exactly like the mail provider and the calendar do (best
+  // effort: a failed seal keeps the session's in-memory token usable),
+  // otherwise the one attachment call would drop the rotation on the
+  // floor and the stored envelope would go stale.
+  const tokenSource = createMicrosoftTokenSource(account, envelope, undefined, {
+    persist: async (rotated) => {
+      try {
+        const credentialsJson = await encryptCredentials(rotated)
+        await updateCredentials(getExecutor(), account.id, credentialsJson)
+      } catch {
+        // No database binding (tests/dev) or transient write failure.
+      }
+    },
+  })
+  const client = createGraphClient({
+    accountId: account.id,
+    getToken: (force) => tokenSource.getToken(force),
+  })
+  const result = await client.getAttachment(
+    message.gmail_message_id,
+    attachment.provider_part_id
+  )
+  // contentBytes only exists for small file attachments (≲3 MB). Larger
+  // ones (or a payload missing the field) ride the raw $value endpoint.
+  const size =
+    typeof result.size === "number"
+      ? result.size
+      : (attachment.size ?? 0)
+  if (result.contentBytes && size <= MAX_INLINE_CONTENTBYTES_BYTES) {
+    return base64ToBytes(result.contentBytes)
+  }
+  const bytes = await client.getAttachmentValue(
+    message.gmail_message_id,
+    attachment.provider_part_id
+  )
+  if (bytes.byteLength === 0) {
+    throw new Error("Microsoft Graph returned no content for the attachment")
+  }
+  return bytes
+}
+
 async function fetchImapAttachment(
   account: EmailAccount,
   message: AttachmentMessageSource,
@@ -251,9 +335,13 @@ export function defaultFetchAttachment(
   message: AttachmentMessageSource,
   attachment: AttachmentRow
 ): Promise<Uint8Array> {
-  return account.type === "gmail"
-    ? fetchGmailAttachment(account, message, attachment)
-    : fetchImapAttachment(account, message, attachment)
+  if (account.type === "gmail") {
+    return fetchGmailAttachment(account, message, attachment)
+  }
+  if (account.type === "microsoft") {
+    return fetchMicrosoftAttachment(account, message, attachment)
+  }
+  return fetchImapAttachment(account, message, attachment)
 }
 
 // ---------------------------------------------------------------------------

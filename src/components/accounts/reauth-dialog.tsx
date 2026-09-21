@@ -21,6 +21,7 @@ import {
   cancelOauthWait,
   reauthGmailAccount,
   reauthImapPassword,
+  reauthMicrosoftAccount,
 } from "@/services/account-flows"
 import type { GmailFlowStep } from "@/services/account-flows"
 import type { AccountInfo } from "@/stores/account-store"
@@ -51,6 +52,13 @@ const STEP_LABELS: Record<GmailFlowStep, string> = {
   save: "Updating the account…",
 }
 
+const MICROSOFT_STEP_LABELS: Record<GmailFlowStep, string> = {
+  consent: "Waiting for you to finish in the browser…",
+  exchange: "Signing you in…",
+  profile: "Reading your Microsoft 365 profile…",
+  save: "Updating the account…",
+}
+
 interface ReauthDialogProps {
   account: AccountInfo | null
   open: boolean
@@ -73,12 +81,19 @@ export function ReauthDialog({
 
   const accountId = account?.id
   const isGmail = account?.type === "gmail"
+  const isMicrosoft = account?.type === "microsoft"
+  // The OAuth flows share one dialog shape; only the provider copy and
+  // the submit handler differ.
+  const oauthProvider = isMicrosoft ? "microsoft" : isGmail ? "gmail" : null
+  const stepLabels: Record<GmailFlowStep, string> = isMicrosoft
+    ? MICROSOFT_STEP_LABELS
+    : STEP_LABELS
 
-  // Pre-fill the stored Client ID so gmail re-authentication is usually a
+  // Pre-fill the stored Client ID so OAuth re-authentication is usually a
   // single "Continue" — best-effort: before initDatabase() (plain vite,
   // tests) getExecutor() throws and the field simply starts empty.
   useEffect(() => {
-    if (!open || !accountId || !isGmail) return
+    if (!open || !accountId || (!isGmail && !isMicrosoft)) return
     let cancelled = false
     void (async () => {
       try {
@@ -93,7 +108,7 @@ export function ReauthDialog({
     return () => {
       cancelled = true
     }
-  }, [open, accountId, isGmail])
+  }, [open, accountId, isGmail, isMicrosoft])
 
   // If the dialog closes while the consent wait is pending, abort the
   // loopback server; the pending flow rejects as cancelled and its handler
@@ -143,6 +158,36 @@ export function ReauthDialog({
     }
   }
 
+  async function handleMicrosoftSubmit(event: React.FormEvent): Promise<void> {
+    event.preventDefault()
+    if (!account) return
+    const trimmed = clientId.trim()
+    if (!trimmed) {
+      setValidationError("Enter your Microsoft app registration's Client ID to continue.")
+      return
+    }
+    setValidationError(null)
+    setErrorMessage(null)
+    setWorking(true)
+    consentRef.current = true
+    try {
+      await reauthMicrosoftAccount(account.id, {
+        clientId: trimmed,
+        onProgress: setStep,
+      })
+      onOpenChange(false)
+    } catch (error) {
+      if (error instanceof OauthCancelledError) {
+        // Quiet: the user backed out; stay on the Client ID step.
+        return
+      }
+      handleError(error, "Sign-in failed. Please try again.")
+    } finally {
+      consentRef.current = false
+      setWorking(false)
+    }
+  }
+
   async function handleImapSubmit(event: React.FormEvent): Promise<void> {
     event.preventDefault()
     if (!account) return
@@ -174,15 +219,15 @@ export function ReauthDialog({
     <Dialog open={open && account !== null} onOpenChange={onOpenChange}>
       {account && (
         <DialogContent>
-          {isGmail ? (
+          {oauthProvider !== null ? (
             working ? (
               <>
                 <DialogHeader>
                   <DialogTitle>Sign in again</DialogTitle>
                   <DialogDescription>
-                    A Google sign-in page opened in your browser for{" "}
-                    {account.email}. Finish there — this window continues
-                    automatically.
+                    A {oauthProvider === "microsoft" ? "Microsoft" : "Google"}{" "}
+                    sign-in page opened in your browser for {account.email}.
+                    Finish there — this window continues automatically.
                   </DialogDescription>
                 </DialogHeader>
                 <div
@@ -194,7 +239,7 @@ export function ReauthDialog({
                     className="size-4 shrink-0 animate-spin"
                     aria-hidden
                   />
-                  {STEP_LABELS[step]}
+                  {stepLabels[step]}
                 </div>
                 <div className="flex justify-start">
                   <Button
@@ -214,23 +259,35 @@ export function ReauthDialog({
                 <DialogHeader>
                   <DialogTitle>Sign in again</DialogTitle>
                   <DialogDescription>
-                    Google reports this account&apos;s sign-in no longer works.
+                    {oauthProvider === "microsoft"
+                      ? "Microsoft reports this account's sign-in no longer works."
+                      : "Google reports this account's sign-in no longer works."}{" "}
                     Re-authorize {account.email} in the browser — your local
                     mail is kept.
                   </DialogDescription>
                 </DialogHeader>
                 <form
                   onSubmit={(event) => {
-                    void handleGmailSubmit(event)
+                    void (oauthProvider === "microsoft"
+                      ? handleMicrosoftSubmit(event)
+                      : handleGmailSubmit(event))
                   }}
                   className="grid gap-3"
                 >
                   <div className="grid gap-1.5">
-                    <Label htmlFor="reauth-gmail-client-id">Client ID</Label>
+                    <Label htmlFor="reauth-gmail-client-id">
+                      {oauthProvider === "microsoft"
+                        ? "Application (client) ID"
+                        : "Client ID"}
+                    </Label>
                     <Input
                       id="reauth-gmail-client-id"
                       autoFocus
-                      placeholder="1234567890-abc123.apps.googleusercontent.com"
+                      placeholder={
+                        oauthProvider === "microsoft"
+                          ? "00000000-0000-0000-0000-000000000000"
+                          : "1234567890-abc123.apps.googleusercontent.com"
+                      }
                       value={clientId}
                       onChange={(event) => {
                         setClientId(event.target.value)

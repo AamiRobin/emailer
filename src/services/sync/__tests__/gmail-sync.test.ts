@@ -32,6 +32,12 @@ import type {
 import type { GmailSyncSummary } from "../gmail-sync"
 import { syncGmailAccount } from "../gmail-sync"
 import { setJunkFilterEnabledPreference } from "../../settings/preferences"
+import {
+  getSubscription,
+  listSubscriptions,
+  markUnsubscribed,
+  recordSenderSeen,
+} from "../../settings/subscriptions"
 import { trainJunkDocument } from "../../security/junk-filter"
 
 // ---------------------------------------------------------------------------
@@ -189,6 +195,9 @@ class FakeGmailProvider implements EmailProvider {
     throw new Error("not implemented in fake")
   }
   async deleteForever(): Promise<void> {
+    throw new Error("not implemented in fake")
+  }
+  async getMessageSource(): Promise<string> {
     throw new Error("not implemented in fake")
   }
   async sendMessage(): Promise<SendEmailResult> {
@@ -1545,5 +1554,86 @@ describe("gmail sync junk-filter exemption", () => {
       is_trashed: 0,
     })
     expect(await pendingOps(harness)).toEqual([])
+  })
+})
+
+describe("gmail sync subscriptions", () => {
+  let harness: TestHarness
+
+  beforeEach(async () => {
+    harness = await createHarness()
+  })
+
+  afterEach(() => {
+    harness.executor.close()
+  })
+
+  it("lists senders of List-Unsubscribe mail; plain mail never enters the list (task 3.6, D13)", async () => {
+    harness.provider.addMessage(
+      message({
+        id: "301",
+        threadId: "t301",
+        fromEmail: "news@lists.example.com",
+        listUnsubscribe: "<https://lists.example.com/u/1>",
+        listUnsubscribePost: "List-Unsubscribe=One-Click",
+      })
+    )
+    harness.provider.addMessage(
+      message({ id: "302", threadId: "t302", fromEmail: "friend@example.com" })
+    )
+
+    const summary = await harness.sync()
+    // Detection never touches the notification count.
+    expect(summary.newMessages).toBe(2)
+
+    const entries = await listSubscriptions(
+      harness.executor,
+      harness.accountId
+    )
+    expect(entries.map((entry) => entry.sender)).toEqual([
+      "news@lists.example.com",
+    ])
+    expect(entries[0]).toMatchObject({
+      state: "subscribed",
+      listUnsubscribe: "<https://lists.example.com/u/1>",
+      listUnsubscribePost: "List-Unsubscribe=One-Click",
+    })
+  })
+
+  it("new mail from an unsubscribed sender flips its entry to resumed (task 3.6, D13)", async () => {
+    // The manager already knows the sender, and the user unsubscribed.
+    await recordSenderSeen(harness.executor, harness.accountId, {
+      sender: "news@lists.example.com",
+      lastSeenAt: 100,
+      listUnsubscribe: "<https://lists.example.com/u/1>",
+    })
+    await markUnsubscribed(
+      harness.executor,
+      harness.accountId,
+      "news@lists.example.com",
+      { at: 150 }
+    )
+
+    harness.provider.addMessage(
+      message({
+        id: "303",
+        threadId: "t303",
+        date: 5000,
+        fromEmail: "news@lists.example.com",
+        listUnsubscribe: "<https://lists.example.com/u/1>",
+        subject: "We missed you",
+      })
+    )
+    await harness.sync()
+
+    // The spec's sender-resumed scenario: the unsubscribe did not hold.
+    const entry = await getSubscription(
+      harness.executor,
+      harness.accountId,
+      "news@lists.example.com"
+    )
+    expect(entry?.state).toBe("resumed")
+    expect(entry?.lastSeenAt).toBe(5000)
+    expect(entry?.unsubscribedAt).toBe(150)
   })
 })

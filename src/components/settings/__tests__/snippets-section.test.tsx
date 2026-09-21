@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react"
 
 import type { SqlExecutor } from "@/services/db/executor"
@@ -34,6 +35,7 @@ vi.mock("@/services/db/executor", () => ({
 }))
 
 import { createSnippet, listSnippets } from "@/services/db/snippets"
+import { SNIPPET_VARIABLES } from "@/services/composer/snippet-variables"
 import {
   createTestExecutor,
   type TestExecutor,
@@ -138,6 +140,29 @@ describe("SnippetsSection", () => {
     const rows = await listSnippets(executor)
     expect(rows).toHaveLength(1)
     expect(rows[0]).toMatchObject({ name: "Renamed", shortcut: null })
+  })
+
+  it("documents the template variable registry (task 2.4)", async () => {
+    render(<SnippetsSection />)
+    await screen.findByText(/No snippets yet/)
+
+    // One monospace line per registry variable, sourced from
+    // SNIPPET_VARIABLES — the same metadata the substitution resolves.
+    const help = screen.getByTestId("snippet-variables-help")
+    const entries = within(help).getAllByTestId("snippet-variable-entry")
+    expect(entries).toHaveLength(SNIPPET_VARIABLES.length)
+    SNIPPET_VARIABLES.forEach((variable, index) => {
+      expect(
+        within(entries[index]).getByText(`{{${variable.id}}}`)
+      ).toBeTruthy()
+      expect(entries[index].textContent).toContain(variable.description)
+      expect(entries[index].textContent).toContain(`(e.g. ${variable.example})`)
+    })
+
+    // The prompt-once sentence: unknown/missing values ask once and the
+    // answer applies to all occurrences (spec behavior).
+    expect(help.textContent).toContain("prompts once per insertion")
+    expect(help.textContent).toContain("every occurrence")
   })
 
   it("deletes a snippet only after the destructive confirm", async () => {

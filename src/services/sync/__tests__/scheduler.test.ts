@@ -565,6 +565,9 @@ describe("sync scheduler", () => {
       async deleteForever(): Promise<never> {
         throw denied
       },
+      async getMessageSource(): Promise<never> {
+        throw denied
+      },
       async sendMessage(): Promise<never> {
         throw denied
       },

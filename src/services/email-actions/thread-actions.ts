@@ -1,5 +1,6 @@
 import type { SqlExecutor } from "../db/executor"
 import { getAccount } from "../db/accounts"
+import { broadcastThreadChange } from "../desktop/popout"
 import type { LabelRow } from "../db/labels"
 import { findLabelsBySpecialUse } from "../db/labels"
 import type { MessageRow } from "../db/messages"
@@ -17,7 +18,7 @@ import {
   // aliased: the public setThreadStarred below is the action wrapper
   setThreadStarred as setThreadStarredCache,
 } from "../db/threads"
-import type { MessageRef } from "../email/types"
+import type { AccountType, MessageRef } from "../email/types"
 import {
   enqueueAddLabels,
   enqueueArchive,
@@ -152,9 +153,16 @@ export class MissingSpecialFolderError extends Error {
 
 // ---- Change notification for the list/pane caches ----
 
+/** A local-only thread-state change (mute/pin/done via
+ * thread-state-flow.ts) — not a provider action, but it moves threads
+ * between views exactly like one, so it rides the same notification. */
+export type ThreadStateEventKind = "thread_state"
+
 export interface ThreadListChangeEvent {
-  action: ThreadActionKind | ThreadLabelEventKind
-  accountId: string
+  action: ThreadActionKind | ThreadLabelEventKind | ThreadStateEventKind
+  /** The account the action ran against; null for the account-agnostic
+   * local-state flow (mute/pin/done), which never scopes by account. */
+  accountId: string | null
   /** Threads whose local placement/state changed (one per single action;
    * the full batch for bulkApply). Deleted ids are included. */
   threadIds: string[]
@@ -192,6 +200,10 @@ function emitThreadListChanged(event: ThreadListChangeEvent): void {
       )
     }
   }
+  // Cross-window bridge (task 1.9): pop-out windows and the main window
+  // converge on the shared SQLite, so a change made in one window must
+  // tell the others to re-read. Fire-and-forget — never blocks the action.
+  void broadcastThreadChange(event)
 }
 
 /**
@@ -406,7 +418,7 @@ export async function applyLabelsToThread(
 
 /** Resolved inputs shared by every action branch. */
 interface ActionContext {
-  accountType: "gmail" | "imap"
+  accountType: AccountType
   thread: ThreadRow
   messages: MessageRow[]
   refs: MessageRef[]

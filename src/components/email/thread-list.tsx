@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useDraggable } from "@dnd-kit/core"
 import { useVirtualizer } from "@tanstack/react-virtual"
 import { formatDistanceToNow } from "date-fns"
+import { toast } from "sonner"
 import {
   Archive,
   ArrowUpDown,
@@ -27,6 +28,7 @@ import {
 import type { LucideIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { isTauriRuntime, openThreadInPopout } from "@/services/desktop/popout"
 import type { ContactRef } from "@/services/db/messages"
 import type {
   ThreadLabelLite,
@@ -73,9 +75,15 @@ import {
 } from "@/components/ui/dropdown-menu"
 import type { ThreadSortOption } from "@/services/db/thread-sort"
 import { THREAD_SORT_OPTIONS } from "@/services/db/thread-sort"
+import {
+  parseSearchQuery,
+  usesOperators,
+} from "@/services/search"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { AccountBadge } from "./account-badge"
 import { EmptyState } from "./empty-state"
+import { ProfileColorMarker } from "./profile-marker"
 import { ThreadContextMenu } from "./thread-context-menu"
 import type { ThreadMenuHandlers } from "./thread-context-menu"
 import { openReplyForThread, resumeDraft } from "./reply-opener"
@@ -92,7 +100,20 @@ import { bundleMemberIds, groupByConsecutiveSender } from "./bundles"
 import {
   getGroupBySenderPreference,
   setGroupBySenderPreference,
+  getProfileColorMarkersEnabled,
 } from "@/services/settings/preferences"
+import { listQuickSteps } from "@/services/settings/quick-steps"
+import type { QuickStep } from "@/services/settings/quick-steps"
+import {
+  alwaysFromSender,
+  moveThreadToCategory,
+} from "@/services/categorization/overrides"
+import type { Category } from "@/services/categorization/classify"
+import { runQuickStepWithConfirm } from "@/services/quick-steps/run-with-confirm"
+import {
+  CATEGORY_LABELS,
+  useCategoriesEnabled,
+} from "@/components/layout/use-categories"
 
 /**
  * The real SQLite-backed thread list (task 6.4, mailbox-ui spec "Thread
@@ -162,6 +183,14 @@ import {
  * in the unified inbox for free. Bundle rows do not participate in the
  * multi-selection (no checkbox); member rows inside an expanded bundle
  * select as usual.
+ *
+ * Profile color markers (parity-round-2 task 4.5, design D10): in the
+ * cross-account scopes every thread row also renders a leading-edge bar
+ * with the sending account's effective color (./profile-marker, colored
+ * from the account store's effectiveColors map). The appearance toggle
+ * `mail.profileColorMarkers` (default shown) gates the rendering; the
+ * marker is purely decorative — no selection, keyboard or screen-reader
+ * impact, and being absolutely positioned it never reflows the rows.
  */
 
 interface FlatRow {
@@ -240,12 +269,20 @@ function emptyStateForView(view: ViewSelection): {
   hint: string
 } {
   switch (view.kind) {
-    case "search":
+    case "search": {
+      // Operator queries get their own explanation (task 1.3, mail-search
+      // spec "Operators stay strict"): they are never silently rewritten,
+      // so the empty state says what to check instead of hinting at the
+      // relaxed retry that never ran.
+      const operatorQuery = usesOperators(parseSearchQuery(view.query))
       return {
         icon: SearchXIcon,
         title: `No results for "${view.query}"`,
-        hint: "Try different keywords, or operators like from:someone@example.com, subject:meeting or is:unread.",
+        hint: operatorQuery
+          ? "Operators like from:, to:, subject:, is: and -term are matched exactly as written. Check their values, or remove one to widen the search."
+          : "No thread matched every term. Try different keywords, or operators like from:someone@example.com, subject:meeting or is:unread.",
       }
+    }
     case "label":
       return {
         icon: TagIcon,
@@ -273,6 +310,22 @@ function emptyStateForView(view: ViewSelection): {
     case "contacts":
       // Unreachable today (the contacts pane owns its own listing), kept
       // only so the switch stays exhaustive over ViewSelection.
+      return {
+        icon: InboxIcon,
+        title: "Nothing to list",
+        hint: "",
+      }
+    case "attachments":
+      // Unreachable today (the attachments pane owns its own listing),
+      // kept only so the switch stays exhaustive over ViewSelection.
+      return {
+        icon: InboxIcon,
+        title: "Nothing to list",
+        hint: "",
+      }
+    case "calendar":
+      // Unreachable today (the calendar pane owns its own listing, task
+      // 5.3), kept only so the switch stays exhaustive over ViewSelection.
       return {
         icon: InboxIcon,
         title: "Nothing to list",
@@ -330,6 +383,19 @@ function splitEmptyState(name: string) {
     icon: Columns2Icon,
     title: `No threads in "${name}"`,
     hint: "Threads matching this split's search will appear here as they sync.",
+  }
+}
+
+/**
+ * Empty state of an active category tab (task 3.5, design D4): like
+ * unified/priority/split, the underlying view is still a folder/label/
+ * search selection, so the copy must name the category, not the view.
+ */
+function categoryEmptyState(name: string) {
+  return {
+    icon: InboxIcon,
+    title: `Nothing in ${name}`,
+    hint: "New mail the categorization engine files here will appear as it arrives.",
   }
 }
 
@@ -532,6 +598,8 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
   const nudges = listScope?.kind === "nudges"
   // An active split tab (task 9.3) owns the pane's title and empty state.
   const splitScope = listScope?.kind === "split" ? listScope : null
+  // An active category tab (task 3.5, design D4) owns the empty state too.
+  const categoryScope = listScope?.kind === "category" ? listScope : null
   // Every cross-account scope — unified, priority, nudges, saved searches
   // AND un-pinned splits — may render rows from several accounts, so each
   // row carries its owning account's badge; account-pinned scopes stay
@@ -541,12 +609,42 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
   const crossAccount = scope !== null && scopeSpansAccounts(scope)
   const priority = useUiStore((state) => state.listScope?.kind === "priority")
   const accounts = useAccountStore((state) => state.accounts)
+  // Profile color markers (task 4.5): the leading-edge bar per row reads
+  // the account store's effectiveColors map (override → profile color →
+  // generated hue), so a profiles edit in settings recolors the list on
+  // the next render. The appearance toggle (mail.profileColorMarkers,
+  // default shown) is read once per mount through the list's executor
+  // seam like the group-by-sender preference; a failed read keeps the
+  // default. Markers are a cross-account feature only — the SAME
+  // scopeSpansAccounts predicate that gates the account badge, so
+  // single-account folder/label/search views are unaffected either way.
+  const effectiveColors = useAccountStore((state) => state.effectiveColors)
+  const [markersEnabled, setMarkersEnabled] = useState(true)
+  useEffect(() => {
+    let cancelled = false
+    getProfileColorMarkersEnabled(getThreadListExecutor())
+      .then((enabled) => {
+        if (!cancelled) setMarkersEnabled(enabled)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
+  const showMarkers = crossAccount && markersEnabled
   const accountById = useMemo(
     () => new Map(accounts.map((account) => [account.id, account])),
     [accounts]
   )
-  const { threads, drafts, labelsByThreadId, userLabels, loading, loaded } =
-    useThreadList()
+  const {
+    threads,
+    drafts,
+    labelsByThreadId,
+    userLabels,
+    loading,
+    loaded,
+    searchRelaxed,
+  } = useThreadList()
   // Multi-select (task 10.3). Subscribed separately so checkbox toggles
   // re-render the list without touching the data subscriptions.
   const selectedIds = useThreadListStore((state) => state.selectedIds)
@@ -612,6 +710,31 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
     // Toggling off drops the (now meaningless) expansion state with it.
     setExpandedBundles(new Set())
   }, [])
+
+  // Quick steps (task 3.2): loaded once per list mount for the context
+  // menu's submenu. The settings page REPLACES the mailbox panes, so any
+  // settings edit remounts this list and re-reads — and a run re-resolves
+  // the step fresh by id anyway (runQuickStepFromList below), so the
+  // definitions a run applies are never stale even if the submenu is.
+  const [quickSteps, setQuickSteps] = useState<QuickStep[]>([])
+  useEffect(() => {
+    let cancelled = false
+    listQuickSteps(getThreadListExecutor())
+      .then((steps) => {
+        if (!cancelled) setQuickSteps(steps)
+      })
+      .catch((error) => {
+        console.warn("[thread-list] failed to load quick steps", error)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Categories (task 3.5): gates the context menu's override submenus.
+  // The hook re-reads on the settings flip (notifyCategoriesChanged), so
+  // enabling/disabling updates the open lists live.
+  const categoriesEnabled = useCategoriesEnabled()
 
   // The collapse step (design D4): GROUP BY over the already-materialized
   // window — visibleThreads in the current sort order; the query is
@@ -819,6 +942,33 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
   }
 
   /**
+   * Run a quick step (task 3.2) against selection-or-row targets: the
+   * step is re-resolved FRESH by id at click time (definitions may have
+   * changed in settings since the submenu rendered), then funneled
+   * through the shared confirm-once runner — which owns the first-run
+   * trash gate, the outcome toast and the post-run refresh. A bulk run
+   * clears the selection afterwards, the same semantics as the other
+   * multi-target actions. An id the list no longer knows (another window
+   * deleted it) toasts instead of failing silently.
+   */
+  const runQuickStepFromList = (stepId: string, targetIds: string[]) => {
+    void (async () => {
+      if (targetIds.length === 0) return
+      const step = (await listQuickSteps(getThreadListExecutor())).find(
+        (candidate) => candidate.id === stepId
+      )
+      if (!step) {
+        toast.error("That quick step no longer exists")
+        return
+      }
+      const ran = await runQuickStepWithConfirm(step, targetIds)
+      if (ran && targetIds.length > 1) {
+        useThreadListStore.getState().clearThreadSelection()
+      }
+    })()
+  }
+
+  /**
    * Draft-row activation (task 8.6): resume the snapshot into the
    * composer — never an open-thread action. resumeDraft keeps the row
    * (deletion happens on send/discard in the composer) and its draftKey,
@@ -826,6 +976,50 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
    */
   const resumeDraftFromList = (draftId: string) => {
     void resumeDraft(getThreadListExecutor(), draftId)
+  }
+
+  /**
+   * Move the clicked thread to a category (task 3.5, design D4): the
+   * per-thread override service (categorization/overrides.ts) — the
+   * keep-first ingestion contract protects the written value from later
+   * arrivals — then the standard refresh so the list, the counts and the
+   * category tabs catch up. Deliberately per-thread (no targetIds fan-out):
+   * a category move is an override of THIS thread's stored category.
+   */
+  const moveToCategoryFromList = (threadId: string, category: Category) => {
+    void (async () => {
+      try {
+        await moveThreadToCategory(getThreadListExecutor(), threadId, category)
+      } catch (error) {
+        console.warn("[thread-list] category move failed", error)
+        return
+      }
+      toast.success(`Moved to ${CATEGORY_LABELS[category]}`)
+      await refreshThreadList()
+    })()
+  }
+
+  /**
+   * "Always from this sender" (task 3.5, design D4): the per-sender
+   * override (sender_categories with source 'user') that classifies as
+   * the rule for that sender from now on, plus the thread move so the
+   * clicked row reflects the choice immediately. Same refresh as above.
+   */
+  const alwaysFromSenderFromList = (threadId: string, category: Category) => {
+    void (async () => {
+      try {
+        await alwaysFromSender(getThreadListExecutor(), threadId, category)
+      } catch (error) {
+        console.warn("[thread-list] always-from-sender failed", error)
+        return
+      }
+      toast.success(
+        `Future messages from this sender will be filed under ${
+          CATEGORY_LABELS[category]
+        }`
+      )
+      await refreshThreadList()
+    })()
   }
 
   // ---- Bundle rows (task 9.4): a bundle action IS a multi-target action ----
@@ -869,6 +1063,13 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
 
   const menuHandlers: ThreadMenuHandlers = {
     onOpen: (threadId) => setActiveThread(threadId),
+    // Pop-out windows (1.9): Tauri runtime only — the handler's presence
+    // drives the menu item's visibility.
+    ...(isTauriRuntime()
+      ? {
+          onOpenInNewWindow: (threadId: string) => openThreadInPopout(threadId),
+        }
+      : {}),
     onReply: (threadId) =>
       onReply ? onReply(threadId) : replyFromList(threadId),
     onAction: runThreadAction,
@@ -876,6 +1077,17 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
     onSnooze: snoozeTargets,
     onThreadState: applyStateToTargets,
     onBlockSender: blockSenderFromList,
+    // Category overrides (task 3.5): present only while categorization is
+    // enabled, so the menu's submenus render with the feature.
+    ...(categoriesEnabled
+      ? {
+          onMoveToCategory: moveToCategoryFromList,
+          onAlwaysFromSender: alwaysFromSenderFromList,
+        }
+      : {}),
+    // Quick steps (task 3.2): present only while steps exist, so the
+    // menu's submenu renders with them.
+    ...(quickSteps.length > 0 ? { onRunQuickStep: runQuickStepFromList } : {}),
   }
 
   /** Row click: plain = open + move the shift-range anchor; shift =
@@ -924,7 +1136,9 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
           ? NUDGES_EMPTY_STATE
           : splitScope
             ? splitEmptyState(splitScope.name)
-            : emptyStateForView(view)
+            : categoryScope
+              ? categoryEmptyState(CATEGORY_LABELS[categoryScope.category])
+              : emptyStateForView(view)
     return (
       <EmptyState icon={empty.icon} title={empty.title} hint={empty.hint} />
     )
@@ -937,16 +1151,29 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* List header (task 4.1): the group-by-sender toggle + the sort
-          selector, right-aligned like the pane header's controls above it.
-          The pinned-first lead is part of every store query, so the picker
-          only changes the trailing sort. */}
-      <div className="flex shrink-0 items-center justify-end gap-1 border-b px-2 py-1">
-        <GroupBySenderToggle
-          enabled={groupBySender}
-          onToggle={toggleGroupBySender}
-        />
-        <SortSelector />
+      {/* List header (task 4.1): the relaxed-search badge leads (task 1.3),
+          then the group-by-sender toggle + the sort selector, right-aligned
+          like the pane header's controls above it. The pinned-first lead is
+          part of every store query, so the picker only changes the trailing
+          sort. */}
+      <div className="flex shrink-0 items-center gap-1 border-b px-2 py-1">
+        {searchRelaxed && (
+          <Badge
+            variant="secondary"
+            data-testid="search-relaxed-badge"
+            title='No thread matched every term — showing threads matching any single term of the query. Press Enter to re-run the exact search.'
+            className="shrink-0 font-normal"
+          >
+            Relaxed search
+          </Badge>
+        )}
+        <span className="ms-auto flex items-center gap-1">
+          <GroupBySenderToggle
+            enabled={groupBySender}
+            onToggle={toggleGroupBySender}
+          />
+          <SortSelector />
+        </span>
       </div>
       {selectionActive && (
         <div
@@ -1130,12 +1357,23 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
                       ? (accountById.get(thread.account_id) ?? null)
                       : null
                   }
+                  // Profile color marker (task 4.5): same cross-account
+                  // gating as the badge, colored by the account store's
+                  // effectiveColor chain; null (no marker) when the
+                  // appearance toggle is off or the account id is unknown.
+                  markerColor={
+                    showMarkers
+                      ? (effectiveColors[thread.account_id] ?? null)
+                      : null
+                  }
                   labels={labelsByThreadId[thread.id] ?? []}
                   selected={activeThread === thread.id}
                   checked={selectedIds.has(thread.id)}
                   selectionActive={selectionActive}
                   targets={targetsForThread(thread.id)}
                   userLabels={userLabels}
+                  quickSteps={quickSteps}
+                  categoriesEnabled={categoriesEnabled}
                   handlers={menuHandlers}
                   onRowClick={handleRowClick}
                   onToggleCheckbox={handleCheckboxClick}
@@ -1159,6 +1397,10 @@ interface ThreadRowProps {
   /** Owning account — set only in the unified scope (task 9.2); null
    * elsewhere so the per-account views render no badge. */
   account: AccountInfo | null
+  /** Effective color for the leading-edge marker (task 4.5) — set only in
+   * the cross-account scopes with the appearance toggle on; null renders
+   * no marker. Purely decorative (see profile-marker.tsx). */
+  markerColor: string | null
   labels: ThreadLabelLite[]
   /** Reading-pane cursor (uiStore.activeThread) — not the multi-select. */
   selected: boolean
@@ -1169,6 +1411,10 @@ interface ThreadRowProps {
   /** Ids the context menu's state-changing items act on. */
   targets: string[]
   userLabels: ThreadLabelLite[]
+  /** Quick steps for the context menu's run submenu (task 3.2). */
+  quickSteps: QuickStep[]
+  /** Whether the category override submenus render (task 3.5). */
+  categoriesEnabled?: boolean
   handlers: ThreadMenuHandlers
   onRowClick: (threadId: string, shiftKey: boolean) => void
   onToggleCheckbox: (threadId: string, shiftKey: boolean) => void
@@ -1186,12 +1432,15 @@ function ThreadRow({
   translateY,
   thread,
   account,
+  markerColor,
   labels,
   selected,
   checked,
   selectionActive,
   targets,
   userLabels,
+  quickSteps,
+  categoriesEnabled,
   handlers,
   onRowClick,
   onToggleCheckbox,
@@ -1240,6 +1489,8 @@ function ThreadRow({
       thread={thread}
       targetIds={targets}
       userLabels={userLabels}
+      quickSteps={quickSteps}
+      categoriesEnabled={categoriesEnabled}
       memberLabelIds={labels.map((label) => label.id)}
       anchorElement={rowElement}
       handlers={handlers}
@@ -1270,10 +1521,12 @@ function ThreadRow({
             {/* Card visual (tweakcn mail reference): the virtual row is the
                 positioning + hit-area wrapper; the card carries the look.
                 dnd activation and clicks live on the wrapper, so the inner
-                element stays presentation-only. */}
+                element stays presentation-only. `relative` anchors the
+                profile color marker (task 4.5) — position-only, so the row
+                layout is unchanged whether or not a marker renders. */}
             <div
               className={cn(
-                "flex cursor-default flex-col gap-1 rounded-lg border p-3 text-left text-sm transition-all hover:bg-accent/50 focus-visible:bg-accent/50",
+                "relative flex cursor-default flex-col gap-1 rounded-lg border p-3 text-left text-sm transition-all hover:bg-accent/50 focus-visible:bg-accent/50",
                 selected && "bg-muted hover:bg-muted",
                 checked && !selected && "bg-accent/40 hover:bg-accent/40",
                 isDragging && "opacity-50",
@@ -1282,6 +1535,11 @@ function ThreadRow({
                 bundleMember && "ml-6 border-l-2 border-l-primary/30"
               )}
             >
+              {/* Profile color marker (task 4.5): leading-edge bar with the
+                  sending account's effective color. Purely decorative and
+                  absolutely positioned (see profile-marker.tsx) — no
+                  selection, keyboard or screen-reader impact, no reflow. */}
+              {markerColor && <ProfileColorMarker color={markerColor} />}
               <div className="flex items-center gap-2">
                 <span
                   data-thread-checkbox={thread.id}

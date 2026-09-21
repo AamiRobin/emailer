@@ -10,6 +10,8 @@ import {
   discoverByDomain,
   discoverByEmail,
   extractDomain,
+  isMicrosoftGraphDomain,
+  isMicrosoftGraphEmail,
 } from "../provider-discovery"
 import type { DiscoveredSettings } from "../provider-discovery"
 
@@ -238,5 +240,30 @@ describe("brand discovery", () => {
     for (const provider of KNOWN_PROVIDERS) {
       expect(provider.brand).toBeTruthy()
     }
+  })
+})
+
+describe("Microsoft Graph eligibility (parity-round-2, task 3.5)", () => {
+  it("detects the consumer Microsoft mailbox domains", () => {
+    expect(isMicrosoftGraphEmail("me@outlook.com")).toBe(true)
+    expect(isMicrosoftGraphEmail("me@hotmail.com")).toBe(true)
+    expect(isMicrosoftGraphEmail("me@live.com")).toBe(true)
+    expect(isMicrosoftGraphEmail("me@msn.com")).toBe(true)
+    // Subdomains match by the same suffix rule as the IMAP table.
+    expect(isMicrosoftGraphEmail("me@mail.outlook.com")).toBe(true)
+  })
+
+  it("does not claim arbitrary domains (custom M365 tenants stay opt-in)", () => {
+    expect(isMicrosoftGraphEmail("me@contoso.com")).toBe(false)
+    expect(isMicrosoftGraphEmail("me@gmail.com")).toBe(false)
+    expect(isMicrosoftGraphEmail("not-an-address")).toBe(false)
+    expect(isMicrosoftGraphDomain("")).toBe(false)
+  })
+
+  it("brands stored accounts: gmail → gmail, microsoft → outlook, imap by domain", () => {
+    expect(brandForAccount("gmail", "user@weird.example")).toBe("gmail")
+    expect(brandForAccount("microsoft", "me@any-tenant.example")).toBe("outlook")
+    expect(brandForAccount("imap", "user@outlook.com")).toBe("outlook")
+    expect(brandForAccount("imap", "me@mydomain.com")).toBeNull()
   })
 })

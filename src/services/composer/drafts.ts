@@ -2,6 +2,7 @@ import type { SqlExecutor } from "../db/executor"
 import type { ContactRef } from "../db/messages"
 import { parseContacts, serializeContacts } from "../db/messages"
 import { getAccount } from "../db/accounts"
+import { deleteDraftAttachmentBytes } from "./draft-attachments"
 import { buildMimeMessage } from "../email/mime-builder"
 import type { ServerDraftRef } from "../email/types"
 import { enqueueDraftDelete, enqueueDraftUpsert } from "../queue/operation"
@@ -365,6 +366,25 @@ export async function getDraft(
 }
 
 /**
+ * One draft by its composer instance key (batch C2), or null when missing.
+ * The composer pop-out addresses the row by key: the main window persists
+ * the snapshot and hands ONLY the key to the new window (its label), which
+ * resumes through here — the same join the resume path uses, minus the row
+ * id the popout never sees.
+ */
+export async function getDraftByKey(
+  executor: SqlExecutor,
+  draftKey: string
+): Promise<DraftRecord | null> {
+  if (!draftKey) return null
+  const rows = await executor.select<DraftRow>(
+    "SELECT * FROM local_drafts WHERE draft_key = $1 ORDER BY rowid DESC LIMIT 1",
+    [draftKey]
+  )
+  return rows[0] ? toRecord(rows[0]) : null
+}
+
+/**
  * Remove a draft (send success / confirmed discard). When the row holds a
  * server mirror, the matching `draft_delete` op is enqueued FIRST (design
  * D9: "sending deletes the server draft" — FIFO lands it after any queued
@@ -376,10 +396,12 @@ export async function deleteDraft(
 ): Promise<{ rowsAffected: number }> {
   const rows = await executor.select<{
     account_id: string
+    draft_key: string | null
     server_draft_ref: string | null
-  }>("SELECT account_id, server_draft_ref FROM local_drafts WHERE id = $1", [
-    id,
-  ])
+  }>(
+    "SELECT account_id, draft_key, server_draft_ref FROM local_drafts WHERE id = $1",
+    [id]
+  )
   const row = rows[0]
   if (row) {
     await enqueueServerDraftDelete(
@@ -387,6 +409,11 @@ export async function deleteDraft(
       row.account_id,
       row.server_draft_ref
     )
+    // The persisted attachment bytes go with the draft (batch C1, fix 1) —
+    // sending or discarding must leave no orphan payload rows behind.
+    if (row.draft_key) {
+      await deleteDraftAttachmentBytes(executor, row.account_id, row.draft_key)
+    }
   }
   return executor.execute("DELETE FROM local_drafts WHERE id = $1", [id])
 }
@@ -413,6 +440,7 @@ export async function deleteDraftByKey(
   for (const row of rows) {
     await enqueueServerDraftDelete(executor, accountId, row.server_draft_ref)
   }
+  await deleteDraftAttachmentBytes(executor, accountId, draftKey)
   return executor.execute(
     "DELETE FROM local_drafts WHERE account_id = $1 AND draft_key = $2",
     [accountId, draftKey]

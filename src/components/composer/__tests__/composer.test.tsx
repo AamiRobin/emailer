@@ -8,6 +8,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react"
+import { useState } from "react"
 import type { Editor } from "@tiptap/react"
 import { readFile } from "@tauri-apps/plugin-fs"
 import { open } from "@tauri-apps/plugin-dialog"
@@ -108,6 +109,11 @@ import {
 } from "@/services/settings/preferences"
 import { getComposerPayload, useComposerStore } from "@/stores/composer-store"
 import { getScheduleSendPresets } from "@/components/layout/use-scheduled-sends"
+import { useAccountStore } from "@/stores/account-store"
+import { useUiStore } from "@/stores/ui-store"
+import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts"
+import { resumeDraft } from "@/components/email/reply-opener"
+import { setSignature } from "@/services/composer/signatures"
 import { getAttachmentBytes } from "../attachment-bytes"
 import {
   AttachmentTooLargeError,
@@ -578,17 +584,19 @@ describe("Composer attachments (task 8.5)", () => {
     fireEvent.dragEnter(composerSection())
     expect(composerSection().className).toContain("ring-2")
 
-    dropFiles([fileOf("photo.png", [10, 20, 30], "image/png")])
+    // Batch C2: image files route INLINE (a separate test file covers
+    // that), so the attachment-drop fixture is a non-image file.
+    dropFiles([fileOf("photo.dat", [10, 20, 30], "application/octet-stream")])
     await waitFor(() => {
-      expect(screen.getByText("photo.png")).toBeTruthy()
+      expect(screen.getByText("photo.dat")).toBeTruthy()
     })
     expect(composerSection().className).not.toContain("ring-2")
     expect(useComposerStore.getState().attachments).toEqual([
       {
         id: expect.any(String),
-        name: "photo.png",
+        name: "photo.dat",
         size: 3,
-        mimeType: "image/png",
+        mimeType: "application/octet-stream",
       },
     ])
     // Dropping a non-file drag (no items) changes nothing.
@@ -1317,6 +1325,102 @@ describe("Composer snippets (task 6.2)", () => {
   })
 })
 
+describe("Composer snippet variables (task 2.3, design D11)", () => {
+  /** Open the picker and insert the named snippet (the dialog, if any,
+   * opens from the picker's own click handler). */
+  async function insertFromMenu(name: string): Promise<void> {
+    fireEvent.click(screen.getByRole("button", { name: "Insert snippet" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: `Insert ${name}` })
+    )
+  }
+
+  it("menu insertion prompts once per unknown id and applies each answer to all occurrences", async () => {
+    await createSnippet(executor, {
+      name: "Ship notice",
+      body: "Hi {{first_name}}, order {{tracking_id}} (again {{tracking_id}})",
+    })
+    openComposer()
+    useComposerStore.getState().setTo([
+      { name: "Jane Doe", email: "jane@example.com" },
+    ])
+    render(<Composer />)
+
+    await insertFromMenu("Ship notice")
+
+    // ONE dialog for the ONE unknown id: first_name filled from the
+    // recipient chip, tracking_id (twice in the body) prompted once.
+    const input = (await screen.findByLabelText(
+      "tracking_id"
+    )) as HTMLInputElement
+    expect(screen.queryByLabelText("First name")).toBeNull()
+    fireEvent.change(input, { target: { value: "TRK-42" } })
+    fireEvent.click(screen.getByRole("button", { name: "Insert" }))
+    await act(async () => {})
+
+    const html = useComposerStore.getState().html
+    expect(html).toContain("Hi Jane,")
+    // The single answer substituted into BOTH occurrences.
+    expect(html.indexOf("TRK-42")).toBeLessThan(html.lastIndexOf("TRK-42"))
+    expect(html).not.toContain("{{")
+  })
+
+  it("a context-less registry variable prompts, and cancelling inserts nothing", async () => {
+    await createSnippet(executor, {
+      name: "Greeting",
+      body: "Hi {{first_name}}",
+    })
+    openComposer()
+    render(<Composer />)
+    await insertFromMenu("Greeting")
+
+    // No recipients: first_name has no context value → prompted (labelled
+    // with the registry's human label).
+    fireEvent.change(await screen.findByLabelText("First name"), {
+      target: { value: "ignored" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    await act(async () => {})
+
+    expect(useComposerStore.getState().html).toBe("")
+  })
+
+  it("keyboard expansion fills known variables and leaves unknown ones literal", async () => {
+    await createSnippet(executor, {
+      name: "Hey",
+      body: "Hey {{first_name}} ({{order_no}})",
+      shortcut: "hey",
+    })
+    openComposer()
+    useComposerStore.getState().setTo([
+      { name: "Jane Doe", email: "jane@example.com" },
+    ])
+    render(<Composer />)
+    const editor = getMountedEditor()
+    const editorDom = document.querySelector(".tiptap") as HTMLElement
+
+    // Wait out the snippet load effect — the expansion plugin reads the
+    // shared shortcut map that effect fills (same round-trip as the
+    // task 6.2 tests).
+    fireEvent.click(screen.getByRole("button", { name: "Insert snippet" }))
+    await screen.findByRole("listbox", { name: "Snippets" })
+    fireEvent.click(screen.getByRole("button", { name: "Insert snippet" }))
+    expect(screen.queryByRole("listbox", { name: "Snippets" })).toBeNull()
+
+    editor.commands.setContent("<p>x hey</p>")
+    editor.commands.focus("end")
+    fireEvent.keyDown(editorDom, { key: " " })
+
+    // The keydown path cannot run the async prompt: known variables
+    // substitute silently, the unknown id stays an editable placeholder
+    // and no dialog opens.
+    expect(useComposerStore.getState().html).toBe(
+      "<p>x Hey Jane ({{order_no}})</p>"
+    )
+    expect(screen.queryByLabelText("order_no")).toBeNull()
+  })
+})
+
 describe("Composer From picker (task 16.2, design D10)", () => {
   const DEFAULT_ALIAS = "team-default@example.com"
   const OTHER_ALIAS = "work-alias@example.com"
@@ -1689,5 +1793,469 @@ describe("Composer PGP send (task 18.5)", () => {
     expect(alert.textContent).toContain("Scheduled sends don't support PGP")
     expect(useComposerStore.getState().open).toBe(true)
     expect(sendComposerDraftMock).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * Test host mounting the global shortcut hook exactly like App does, so
+ * the composer-scoped bindings (fix 2) fire through the real window
+ * capture listener while the composer view is open.
+ */
+function ComposerWithShortcuts(): React.ReactNode {
+  const [helpOpen, setHelpOpen] = useState(false)
+  useKeyboardShortcuts({ helpOpen, setHelpOpen })
+  return <Composer />
+}
+
+describe("Composer keyboard send + keep-draft (batch C1, fix 2)", () => {
+  // These tests run the IMMEDIATE send path (no undo window) and the
+  // close-keep-draft path; both funnel through the same handleSend /
+  // handleCloseKeepDraft the buttons use.
+  beforeEach(async () => {
+    await setSetting(executor, sendDelaySettingKey(accountId), 0)
+  })
+
+  afterEach(() => {
+    useUiStore.setState({ composerOpen: false })
+  })
+
+  /** Mount the hook + composer the way the shell does: the ui-store open
+   * flag is flipped beside openNew, and the hook gates on it. */
+  function renderWithShortcuts(): void {
+    useUiStore.setState({ composerOpen: true })
+    openComposer()
+    render(<ComposerWithShortcuts />)
+  }
+
+  function pressKeyOn(target: Element, init: Partial<KeyboardEventInit>) {
+    fireEvent.keyDown(target, {
+      bubbles: true,
+      cancelable: true,
+      ...init,
+    })
+  }
+
+  it("Cmd/Ctrl+Enter sends exactly like clicking Send", async () => {
+    renderWithShortcuts()
+    const toInput = screen.getByLabelText("To")
+    typeInto(toInput, "ada@example.com")
+    pressKey(toInput, "Enter")
+    typeInto(screen.getByLabelText("Subject"), "Quarterly report")
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    // Fired with focus in a field — the composer block runs before the
+    // typing gate, exactly like the guard prompts do not.
+    pressKeyOn(screen.getByLabelText("Subject"), {
+      key: "Enter",
+      metaKey: true,
+    })
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.success).toHaveBeenCalledWith("Message sent")
+    expect(await listDrafts(executor, accountId)).toHaveLength(0)
+  })
+
+  it("Ctrl+Enter from the message body sends too", async () => {
+    renderWithShortcuts()
+    const toInput = screen.getByLabelText("To")
+    typeInto(toInput, "ada@example.com")
+    pressKey(toInput, "Enter")
+    typeInto(screen.getByLabelText("Subject"), "Quarterly report")
+    act(() => {
+      getMountedEditor().commands.focus("end")
+    })
+    sendComposerDraftMock.mockResolvedValue(queuedResult())
+
+    pressKeyOn(document.querySelector(".tiptap") as HTMLElement, {
+      key: "Enter",
+      ctrlKey: true,
+    })
+
+    await waitFor(() => {
+      expect(useComposerStore.getState().open).toBe(false)
+    })
+    expect(sendComposerDraftMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("Cmd/Ctrl+Enter does nothing when the draft is not sendable", async () => {
+    renderWithShortcuts()
+    // A subject without recipients: Send is disabled, so is the combo.
+    typeInto(screen.getByLabelText("Subject"), "No recipient yet")
+
+    pressKeyOn(screen.getByLabelText("Subject"), {
+      key: "Enter",
+      metaKey: true,
+    })
+
+    await act(async () => {})
+    expect(sendComposerDraftMock).not.toHaveBeenCalled()
+    expect(useComposerStore.getState().open).toBe(true)
+  })
+
+  it("Esc minimizes to the tray chip — draft stays open and autosaving (batch C2)", async () => {
+    renderWithShortcuts()
+    typeInto(screen.getByLabelText("Subject"), "keep me")
+
+    pressKeyOn(screen.getByLabelText("Subject"), { key: "Escape" })
+
+    // Batch C2: Esc MINIMIZES — the composer stays open (autosave keeps
+    // polling, the shortcut gates keep treating it as open) behind the
+    // shell's tray chip; the save-and-close flow is the X button's now.
+    await waitFor(() => {
+      expect(useComposerStore.getState().minimized).toBe(true)
+    })
+    expect(useComposerStore.getState().open).toBe(true)
+    expect(useComposerStore.getState().subject).toBe("keep me")
+    // The `c` binding restores (and refocuses) instead of stacking.
+    pressKeyOn(document.body, { key: "c" })
+    await waitFor(() => {
+      expect(useComposerStore.getState().minimized).toBe(false)
+    })
+    expect(useComposerStore.getState().open).toBe(true)
+  })
+
+  it("Esc inside the snippet picker closes the popover, not the composer", async () => {
+    renderWithShortcuts()
+    fireEvent.click(screen.getByRole("button", { name: "Insert snippet" }))
+    // Base UI popups render role="dialog" — the very thing the hook's
+    // modal gate keys on.
+    await screen.findByRole("dialog")
+
+    pressKeyOn(document.body, { key: "Escape" })
+
+    // The hook stood down behind the modal gate; the popover's own Esc
+    // handling dismissed IT while the composer stayed open.
+    expect(useComposerStore.getState().open).toBe(true)
+    expect(screen.queryByRole("dialog")).toBeNull()
+  })
+
+  it("Esc with the contact-suggestion list open closes the list, not the composer", async () => {
+    await seedContact("alice@example.com", { name: "Alice" })
+    renderWithShortcuts()
+    const toInput = screen.getByLabelText("To")
+    typeInto(toInput, "al")
+    await screen.findByRole("listbox", { name: "Contact suggestions" })
+
+    pressKeyOn(toInput, { key: "Escape" })
+
+    // The bare listbox is not a dialog: the composer block defers to it
+    // explicitly, and the field's own Esc handling closes it.
+    expect(screen.queryByRole("listbox", { name: "Contact suggestions" })).toBeNull()
+    expect(useComposerStore.getState().open).toBe(true)
+  })
+
+  it("the send and minimize affordances surface the bindings in their tooltips", () => {
+    openComposer()
+    render(<Composer />)
+    expect(
+      screen.getByRole("button", { name: "Send" }).getAttribute("title")
+    ).toContain("Cmd/Ctrl+Enter")
+    // Batch C2: Esc belongs to the MINIMIZE button now; the close button
+    // (saveNow + keep-draft) is pointer-only and carries no key hint.
+    expect(
+      screen.getByRole("button", { name: "Minimize composer" }).getAttribute(
+        "title"
+      )
+    ).toContain("Esc")
+    expect(
+      screen.getByRole("button", { name: "Close and save draft" }).getAttribute(
+        "title"
+      )
+    ).not.toContain("Esc")
+    // The pop-out button hides without the Tauri runtime (mock mode).
+    expect(
+      screen.queryByRole("button", { name: "Pop out composer" })
+    ).toBeNull()
+  })
+})
+
+describe("Composer draft attachments survive restart (batch C1, fix 1)", () => {
+  function renderOpen(): string {
+    openComposer()
+    render(<Composer />)
+    return useComposerStore.getState().draftKey ?? ""
+  }
+
+  function dropOnSection(files: File[]): void {
+    const section = document.querySelector("section")
+    if (!section) throw new Error("composer section did not mount")
+    fireEvent.drop(section, { dataTransfer: { files } })
+  }
+
+  async function storedRowCount(draftKey: string): Promise<number> {
+    const rows = await executor.select<{ id: string }>(
+      "SELECT id FROM draft_attachments WHERE draft_key = $1",
+      [draftKey]
+    )
+    return rows.length
+  }
+
+  it("persists bytes at add time and restores them on resume into the send payload", async () => {
+    const draftKey = renderOpen()
+    dropOnSection([
+      new File([new Uint8Array([1, 2, 3, 4])], "report.pdf", {
+        type: "application/pdf",
+      }),
+    ])
+    await waitFor(() => {
+      expect(screen.getByText("report.pdf")).toBeTruthy()
+    })
+
+    // The list-change sync wrote the bytes under the draft key.
+    await waitFor(async () => {
+      await expect(storedRowCount(draftKey)).resolves.toBe(1)
+    })
+
+    // The draft row itself (what the debounced autosave writes).
+    const saved = await saveDraft(executor, {
+      accountId,
+      draftKey,
+      draft: {
+        to: [],
+        cc: [],
+        bcc: [],
+        subject: "files draft",
+        bodyHtml: "<p></p>",
+        attachments: [{ filename: "report.pdf", size: 4 }],
+      },
+    })
+
+    // Restart: the view unmounts, the store resets, the session registry
+    // empties — previously the files were simply gone from here on.
+    cleanup()
+    useComposerStore.getState().reset()
+    await act(async () => {})
+    expect(getComposerPayload().attachments).toBeUndefined()
+
+    // Resume from the Drafts folder: the bytes re-register and ride the
+    // payload exactly like freshly attached files.
+    expect(await resumeDraft(executor, saved.id)).toBe(true)
+    expect(
+      useComposerStore.getState().attachments.map((a) => a.name)
+    ).toEqual(["report.pdf"])
+    expect(getComposerPayload().attachments).toEqual([
+      {
+        filename: "report.pdf",
+        mimeType: "application/pdf",
+        contentBase64: btoa(String.fromCharCode(1, 2, 3, 4)),
+      },
+    ])
+
+    // The strip renders the restored chip (with its bytes).
+    render(<Composer />)
+    expect(screen.getByText("report.pdf")).toBeTruthy()
+  })
+
+  it("an attachment removed while composing is not persisted", async () => {
+    const draftKey = renderOpen()
+    dropOnSection([
+      new File([new Uint8Array([1])], "gone.txt", { type: "text/plain" }),
+    ])
+    await waitFor(() => {
+      expect(screen.getByText("gone.txt")).toBeTruthy()
+    })
+    await waitFor(async () => {
+      await expect(storedRowCount(draftKey)).resolves.toBe(1)
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove gone.txt" }))
+    expect(useComposerStore.getState().attachments).toEqual([])
+    await waitFor(async () => {
+      await expect(storedRowCount(draftKey)).resolves.toBe(0)
+    })
+  })
+
+  it("a corrupt stored payload is dropped with a warning; the rest of the draft resumes", async () => {
+    const draftKey = renderOpen()
+    dropOnSection([
+      new File([new Uint8Array([1, 2])], "good.txt", { type: "text/plain" }),
+      new File([new Uint8Array([3, 4])], "bad.bin"),
+    ])
+    await waitFor(() => {
+      expect(screen.getByText("good.txt")).toBeTruthy()
+    })
+    await waitFor(async () => {
+      await expect(storedRowCount(draftKey)).resolves.toBe(2)
+    })
+    const saved = await saveDraft(executor, {
+      accountId,
+      draftKey,
+      draft: {
+        to: [],
+        cc: [],
+        bcc: [],
+        subject: "mostly fine",
+        bodyHtml: "<p></p>",
+        attachments: [
+          { filename: "good.txt", size: 2 },
+          { filename: "bad.bin", size: 2 },
+        ],
+      },
+    })
+
+    // Tampered store: bad.bin's base64 no longer decodes.
+    await executor.execute(
+      "UPDATE draft_attachments SET content_base64 = '!!!not-base64' WHERE name = 'bad.bin'"
+    )
+
+    cleanup()
+    useComposerStore.getState().reset()
+    await act(async () => {})
+    expect(await resumeDraft(executor, saved.id)).toBe(true)
+
+    expect(toastMock.warning).toHaveBeenCalledWith(
+      'Attachment "bad.bin" couldn\'t be restored and was removed'
+    )
+    const state = useComposerStore.getState()
+    expect(state.attachments.map((a) => a.name)).toEqual(["good.txt"])
+    expect(state.subject).toBe("mostly fine")
+  })
+})
+
+describe("Composer signature selector (batch C1, fix 3)", () => {
+  let otherAccountId: string
+
+  function seedAccounts(): void {
+    useAccountStore.setState({
+      accounts: [
+        {
+          id: accountId,
+          type: "gmail",
+          email: `${accountId}@example.com`,
+          displayName: "First",
+          status: "active",
+          unreadCount: 0,
+        },
+        {
+          id: otherAccountId,
+          type: "gmail",
+          email: `${otherAccountId}@example.com`,
+          displayName: null,
+          status: "active",
+          unreadCount: 0,
+        },
+      ],
+      activeAccountId: accountId,
+      loaded: true,
+    })
+  }
+
+  beforeEach(async () => {
+    otherAccountId = await createAccount(executor)
+    await setSignature(executor, accountId, "<p>First account sig</p>")
+    await setSignature(executor, otherAccountId, "<p>Second account sig</p>")
+    seedAccounts()
+  })
+
+  afterEach(() => {
+    useAccountStore.setState({
+      accounts: [],
+      activeAccountId: null,
+      loaded: false,
+    })
+  })
+
+  function signatureSelect(): HTMLSelectElement {
+    return screen.getByLabelText("Signature") as HTMLSelectElement
+  }
+
+  it("offers No signature plus every account signature; a new compose starts on none", async () => {
+    openComposer()
+    render(<Composer />)
+
+    const select = await screen.findByLabelText("Signature")
+    const labels = Array.from(select.querySelectorAll("option")).map(
+      (option) => option.textContent
+    )
+    expect(labels).toEqual([
+      "No signature",
+      `First <${accountId}@example.com>`,
+      `${otherAccountId}@example.com`,
+    ])
+    expect((select as HTMLSelectElement).value).toBe("")
+    expect(useComposerStore.getState().signatureSelection).toBeNull()
+  })
+
+  it("is hidden when no account has a signature to offer", async () => {
+    await setSignature(executor, accountId, "")
+    await setSignature(executor, otherAccountId, "")
+    openComposer()
+    render(<Composer />)
+    // Let the loader settle: absence must be the LOADED state, not a race.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+    expect(screen.queryByLabelText("Signature")).toBeNull()
+  })
+
+  it("selecting a signature inserts the managed block; No signature removes it", async () => {
+    openComposer()
+    render(<Composer />)
+    act(() => {
+      getMountedEditor().commands.setContent("<p>Hello there</p>")
+    })
+    await screen.findByLabelText("Signature")
+
+    fireEvent.change(signatureSelect(), { target: { value: otherAccountId } })
+    let html = useComposerStore.getState().html
+    expect(html).toContain('class="emailer-signature"')
+    expect(html).toContain("Second account sig")
+    expect(html.indexOf("Hello there")).toBeLessThan(
+      html.indexOf("Second account sig")
+    )
+    expect(useComposerStore.getState().signatureSelection).toBe(otherAccountId)
+
+    fireEvent.change(signatureSelect(), { target: { value: "" } })
+    html = useComposerStore.getState().html
+    expect(html).not.toContain("emailer-signature")
+    expect(html).toContain("Hello there")
+    expect(useComposerStore.getState().signatureSelection).toBeNull()
+  })
+
+  it("switching signatures replaces the managed block and preserves the user text", async () => {
+    openComposer()
+    render(<Composer />)
+    act(() => {
+      getMountedEditor().commands.setContent("<p>My update:</p>")
+    })
+    await screen.findByLabelText("Signature")
+
+    fireEvent.change(signatureSelect(), { target: { value: accountId } })
+    fireEvent.change(signatureSelect(), {
+      target: { value: otherAccountId },
+    })
+
+    const html = useComposerStore.getState().html
+    expect(html).toContain("Second account sig")
+    expect(html).not.toContain("First account sig")
+    expect(html.indexOf("My update:")).toBeLessThan(
+      html.indexOf("Second account sig")
+    )
+    expect(html.match(/emailer-signature/g)?.length).toBe(1)
+  })
+
+  it("a reply keeps the signature between the body and the quoted history", async () => {
+    openComposer()
+    render(<Composer />)
+    act(() => {
+      getMountedEditor().commands.setContent(
+        "<p>My reply</p><p>On Jan 1, Ada wrote:</p><blockquote><p>original</p></blockquote>"
+      )
+    })
+    await screen.findByLabelText("Signature")
+
+    fireEvent.change(signatureSelect(), { target: { value: accountId } })
+
+    const html = useComposerStore.getState().html
+    const body = html.indexOf("My reply")
+    const sig = html.indexOf("First account sig")
+    const quote = html.indexOf("<blockquote")
+    expect(sig).toBeGreaterThan(body)
+    expect(sig).toBeLessThan(quote)
+    // The quote was not duplicated or disturbed.
+    expect(html.match(/<blockquote/g)?.length).toBe(1)
   })
 })

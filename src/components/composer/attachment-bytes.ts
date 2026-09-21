@@ -13,10 +13,12 @@
  * expose no reliable path in the webview), and the picker path is read
  * through plugin-fs (see attachment-input.ts). The store's
  * `removeAttachment` deletes the entry and `reset`/`openNew`/`openWith`
- * clear the registry together with the draft. Bytes are deliberately NOT
- * persisted with drafts — attachments survive within the session only
- * (acceptable v1; see services/composer/drafts.ts, metadata-only
- * attachments_json).
+ * clear the registry together with the draft. Bytes ARE persisted with
+ * drafts since batch C1 (fix 1): the draft-attachments service
+ * (services/composer/draft-attachments.ts) syncs them into the
+ * `draft_attachments` table whenever the attachment list changes and
+ * restores them on draft resume — this registry stays the session-side
+ * source the send payload reads.
  *
  * File contents never leave this module except through the send payload:
  * they are never logged (privacy rule).

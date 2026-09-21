@@ -19,6 +19,7 @@ import {
 } from "../../db/sender-stats"
 import { recomputeThreadCaches, setThreadLabels } from "../../db/threads"
 import { MissingSpecialFolderError } from "../../email-actions/thread-actions"
+import { setMarkReadOnOpenPreference } from "../../settings/preferences"
 import { applyRuleActions, parseActionsJson } from "../actions"
 import {
   createRule,
@@ -339,6 +340,20 @@ describe("rule actions", () => {
     )
   })
 
+  it("mark_read ignores the mark-as-read-on-open toggle (task 1.4: rules are not the open seam)", async () => {
+    // the reading preference gates ONLY the reading pane's open path;
+    // rules must keep marking read with the toggle off
+    await setMarkReadOnOpenPreference(executor, false)
+    const { threadId } = await seedGmailThread()
+
+    const applied = await applyRuleActions(executor, accountId, threadId, [
+      { type: "mark_read" },
+    ])
+
+    expect(applied).toEqual(["mark_read"])
+    expect(await threadRow(threadId)).toMatchObject({ unread_count: 0 })
+  })
+
   it("star flags the messages and the thread cache, queuing star", async () => {
     const { threadId, messageId } = await seedGmailThread()
 
@@ -581,6 +596,7 @@ describe("ingestion hook", () => {
       hasAttachments: false,
       threadHasUserMessage: false,
       isMailingList: false,
+      headers: {},
       sizeEstimate: null,
       ...overrides,
     }
@@ -898,6 +914,7 @@ describe("ingestion hook", () => {
       sizeEstimate: 4096,
       threadHasUserMessage: false,
       isMailingList: false,
+      headers: {},
     })
   })
 })
@@ -941,6 +958,7 @@ describe("sender stats consumer", () => {
       hasAttachments: false,
       threadHasUserMessage: false,
       isMailingList: false,
+      headers: {},
       sizeEstimate: null,
       ...overrides,
     }

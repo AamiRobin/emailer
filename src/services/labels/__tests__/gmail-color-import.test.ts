@@ -60,6 +60,7 @@ function fakeGmailProvider(folders: EmailFolder[]): EmailProvider {
     trash: vi.fn(async () => {}),
     moveToFolder: vi.fn(async () => {}),
     deleteForever: vi.fn(async () => {}),
+    getMessageSource: vi.fn(async () => ""),
     sendMessage: vi.fn(async () => ({ messageId: "x" })),
     appendMessage: vi.fn(async () => {}),
     testConnection: vi.fn(async () => ({ success: true, message: "ok" })),

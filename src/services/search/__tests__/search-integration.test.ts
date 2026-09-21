@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { addDays } from "date-fns"
 
-import { searchThreadsAcrossAccounts, searchThreadsQuery } from "../index"
+import {
+  countThreadsForQuery,
+  searchThreadsWithRelaxedFallback,
+  searchThreadsAcrossAccounts,
+  searchThreadsQuery,
+} from "../index"
 import {
   recomputeThreadCaches,
   setThreadLabels,
@@ -662,11 +668,7 @@ describe("searchThreadsQuery", () => {
     // the negated bound excludes exactly the offending thread
     const noBig = await searchThreadsQuery(executor, accountId, "-larger:10m")
     expect(noBig.map((thread) => thread.id)).toEqual([smallNew])
-    const noSmall = await searchThreadsQuery(
-      executor,
-      accountId,
-      "-smaller:1m"
-    )
+    const noSmall = await searchThreadsQuery(executor, accountId, "-smaller:1m")
     expect(noSmall.map((thread) => thread.id)).toEqual([bigOld])
     const notOld = await searchThreadsQuery(
       executor,
@@ -841,5 +843,271 @@ describe("searchThreadsAcrossAccounts (task 9.1)", () => {
     expect(await searchThreadsAcrossAccounts(executor, [], "roadmap")).toEqual(
       []
     )
+  })
+})
+
+describe("dynamic date tokens (task 3.8, design D13)", () => {
+  let executor: TestExecutor
+  let accountId: string
+
+  /** Seed a thread + one message dated `date` (unix seconds, absolute). */
+  async function seedDated(subject: string, date: number): Promise<string> {
+    const threadId = await createThread(executor, accountId, { subject })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date,
+      subject,
+      fromName: "Alice Wonderland",
+      fromAddress: "alice@wonderland.example",
+    })
+    await recomputeThreadCaches(executor, threadId)
+    return threadId
+  }
+
+  /** Real now, shifted `days` (negative = past), as unix seconds. */
+  function daysFromNow(days: number): number {
+    return Math.floor(addDays(new Date(), days).getTime() / 1000)
+  }
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("resolves after:__TODAY-7D__ at query time against the current clock", async () => {
+    // One message inside the rolling window (2 days ago) and one outside
+    // (9 days ago). Without token resolution the query degrades to free
+    // text and matches NEITHER.
+    await seedDated("Inside the window", daysFromNow(-2))
+    await seedDated("Outside the window", daysFromNow(-9))
+
+    const hits = await searchThreadsAcrossAccounts(
+      executor,
+      [accountId],
+      "after:__TODAY-7D__"
+    )
+    expect(hits.map((thread) => thread.subject)).toEqual(["Inside the window"])
+  })
+
+  it("resolves tokens in the count pipeline too (split tab counts)", async () => {
+    await seedDated("Inside the window", daysFromNow(-2))
+    await seedDated("Outside the window", daysFromNow(-9))
+
+    expect(
+      await countThreadsForQuery(executor, [accountId], "after:__TODAY-7D__")
+    ).toBe(1)
+  })
+})
+
+describe("accent folding + relaxed fallback (task 1.3)", () => {
+  let executor: TestExecutor
+  let accountId: string
+
+  /** Seed one thread + message with the given text fields. */
+  async function seed(options: {
+    subject?: string
+    fromName?: string
+    fromAddress?: string
+    bodyText?: string
+    date: number
+    isRead?: boolean
+  }): Promise<string> {
+    const threadId = await createThread(executor, accountId, {
+      subject: options.subject,
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: options.date,
+      subject: options.subject,
+      fromName: options.fromName,
+      fromAddress: options.fromAddress,
+      bodyText: options.bodyText,
+      snippet: options.bodyText?.slice(0, 40),
+      isRead: options.isRead,
+    })
+    await recomputeThreadCaches(executor, threadId)
+    return threadId
+  }
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  describe("accent folding (the v13 index folds; the query folds too)", () => {
+    beforeEach(async () => {
+      await seed({
+        subject: "Bé Dọn Dẹp",
+        fromName: "Hoà Bình",
+        fromAddress: "hoa@vn.example",
+        bodyText: "Lịch họp tuần sau đã đổi.",
+        date: at(100),
+      })
+      await seed({
+        subject: "Unrelated minutes",
+        fromName: "Biz",
+        fromAddress: "biz@corp.example",
+        bodyText: "Nothing accented here.",
+        date: at(200),
+      })
+    })
+
+    it("spec scenario: the strict unaccented query finds the accented thread", async () => {
+      const hits = await searchThreadsQuery(executor, accountId, "be don dep")
+      expect(hits.map((thread) => thread.subject)).toEqual(["Bé Dọn Dẹp"])
+    })
+
+    it("matches folded terms across every indexed column", async () => {
+      // from_name, body and subject each carry a different accent class
+      expect(
+        (await searchThreadsQuery(executor, accountId, "hoa binh")).length
+      ).toBe(1)
+      expect(
+        (await searchThreadsQuery(executor, accountId, "lich hop")).length
+      ).toBe(1)
+    })
+
+    it("also matches accented input against accented content", async () => {
+      // the fold runs on the query side as well
+      expect(
+        (await searchThreadsQuery(executor, accountId, "bé dọn")).length
+      ).toBe(1)
+    })
+
+    it("keeps CJK search working untouched by the fold", async () => {
+      const cjkThread = await seed({
+        subject: "会議のお知らせ",
+        bodyText: "打ち合わせの日程",
+        date: at(300),
+      })
+      expect(
+        (await searchThreadsQuery(executor, accountId, "会議のお")).map(
+          (thread) => thread.id
+        )
+      ).toEqual([cjkThread])
+    })
+
+    it("keeps plain ASCII search working exactly as before", async () => {
+      expect(
+        (await searchThreadsQuery(executor, accountId, "unrelated minutes"))
+          .length
+      ).toBe(1)
+      expect(
+        (await searchThreadsQuery(executor, accountId, "be don dep unrelated"))
+          .length
+      ).toBe(0)
+    })
+  })
+
+  describe("relaxed fallback", () => {
+    beforeEach(async () => {
+      await seed({
+        subject: "Banking summary",
+        bodyText: "Quarterly banking numbers.",
+        date: at(100),
+      })
+      await seed({
+        subject: "Roadmap review",
+        bodyText: "The roadmap moved a quarter.",
+        date: at(200),
+      })
+      await seed({
+        subject: "Unrelated",
+        bodyText: "Neither topic.",
+        date: at(300),
+      })
+    })
+
+    it("strict multi-term hit is returned unflagged", async () => {
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "banking quarterly"
+      )
+      expect(result.relaxed).toBe(false)
+      expect(result.threads.length).toBe(1)
+    })
+
+    it("spec scenario: zero strict results re-run any-term, flagged relaxed", async () => {
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "banking roadmap"
+      )
+      // no single message carries BOTH terms — strict found nothing
+      expect(
+        await searchThreadsQuery(executor, accountId, "banking roadmap")
+      ).toEqual([])
+      // the OR retry returns each single-term match, flagged
+      expect(result.relaxed).toBe(true)
+      expect(result.threads.map((thread) => thread.subject).sort()).toEqual([
+        "Banking summary",
+        "Roadmap review",
+      ])
+    })
+
+    it("operator queries NEVER fall back — even when a term would match", async () => {
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "banking from:nobody@corp.example"
+      )
+      expect(result.threads).toEqual([])
+      expect(result.relaxed).toBe(false)
+    })
+
+    it("a flag-operator query never falls back either", async () => {
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "banking is:starred"
+      )
+      expect(result.threads).toEqual([])
+      expect(result.relaxed).toBe(false)
+    })
+
+    it("a single-term zero-result query does not retry (its OR form is itself)", async () => {
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "xyzzyy"
+      )
+      expect(result.threads).toEqual([])
+      expect(result.relaxed).toBe(false)
+    })
+
+    it("a negation-only query does not retry", async () => {
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "-banking -roadmap"
+      )
+      // matches only the "Unrelated" thread strictly (no positive terms —
+      // an OR retry is meaningless), and it must not be flagged relaxed
+      expect(result.threads.map((thread) => thread.subject)).toEqual([
+        "Unrelated",
+      ])
+      expect(result.relaxed).toBe(false)
+    })
+
+    it("an OR retry that still finds nothing reports unflagged empty", async () => {
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "xyzzyp xyzzzq"
+      )
+      expect(result.threads).toEqual([])
+      expect(result.relaxed).toBe(false)
+    })
   })
 })

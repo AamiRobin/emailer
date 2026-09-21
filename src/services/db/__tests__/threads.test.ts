@@ -13,6 +13,7 @@ import {
   getLabelsForThreads,
   getThread,
   getThreadWithMessages,
+  listRecentThreadsByParticipant,
   listThreadsAcrossAccounts,
   listThreadsByFolder,
   recomputeThreadCaches,
@@ -1224,5 +1225,133 @@ describe("listThreadsAcrossAccounts (task 9.1)", () => {
       midB,
       newestB,
     ])
+  })
+})
+
+describe("listRecentThreadsByParticipant (task 2.7)", () => {
+  let executor: TestExecutor
+  let accountId: string
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  /** A thread whose newest message is from `fromAddress`, with the
+   * participants cache populated exactly like ingestion does. */
+  async function seedFromSender(options: {
+    subject: string
+    fromAddress: string
+    date: number
+  }): Promise<string> {
+    const threadId = await createThread(executor, accountId, {
+      subject: options.subject,
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: options.date,
+      fromName: "Ada Lovelace",
+      fromAddress: options.fromAddress,
+    })
+    await recomputeThreadCaches(executor, threadId)
+    return threadId
+  }
+
+  it("finds threads by participant email (casing-insensitive), excluding the open thread, newest first", async () => {
+    const openId = await seedFromSender({
+      subject: "Open thread",
+      fromAddress: "ada@example.com",
+      date: at(300),
+    })
+    const olderId = await seedFromSender({
+      subject: "Older thread",
+      fromAddress: "ada@example.com",
+      date: at(100),
+    })
+    // Header casing differs from the queried address — still one person.
+    const middleId = await seedFromSender({
+      subject: "Middle thread",
+      fromAddress: "Ada@Example.com",
+      date: at(200),
+    })
+    await seedFromSender({
+      subject: "Other sender",
+      fromAddress: "grace@example.com",
+      date: at(250),
+    })
+
+    const rows = await listRecentThreadsByParticipant(
+      executor,
+      "ada@example.com",
+      { excludeThreadId: openId }
+    )
+    expect(rows.map((thread) => thread.id)).toEqual([middleId, olderId])
+
+    // Without the exclusion the open (newest) thread leads the list.
+    const unfiltered = await listRecentThreadsByParticipant(
+      executor,
+      "ada@example.com"
+    )
+    expect(unfiltered.map((thread) => thread.id)).toEqual([
+      openId,
+      middleId,
+      olderId,
+    ])
+  })
+
+  it("caps the result at limit and skips trashed/spam threads", async () => {
+    const firstId = await seedFromSender({
+      subject: "First",
+      fromAddress: "ada@example.com",
+      date: at(300),
+    })
+    const secondId = await seedFromSender({
+      subject: "Second",
+      fromAddress: "ada@example.com",
+      date: at(200),
+    })
+    const thirdId = await seedFromSender({
+      subject: "Third",
+      fromAddress: "ada@example.com",
+      date: at(100),
+    })
+    const trashedId = await seedFromSender({
+      subject: "Trashed",
+      fromAddress: "ada@example.com",
+      date: at(400),
+    })
+    await executor.execute("UPDATE threads SET is_trashed = 1 WHERE id = $1", [
+      trashedId,
+    ])
+
+    expect(
+      (await listRecentThreadsByParticipant(executor, "ada@example.com")).map(
+        (thread) => thread.id
+      )
+    ).toEqual([firstId, secondId, thirdId])
+    expect(
+      (
+        await listRecentThreadsByParticipant(executor, "ada@example.com", {
+          limit: 2,
+        })
+      ).map((thread) => thread.id)
+    ).toEqual([firstId, secondId])
+  })
+
+  it("never matches a longer address sharing the queried suffix, and [] on an empty address", async () => {
+    await seedFromSender({
+      subject: "Canada",
+      fromAddress: "canada@example.com",
+      date: at(100),
+    })
+    expect(
+      await listRecentThreadsByParticipant(executor, "ada@example.com")
+    ).toEqual([])
+    expect(await listRecentThreadsByParticipant(executor, "   ")).toEqual([])
   })
 })

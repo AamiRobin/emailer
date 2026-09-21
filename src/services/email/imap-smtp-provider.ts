@@ -21,6 +21,7 @@ import {
   imapDeleteMessage,
   imapFetchFlags,
   imapFetchMessages,
+  imapFetchSource,
   imapListFolders,
   imapMoveMessage,
   imapStoreFlags,
@@ -30,6 +31,7 @@ import {
   smtpTestConnection,
 } from "./invoke"
 import { toEmailFolders } from "./folder-mapper"
+import { buildMimeMessage, hasInlineImages } from "./mime-builder"
 
 /**
  * EmailProvider implementation for IMAP/SMTP accounts (design D2/D4):
@@ -75,6 +77,16 @@ function uidSetFromUids(uids: number[]): string {
   return [...new Set(uids)].join(",")
 }
 
+/** Standard base64 → bytes (the imap_fetch_source wire payload). */
+function base64ToBytes(encoded: string): Uint8Array {
+  const binary = atob(encoded)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index++) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+  return bytes
+}
+
 /** Group message refs by folder for per-folder UID operations. */
 function groupRefsByFolder(refs: MessageRef[]): Map<string, number[]> {
   const grouped = new Map<string, number[]>()
@@ -109,6 +121,7 @@ export function toNormalizedMessage(
     references?: string | null
     listUnsubscribe?: string | null
     listUnsubscribePost?: string | null
+    authResults?: string | null
     subject?: string | null
     from: { name?: string | null; email?: string | null }[]
     to: { name?: string | null; email?: string | null }[]
@@ -149,6 +162,10 @@ export function toNormalizedMessage(
     // header pair verbatim; buildStoredHeaders (imap-sync) persists it.
     listUnsubscribe: message.listUnsubscribe ?? undefined,
     listUnsubscribePost: message.listUnsubscribePost ?? undefined,
+    // Task 2.1 (D10): the Rust ImapMessage carries the compact
+    // Authentication-Results verdicts already consolidated Rust-side;
+    // upsertMessageByProviderId persists the auth_results column.
+    authResults: message.authResults ?? undefined,
     subject: message.subject ?? undefined,
     from: message.from.map(normalizeAddress),
     to: message.to.map(normalizeAddress),
@@ -414,6 +431,18 @@ export function createImapSmtpProvider(
       )
     },
 
+    /**
+     * Raw source (task 1.2, design D6): the imap_fetch_source command's
+     * BODY.PEEK[] full-message fetch (no \Seen side effect), base64 over
+     * the bridge, decoded here. One connection per call, nothing cached.
+     */
+    async getMessageSource(ref: MessageRef): Promise<string> {
+      const base64 = await call(() =>
+        imapFetchSource(imapParams, ref.folder, ref.uid)
+      )
+      return new TextDecoder().decode(base64ToBytes(base64))
+    },
+
     async sendMessage(input: SendEmailInput) {
       // Task 18.5 (design D11): a PGP send arrives FULLY BUILT (the
       // signed/encrypted PGP/MIME was frozen into the queued input at
@@ -432,6 +461,24 @@ export function createImapSmtpProvider(
           smtpSendRawEmail(
             requireSmtpParams(),
             pgpMime,
+            envelopeRecipients(input),
+            input.from.email
+          )
+        )
+        return { messageId: input.messageId ?? "" }
+      }
+      // Inline body images (batch C2): they ride multipart/related, which
+      // the Rust MIME builder does not emit — build the complete message
+      // TS-side (the same builder Gmail/Graph use, with the data: srcs
+      // extracted into Content-ID'd parts) and transmit verbatim through
+      // the raw command. The envelope is identical to the structured path
+      // below (D10: the alias rides in the header, never the MAIL FROM).
+      if (hasInlineImages(input.htmlBody)) {
+        const raw = buildMimeMessage(input).mime
+        await call(() =>
+          smtpSendRawEmail(
+            requireSmtpParams(),
+            raw,
             envelopeRecipients(input),
             input.from.email
           )

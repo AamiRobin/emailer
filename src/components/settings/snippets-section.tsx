@@ -22,6 +22,7 @@ import {
   listSnippets,
   updateSnippet,
 } from "@/services/db/snippets"
+import { SNIPPET_VARIABLES } from "@/services/composer/snippet-variables"
 
 /**
  * Settings "Snippets" section (task 6.1): manages the global composer text
@@ -31,6 +32,11 @@ import {
  * dialogs), Delete reuses the destructive confirm-dialog pattern of
  * account removal. The composer insertion itself is a later task; this
  * section is the only writer.
+ *
+ * Task 2.4 (design D11) adds a read-only "Template variables" legend: one
+ * line per registry variable, rendered from the substitution engine's
+ * SNIPPET_VARIABLES metadata so the documentation can never drift from
+ * what insertion actually resolves.
  */
 
 type DialogTarget = { mode: "add" } | { mode: "edit"; snippet: SnippetRow }
@@ -270,6 +276,48 @@ function SnippetRowItem({
   )
 }
 
+/**
+ * Read-only legend for the `{{variable}}` placeholders a snippet body may
+ * use (task 2.4, design D11) — rendered straight from the substitution
+ * engine's SNIPPET_VARIABLES metadata (single source of truth), so the
+ * documented list is always exactly what insertion resolves. Also states
+ * the prompt behavior: a variable without a known value (registry or not)
+ * asks once per insertion and the answer fills every occurrence.
+ */
+function TemplateVariablesHelp() {
+  return (
+    <div className="flex flex-col gap-2" data-testid="snippet-variables-help">
+      <h3 className="text-sm font-medium text-foreground">
+        Template variables
+      </h3>
+      <p className="text-xs text-muted-foreground">
+        A snippet body can contain{" "}
+        <code className="font-mono">{"{{variable}}"}</code> placeholders, which
+        fill automatically when the snippet is inserted.
+      </p>
+      <ul className="flex flex-col gap-1.5">
+        {SNIPPET_VARIABLES.map((variable) => (
+          <li
+            key={variable.id}
+            className="text-xs text-muted-foreground"
+            data-testid="snippet-variable-entry"
+          >
+            <code className="font-mono text-foreground">
+              {`{{${variable.id}}}`}
+            </code>{" "}
+            — {variable.description} (e.g. {variable.example})
+          </li>
+        ))}
+      </ul>
+      <p className="text-xs text-muted-foreground">
+        A variable the message context can't fill — including ids not listed
+        here — prompts once per insertion, and the answer applies to every
+        occurrence in the snippet.
+      </p>
+    </div>
+  )
+}
+
 export function SnippetsSection() {
   const [snippets, setSnippets] = useState<SnippetRow[]>([])
   const [dialog, setDialog] = useState<DialogTarget | null>(null)
@@ -322,6 +370,7 @@ export function SnippetsSection() {
           ))}
         </div>
       )}
+      <TemplateVariablesHelp />
       {/* Remounted on every open so the form always starts fresh. */}
       {dialog && (
         <SnippetDialog

@@ -1,5 +1,6 @@
 import type { SqlExecutor } from "../db/executor"
 import { getAccount } from "../db/accounts"
+import type { Category } from "../categorization/classify"
 import type { ContactRef, MessageInput } from "../db/messages"
 import { parseContacts, serializeContacts } from "../db/messages"
 import type { SenderStatPatch } from "../db/sender-stats"
@@ -125,6 +126,17 @@ import { listEnabledRules, type RuleRow } from "./db"
  * normally, an untrained or opted-out account never sees a verdict, and
  * the classification is recoverable: the spam-placed thread shows the
  * mail-display "Not spam" affordance, whose action retrains the filter.
+ *
+ * Automatic categorization (task 3.3, design D4) is the SEVENTH consumer,
+ * riding the same flow like sender stats: after runIngestionRules and the
+ * apply/filing steps, the engines call categorizeIncomingMessages
+ * (categorization/ingestion.ts) with one input per new event, which
+ * classifies (user-rule category → list-header heuristics → sender
+ * override read → default Primary) and writes threads.category KEEP-FIRST.
+ * It must land BEFORE the engines finalize the new-mail count — that count
+ * is what the scheduler forwards to notifyNewMail, so every category
+ * exists before any notification fires. Like the stats it never touches
+ * the outcomes or the count.
  */
 
 /** One newly inserted message, described for rule matching. */
@@ -177,13 +189,38 @@ export interface IngestionEvent {
    */
   threadHasUserMessage: boolean
   isMailingList: boolean
+  /**
+   * Categorization header subset (task 3.3, design D4), keyed by
+   * lowercase header name — the parsed form of the stored messages.headers
+   * JSON the MessageInput already carries (the engines' buildStoredHeaders:
+   * list-unsubscribe/-post today; more when the provider surfaces expose
+   * them). The categorization pass (categorization/ingestion.ts) classifies
+   * from this record, so the classifier sees exactly the headers that were
+   * persisted. Empty when the message carried none of the captured
+   * headers.
+   */
+  headers: Record<string, string>
+  /**
+   * A user rule named a category for this message (task 3.4, design D4 —
+   * the `set_category` action). NOT an engine input and not set by
+   * ingestionEventFromInput: runIngestionRules STAMPS it when a matching
+   * enabled rule carries a set_category action (first matching rule wins —
+   * position order is the priority). The transport works because the
+   * engines hand the SAME event objects to runIngestionRules and then to
+   * categorizationInputFromEvent, so the stamp rides the objects into
+   * categorizeIncomingMessages' classify call with zero engine changes.
+   * Leave undefined otherwise (the header heuristics decide).
+   */
+  ruleCategory?: Category | null
 }
 
 /**
  * Build the event from the MessageInput the engine is about to store —
  * pure projection, so the engines add one call per created message.
  * `labelNames` is provider-resolved by the caller (see IngestionEvent);
- * the engine-only stats flags start false and are stamped by the engines.
+ * the engine-only stats flags start false and are stamped by the engines;
+ * `headers` is the MessageInput's stored headers JSON parsed back to its
+ * record form (the categorization input — task 3.3, design D4).
  */
 export function ingestionEventFromInput(
   input: MessageInput,
@@ -209,6 +246,34 @@ export function ingestionEventFromInput(
     sizeEstimate: input.sizeEstimate ?? null,
     threadHasUserMessage: false,
     isMailingList: false,
+    headers: storedHeadersRecord(input.headers),
+  }
+}
+
+/**
+ * Parse the MessageInput's stored headers JSON (the engines'
+ * buildStoredHeaders output — a lowercase-keyed record) back into the
+ * event's header record. Corrupt or unexpected shapes degrade to {} —
+ * an unparseable capture must never break a sync pass. Exported for the
+ * task 3.4 backfill, which reads the same stored capture for the thread's
+ * newest message (categorization/backfill.ts).
+ */
+export function storedHeadersRecord(
+  json: string | undefined
+): Record<string, string> {
+  if (!json) return {}
+  try {
+    const parsed: unknown = JSON.parse(json)
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {}
+    }
+    const record: Record<string, string> = {}
+    for (const [name, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === "string") record[name] = value
+    }
+    return record
+  } catch {
+    return {}
   }
 }
 
@@ -384,12 +449,26 @@ export async function runIngestionRules(
       }
       const parsed = criteriaByRuleId.get(rule.id)
       if (!parsed || !messageMatchesCriteria(event, parsed)) continue
+      const actions = actionsByRuleId.get(rule.id) ?? []
+      // The set_category seam (task 3.4, design D4): a matching rule that
+      // names a category stamps it on the event for the categorization
+      // pass (see IngestionEvent.ruleCategory). FIRST matching rule wins —
+      // position order is the priority, and the stamp is not overwritten
+      // by later rules. Stamped BEFORE applyRuleActions so the category
+      // survives even when one of the rule's delivery actions throws (the
+      // hook isolates that failure per rule).
+      if (event.ruleCategory == null) {
+        const named = actions.find(
+          (action) => action.type === "set_category" && action.category
+        )
+        if (named?.category) event.ruleCategory = named.category
+      }
       try {
         const applied = await applyRuleActions(
           executor,
           accountId,
           event.threadId,
-          actionsByRuleId.get(rule.id) ?? []
+          actions
         )
         outcome.appliedActions.push(...applied)
       } catch (error) {

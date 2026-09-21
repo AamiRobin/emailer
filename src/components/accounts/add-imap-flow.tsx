@@ -23,6 +23,7 @@ import {
   defaultSmtpPort,
   discoverByEmail,
   discoverBrandByEmail,
+  isMicrosoftGraphEmail,
   ImapTestFailedError,
   SmtpTestFailedError,
   testImapSettings,
@@ -310,6 +311,13 @@ export function AddImapFlow({ onBack, onSuccess }: AddImapFlowProps) {
                 <ProviderIcon provider={detectedBrand} className="size-3.5" />
                 {providerBrandName(detectedBrand)} detected — server settings
                 will be prefilled.
+              </p>
+            )}
+            {isMicrosoftGraphEmail(email.trim()) && (
+              <p className="text-xs text-muted-foreground">
+                Outlook/Hotmail/Live addresses connect better via “Microsoft
+                365 / Outlook.com” on the previous screen (modern OAuth sign-in
+                instead of a password).
               </p>
             )}
           </div>

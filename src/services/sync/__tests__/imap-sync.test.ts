@@ -39,6 +39,12 @@ import type { FetchFlagsChangedFn } from "../flag-sync"
 import type { ImapSyncSummary } from "../imap-sync"
 import { syncImapAccount } from "../imap-sync"
 import { setJunkFilterEnabledPreference } from "../../settings/preferences"
+import {
+  getSubscription,
+  listSubscriptions,
+  markUnsubscribed,
+  recordSenderSeen,
+} from "../../settings/subscriptions"
 import { trainJunkDocument } from "../../security/junk-filter"
 
 // ---------------------------------------------------------------------------
@@ -249,6 +255,9 @@ class FakeImapProvider implements EmailProvider {
     throw new Error("not implemented in fake")
   }
   async deleteForever(): Promise<void> {
+    throw new Error("not implemented in fake")
+  }
+  async getMessageSource(): Promise<string> {
     throw new Error("not implemented in fake")
   }
   async sendMessage(): Promise<SendEmailResult> {
@@ -1702,5 +1711,242 @@ describe("imap sync junk filter", () => {
     expect(await messagesIn(harness, "INBOX")).toHaveLength(1)
     expect(await messagesIn(harness, "Junk")).toHaveLength(0)
     expect(await pendingOps()).toEqual([])
+  })
+})
+
+describe("imap sync categorization", () => {
+  let harness: TestHarness
+
+  beforeEach(async () => {
+    harness = await createHarness()
+  })
+
+  afterEach(() => {
+    harness.executor.close()
+  })
+
+  async function categoryByThread(
+    threadId: string
+  ): Promise<string | null> {
+    const rows = await harness.executor.select<{ category: string | null }>(
+      "SELECT category FROM threads WHERE id = $1",
+      [threadId]
+    )
+    return rows[0]?.category ?? null
+  }
+
+  it("categorizes new mail during the sync pass, before the count (task 3.3, D4)", async () => {
+    // First sync (a seed pass) so a second delta arrival exercises the
+    // counting gate; the categorization pass must write on BOTH passes.
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: [],
+      messageId: "<seed@x>",
+      subject: "Seed mail",
+      fromEmail: "friend@x",
+      date: 100,
+      textBody: "seed",
+    })
+    await harness.sync()
+
+    // A newsletter (List-Unsubscribe) and a personal mail arrive together;
+    // the engines run categorizeIncomingMessages BEFORE finalizing the
+    // newMessages count the scheduler forwards to notifyNewMail, so both
+    // threads carry their category the moment the pass announces them.
+    inbox.insert({
+      flags: [],
+      messageId: "<list-1@lists.example>",
+      subject: "Monthly digest",
+      fromEmail: "news@lists.example",
+      listUnsubscribe: "<https://lists.example/unsub>",
+      date: 1000,
+      textBody: "digest",
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<plain-1@x>",
+      subject: "Lunch?",
+      fromEmail: "friend@x",
+      date: 2000,
+      textBody: "still on for tomorrow?",
+    })
+
+    const summary = await harness.sync()
+    // Categorization never touches the notification count.
+    expect(summary.newMessages).toBe(2)
+
+    const rows = await harness.executor.select<{
+      subject: string | null
+      category: string | null
+    }>("SELECT subject, category FROM threads WHERE account_id = $1", [
+      harness.accountId,
+    ])
+    const bySubject = new Map(rows.map((row) => [row.subject, row.category]))
+    // List-Unsubscribe → newsletters; unmatched personal mail → the real
+    // 'primary' value, not NULL (migration v9 NULL semantics: only rows
+    // predating the column stay NULL until the task 3.4 backfill).
+    expect(bySubject.get("Monthly digest")).toBe("newsletters")
+    expect(bySubject.get("Lunch?")).toBe("primary")
+    // The seed thread was categorized on its own (first) pass.
+    expect(bySubject.get("Seed mail")).toBe("primary")
+  })
+
+  it("a later arrival keeps an existing category (keep-first)", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: [],
+      messageId: "<seed@x>",
+      subject: "Seed mail",
+      fromEmail: "friend@x",
+      date: 100,
+      textBody: "seed",
+    })
+    await harness.sync()
+
+    // Simulate the user override task 3.4 writes: the thread is moved to
+    // promotions by hand. A follow-up arrival in the same thread must not
+    // re-categorize it.
+    const threads = await harness.executor.select<{ id: string }>(
+      "SELECT id FROM threads WHERE subject = 'Seed mail'"
+    )
+    const threadId = threads[0]!.id
+    await harness.executor.execute(
+      "UPDATE threads SET category = $1 WHERE id = $2",
+      ["promotions", threadId]
+    )
+
+    inbox.insert({
+      flags: [],
+      messageId: "<plain-2@x>",
+      inReplyTo: "<seed@x>",
+      subject: "Re: Seed mail",
+      fromEmail: "friend@x",
+      date: 2000,
+      textBody: "follow-up",
+    })
+    await harness.sync()
+
+    expect(await categoryByThread(threadId)).toBe("promotions")
+  })
+})
+
+describe("imap sync subscriptions", () => {
+  let harness: TestHarness
+
+  beforeEach(async () => {
+    harness = await createHarness()
+  })
+
+  afterEach(() => {
+    harness.executor.close()
+  })
+
+  it("lists senders of List-Unsubscribe mail during the sync pass (task 3.6, D13)", async () => {
+    // First sync (a seed pass) so a second delta arrival exercises the
+    // counting gate; the detection pass must record on BOTH passes.
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: [],
+      messageId: "<seed@x>",
+      subject: "Seed mail",
+      fromEmail: "friend@x",
+      date: 100,
+      textBody: "seed",
+    })
+    await harness.sync()
+
+    // A newsletter (List-Unsubscribe + one-click -Post) and a plain mail
+    // arrive together; detection runs right next to categorization, before
+    // the new-mail count is finalized, and never touches that count.
+    inbox.insert({
+      flags: [],
+      messageId: "<list-1@lists.example>",
+      subject: "Monthly digest",
+      fromEmail: "news@lists.example",
+      listUnsubscribe: "<https://lists.example/unsub>",
+      listUnsubscribePost: "List-Unsubscribe=One-Click",
+      date: 1000,
+      textBody: "digest",
+    })
+    inbox.insert({
+      flags: [],
+      messageId: "<plain-1@x>",
+      subject: "Lunch?",
+      fromEmail: "friend@x",
+      date: 2000,
+      textBody: "still on for tomorrow?",
+    })
+
+    const summary = await harness.sync()
+    // Detection never touches the notification count.
+    expect(summary.newMessages).toBe(2)
+
+    const entries = await listSubscriptions(
+      harness.executor,
+      harness.accountId
+    )
+    // ONLY the header-carrying sender is detected as a newsletter; the
+    // plain correspondent never enters the list.
+    expect(entries.map((entry) => entry.sender)).toEqual(["news@lists.example"])
+    expect(entries[0]).toMatchObject({
+      sender: "news@lists.example",
+      state: "subscribed",
+      listUnsubscribe: "<https://lists.example/unsub>",
+      listUnsubscribePost: "List-Unsubscribe=One-Click",
+    })
+  })
+
+  it("new mail from an unsubscribed sender flips its entry to resumed (task 3.6, D13)", async () => {
+    // The manager already knows the sender, and the user unsubscribed.
+    await recordSenderSeen(harness.executor, harness.accountId, {
+      sender: "news@lists.example",
+      lastSeenAt: 100,
+      listUnsubscribe: "<https://lists.example/unsub>",
+    })
+    await markUnsubscribed(
+      harness.executor,
+      harness.accountId,
+      "news@lists.example",
+      { at: 150 }
+    )
+
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: [],
+      messageId: "<list-2@lists.example>",
+      subject: "We missed you",
+      fromEmail: "news@lists.example",
+      listUnsubscribe: "<https://lists.example/unsub>",
+      date: 5000,
+      textBody: "still mailing you",
+    })
+    await harness.sync()
+
+    // The spec's sender-resumed scenario: the unsubscribe did not hold.
+    const entry = await getSubscription(
+      harness.executor,
+      harness.accountId,
+      "news@lists.example"
+    )
+    expect(entry?.state).toBe("resumed")
+    expect(entry?.lastSeenAt).toBe(5000)
+    expect(entry?.unsubscribedAt).toBe(150)
+  })
+
+  it("mail without unsubscribe headers creates no subscription entry", async () => {
+    const inbox = harness.addFolder("INBOX", 100, "inbox")
+    inbox.insert({
+      flags: [],
+      messageId: "<plain-2@x>",
+      subject: "Hello",
+      fromEmail: "friend@x",
+      date: 100,
+      textBody: "hi",
+    })
+    await harness.sync()
+
+    expect(
+      await listSubscriptions(harness.executor, harness.accountId)
+    ).toEqual([])
   })
 })

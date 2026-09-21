@@ -1,4 +1,4 @@
-import type { RuleAction, RuleActionType } from "@/services/rules"
+import type { Category, RuleAction, RuleActionType } from "@/services/rules"
 
 /**
  * Non-component pieces of the rule dialog, split out so the dialog file
@@ -23,7 +23,20 @@ export const ACTION_TYPE_OPTIONS: { value: RuleActionType; label: string }[] = [
   { value: "add_labels", label: "Add labels" },
   { value: "remove_labels", label: "Remove labels" },
   { value: "move", label: "Move to folder (imap)" },
+  // Task 3.4 (design D4): names a category for the categorization pass —
+  // no delivery effect (the executor ignores it; no announcement change).
+  { value: "set_category", label: "Set category" },
 ]
+
+/** Category values as the UI shows them (the storage values are
+ * lowercase; the tabs are titled with the capitalized forms). */
+export const CATEGORY_LABELS: Record<Category, string> = {
+  primary: "Primary",
+  updates: "Updates",
+  promotions: "Promotions",
+  social: "Social",
+  newsletters: "Newsletters",
+}
 
 export function actionChipLabel(action: RuleAction): string {
   switch (action.type) {
@@ -43,6 +56,8 @@ export function actionChipLabel(action: RuleAction): string {
       return `Remove: ${(action.labels ?? []).join(", ")}`
     case "move":
       return `Move: ${action.folder ?? ""}`
+    case "set_category":
+      return `Category: ${CATEGORY_LABELS[action.category ?? "primary"]}`
   }
 }
 

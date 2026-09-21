@@ -42,6 +42,7 @@ export function fakeProvider(accountId: string): EmailProvider {
     trash: vi.fn(),
     moveToFolder: vi.fn(),
     deleteForever: vi.fn(),
+    getMessageSource: vi.fn(),
     appendMessage: vi.fn(),
     sendMessage: vi.fn(),
     testConnection: vi.fn(),

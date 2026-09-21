@@ -1272,3 +1272,74 @@ describe("thread list nudges scope (task 14.1, design D8)", () => {
     ).toEqual([nudgeA])
   })
 })
+
+describe("thread list relaxed search flag (task 1.3)", () => {
+  let accountId: string
+  let bankingThread: string
+  let roadmapThread: string
+
+  beforeEach(async () => {
+    accountId = await createAccount(executor, "gmail")
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+    bankingThread = await seedThread(accountId, [], {
+      subject: "Banking summary",
+      date: nowAt(-300),
+      snippet: "Quarterly banking numbers.",
+    })
+    roadmapThread = await seedThread(accountId, [], {
+      subject: "Roadmap review",
+      date: nowAt(-200),
+      snippet: "The roadmap moved a quarter.",
+    })
+  })
+
+  it("flags the page when the search box falls back to any-term", async () => {
+    // no single message carries BOTH terms — strict finds nothing
+    useUiStore.setState({
+      view: { kind: "search", query: "banking roadmap" },
+    })
+    await refreshThreadList()
+    const state = useThreadListStore.getState()
+    expect(state.searchRelaxed).toBe(true)
+    expect(state.threads.map((thread) => thread.id).sort()).toEqual(
+      [bankingThread, roadmapThread].sort()
+    )
+  })
+
+  it("strict hits are returned unflagged", async () => {
+    useUiStore.setState({ view: { kind: "search", query: "banking" } })
+    await refreshThreadList()
+    const state = useThreadListStore.getState()
+    expect(state.threads.map((thread) => thread.id)).toEqual([bankingThread])
+    expect(state.searchRelaxed).toBe(false)
+  })
+
+  it("operator queries never relax the page", async () => {
+    useUiStore.setState({
+      view: { kind: "search", query: "banking from:nobody@corp.example" },
+    })
+    await refreshThreadList()
+    const state = useThreadListStore.getState()
+    expect(state.threads).toEqual([])
+    expect(state.searchRelaxed).toBe(false)
+  })
+
+  it("the flag resets when the view leaves the search scope", async () => {
+    useUiStore.setState({
+      view: { kind: "search", query: "banking roadmap" },
+    })
+    await refreshThreadList()
+    expect(useThreadListStore.getState().searchRelaxed).toBe(true)
+
+    await seedThread(accountId, [], {
+      subject: "Inbox filler",
+      date: nowAt(-100),
+    })
+    useUiStore.getState().setView({
+      kind: "folder",
+      folder: { kind: "specialUse", specialUse: "inbox" },
+    })
+    await refreshThreadList()
+    expect(useThreadListStore.getState().searchRelaxed).toBe(false)
+  })
+})

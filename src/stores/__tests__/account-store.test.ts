@@ -4,11 +4,18 @@ import {
   createTestExecutor,
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
+import {
+  assignAccountToProfile,
+  createProfile,
+  deleteProfile,
+  setAccountColorOverride,
+} from "@/services/db/account-profiles"
 import { snoozeThread, wakeDueThreads } from "@/services/email-actions/snooze"
 import {
   muteThread,
   unmuteThread,
 } from "@/services/email-actions/thread-states"
+import { accountHue } from "@/components/email/account-hue"
 import {
   setAccountStoreExecutor,
   useAccountStore,
@@ -31,6 +38,7 @@ function resetStore(): void {
   useAccountStore.setState({
     accounts: [],
     activeAccountId: null,
+    effectiveColors: {},
     loaded: false,
   })
 }
@@ -321,5 +329,141 @@ describe("account store", () => {
     await useAccountStore.getState().reload()
 
     expect(useAccountStore.getState().activeAccountId).toBe(firstId)
+  })
+})
+
+/**
+ * effectiveColor (parity-round-2 task 4.4, design D10): the account store
+ * resolves the accounts spec's chain — per-account override, else the
+ * profile color, else the individual/generated color — into a reactive
+ * map rebuilt at load and on refreshProfileColors().
+ */
+describe("account store effectiveColor (parity-round-2 task 4.4)", () => {
+  let executor: TestExecutor
+  let idSequence = 0
+
+  function resetStore(): void {
+    useAccountStore.setState({
+      accounts: [],
+      activeAccountId: null,
+      effectiveColors: {},
+      loaded: false,
+    })
+  }
+
+  async function seedAccount(email: string): Promise<string> {
+    idSequence += 1
+    const id = `acc-${idSequence}`
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [id, "gmail", email]
+    )
+    return id
+  }
+
+  beforeEach(() => {
+    executor = createTestExecutor()
+    setAccountStoreExecutor(executor)
+    idSequence = 0
+    resetStore()
+  })
+
+  afterEach(() => {
+    setAccountStoreExecutor(null)
+    executor.close()
+  })
+
+  it("falls back to the generated hue when no profile or override exists", async () => {
+    const accountId = await seedAccount("plain@example.com")
+    await useAccountStore.getState().init()
+
+    const expected = `hsl(${accountHue(accountId)} 55% 50%)`
+    expect(useAccountStore.getState().effectiveColor(accountId)).toBe(expected)
+    // The same value the unified-inbox badge derives, so an unprofiled
+    // account's marker and badge always agree.
+    expect(useAccountStore.getState().effectiveColors[accountId]).toBe(
+      expected
+    )
+  })
+
+  it("resolves the profile color for assigned accounts", async () => {
+    const workId = await seedAccount("one@example.com")
+    const otherId = await seedAccount("two@example.com")
+    const profile = await createProfile(executor, {
+      name: "Work",
+      color: "#8b5cf6",
+    })
+    await assignAccountToProfile(executor, workId, profile.id)
+    await useAccountStore.getState().init()
+
+    expect(useAccountStore.getState().effectiveColor(workId)).toBe("#8b5cf6")
+    // The unassigned sibling keeps its generated hue.
+    expect(useAccountStore.getState().effectiveColor(otherId)).toBe(
+      `hsl(${accountHue(otherId)} 55% 50%)`
+    )
+  })
+
+  it("prefers the per-account override over the profile color (siblings keep the profile color)", async () => {
+    const overriddenId = await seedAccount("one@example.com")
+    const siblingId = await seedAccount("two@example.com")
+    const profile = await createProfile(executor, {
+      name: "Work",
+      color: "#8b5cf6",
+    })
+    await assignAccountToProfile(executor, overriddenId, profile.id)
+    await assignAccountToProfile(executor, siblingId, profile.id)
+    await setAccountColorOverride(executor, overriddenId, "#f97316")
+    await useAccountStore.getState().init()
+
+    // The accounts spec's per-account-override scenario: the overriding
+    // account shows orange while its profile siblings keep purple.
+    expect(useAccountStore.getState().effectiveColor(overriddenId)).toBe(
+      "#f97316"
+    )
+    expect(useAccountStore.getState().effectiveColor(siblingId)).toBe(
+      "#8b5cf6"
+    )
+  })
+
+  it("refreshProfileColors re-resolves after a profiles edit without a full reload", async () => {
+    const accountId = await seedAccount("one@example.com")
+    await useAccountStore.getState().init()
+    const generated = `hsl(${accountHue(accountId)} 55% 50%)`
+    expect(useAccountStore.getState().effectiveColor(accountId)).toBe(generated)
+
+    const profile = await createProfile(executor, {
+      name: "Work",
+      color: "#8b5cf6",
+    })
+    await assignAccountToProfile(executor, accountId, profile.id)
+    await useAccountStore.getState().refreshProfileColors()
+    expect(useAccountStore.getState().effectiveColor(accountId)).toBe(
+      "#8b5cf6"
+    )
+
+    // A rename/re-color + refresh flows through the same seam.
+    await setAccountColorOverride(executor, accountId, "#22c55e")
+    await useAccountStore.getState().refreshProfileColors()
+    expect(useAccountStore.getState().effectiveColor(accountId)).toBe(
+      "#22c55e"
+    )
+
+    // Delete-keeps-accounts: after the profile goes, the effective color
+    // falls back (override survives deletion — the individual color).
+    await deleteProfile(executor, profile.id)
+    await useAccountStore.getState().refreshProfileColors()
+    expect(useAccountStore.getState().effectiveColor(accountId)).toBe(
+      "#22c55e"
+    )
+    // A full reload re-derives the same map from the same rows.
+    await useAccountStore.getState().reload()
+    expect(useAccountStore.getState().effectiveColor(accountId)).toBe(
+      "#22c55e"
+    )
+  })
+
+  it("effectiveColor returns null for unknown account ids", async () => {
+    await useAccountStore.getState().init()
+    expect(useAccountStore.getState().effectiveColor("missing")).toBeNull()
   })
 })

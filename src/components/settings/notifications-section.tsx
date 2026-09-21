@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Bell, Loader2, Trash2 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
+import { Switch } from "@/components/ui/switch"
 import { getExecutor } from "@/services/db/executor"
 import type {
   NotificationRuleAction,
@@ -32,6 +33,12 @@ import {
   listNotificationRules,
   removeNotificationRule,
 } from "@/services/db/notification-rules"
+import {
+  getNewMailSoundEnabled,
+  getSentSoundEnabled,
+  setNewMailSoundPreference,
+  setSentSoundPreference,
+} from "@/services/settings/preferences"
 import { useActiveAccount } from "@/stores/account-store"
 
 /**
@@ -41,6 +48,13 @@ import { useActiveAccount } from "@/stores/account-store"
  * page has no other account scoping). Lists the active overrides and adds
  * or removes them; the evaluation itself lives at the sync engines' count
  * seam (notification-rules.ts).
+ *
+ * Sound toggles (task 1.5, settings spec, design D12): the new-mail
+ * chime (default on) and the sent-confirmation chime (default off),
+ * persisted through the preferences service. The new-mail sound plays
+ * only when the notification itself is shown — a "never notify" rule, a
+ * muted thread or a disabled notifications setting silences banner and
+ * sound together; disabling desktop notifications disables their sound.
  *
  * Copy note (D16): the rules gate only the new-mail announcement. A
  * suppressed message is still delivered, unread and shown in the thread
@@ -236,6 +250,13 @@ export function NotificationsSection() {
   const account = useActiveAccount()
   const [rules, setRules] = useState<NotificationRuleRow[]>([])
   const [addOpen, setAddOpen] = useState(false)
+  const [newMailSound, setNewMailSound] = useState(true)
+  const [sentSound, setSentSound] = useState(false)
+  // Set as soon as the user toggles: the async initial load must never
+  // clobber a change with a stale DB read (same ref pattern as the
+  // reading section's toggles).
+  const newMailSoundDirtyRef = useRef(false)
+  const sentSoundDirtyRef = useRef(false)
 
   const reload = useCallback(() => {
     // Without an active account there is nothing to load — the render
@@ -255,6 +276,49 @@ export function NotificationsSection() {
   // The shell only mounts settings after bootstrap(), so the executor is
   // available (same assumption as the other sections).
   useEffect(reload, [reload])
+
+  // Load the sound toggles once (failures keep the defaults). The sound
+  // toggles are GLOBAL — they do not depend on the active account.
+  useEffect(() => {
+    try {
+      void getNewMailSoundEnabled(getExecutor())
+        .then((enabled) => {
+          if (!newMailSoundDirtyRef.current) setNewMailSound(enabled)
+        })
+        .catch(() => {})
+      void getSentSoundEnabled(getExecutor())
+        .then((enabled) => {
+          if (!sentSoundDirtyRef.current) setSentSound(enabled)
+        })
+        .catch(() => {})
+    } catch (error) {
+      console.warn("[settings] failed to load sound toggles", error)
+    }
+  }, [])
+
+  async function changeNewMailSound(enabled: boolean): Promise<void> {
+    const previous = newMailSound
+    newMailSoundDirtyRef.current = true
+    setNewMailSound(enabled)
+    try {
+      await setNewMailSoundPreference(getExecutor(), enabled)
+    } catch (error) {
+      setNewMailSound(previous)
+      console.warn("[settings] failed to persist new-mail sound", error)
+    }
+  }
+
+  async function changeSentSound(enabled: boolean): Promise<void> {
+    const previous = sentSound
+    sentSoundDirtyRef.current = true
+    setSentSound(enabled)
+    try {
+      await setSentSoundPreference(getExecutor(), enabled)
+    } catch (error) {
+      setSentSound(previous)
+      console.warn("[settings] failed to persist sent sound", error)
+    }
+  }
 
   async function handleDelete(rule: NotificationRuleRow): Promise<void> {
     try {
@@ -283,13 +347,47 @@ export function NotificationsSection() {
           Add Rule
         </Button>
       </div>
+      <div className="divide-y divide-border">
+        <div className="flex items-center justify-between gap-6 py-3">
+          <div className="grid gap-0.5">
+            <Label htmlFor="notifications-new-mail-sound">New-mail sound</Label>
+            <p className="text-xs text-muted-foreground">
+              Play a chime with new-mail notifications. Senders and threads
+              that are silenced stay silent — no banner, no sound.
+            </p>
+          </div>
+          <Switch
+            id="notifications-new-mail-sound"
+            checked={newMailSound}
+            onCheckedChange={(checked) => {
+              void changeNewMailSound(checked)
+            }}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-6 py-3">
+          <div className="grid gap-0.5">
+            <Label htmlFor="notifications-sent-sound">Sent-message sound</Label>
+            <p className="text-xs text-muted-foreground">
+              Play a chime when a message is sent. Off for messages that are
+              only queued while offline.
+            </p>
+          </div>
+          <Switch
+            id="notifications-sent-sound"
+            checked={sentSound}
+            onCheckedChange={(checked) => {
+              void changeSentSound(checked)
+            }}
+          />
+        </div>
+      </div>
+      <Separator />
       <p className="text-xs text-muted-foreground">
         Rules apply when sync finds new mail. A "never" rule wins over an
         "always" rule when both match, and muted threads stay silent either way.
         Suppressed messages are still delivered and unread — including in the
         unread badge — so the badge can show mail you were not notified about.
       </p>
-      <Separator />
       {!account ? (
         <p className="text-sm text-muted-foreground">
           Add an account to manage its notification rules.

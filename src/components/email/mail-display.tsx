@@ -1,8 +1,17 @@
-import { useEffect, useMemo, useRef, useState, type ReactElement } from "react"
 import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactElement,
+} from "react"
+import {
+  CalendarPlus,
   ChevronDown,
   File as FileIcon,
   FileArchive as FileArchiveIcon,
+  FileCode as FileCodeIcon,
   FileImage as FileImageIcon,
   FileSpreadsheet as FileSpreadsheetIcon,
   FileText as FileTextIcon,
@@ -10,6 +19,7 @@ import {
   Lock,
   Paperclip,
   Save,
+  SendHorizontal,
   ShieldAlert,
   ShieldCheck,
   TriangleAlert,
@@ -44,6 +54,7 @@ import { getExecutor } from "@/services/db/executor"
 import type { AttachmentRow, MessageRow } from "@/services/db/messages"
 import { parseContacts } from "@/services/db/messages"
 import type { EmailAccount } from "@/services/email/types"
+import { parseStoredAuthResults } from "@/services/email/auth-results"
 import {
   attachmentRisk,
   type AttachmentRisk,
@@ -66,6 +77,10 @@ import {
 import { markNotSpam } from "@/services/email-actions/thread-actions"
 import { getJunkFilterEnabled } from "@/services/settings/preferences"
 import {
+  isThreadInSentFolder,
+  openSendAgainForMessage,
+} from "@/services/composer/send-again"
+import {
   canUnsubscribe,
   createAutoArchiveRule,
   hasAutoArchiveRule,
@@ -78,8 +93,16 @@ import {
 import { useComposerStore } from "@/stores/composer-store"
 import { useUiStore } from "@/stores/ui-store"
 import { formatRowTimestamp } from "@/stores/thread-list-store"
+import type { MessageSourceDeps } from "@/services/email/message-source"
+import { IcsPreviewDialog } from "@/components/calendar/ics-preview-dialog"
+import {
+  isCalendarAttachment,
+  readIcsAttachmentText,
+} from "@/services/calendar/ics-detect"
 import { SafeEmailFrame } from "@/components/email/safe-email-frame"
+import { AuthBadge } from "./auth-badge"
 import { PgpPassphraseDialog } from "./pgp-passphrase-dialog"
+import { SourceViewDialog } from "./source-view-dialog"
 import {
   avatarTokenClass,
   formatFullTimestamp,
@@ -167,6 +190,13 @@ import {
  * seam). After either, the banner offers to auto-archive future mail from
  * the sender — an ordinary from:sender → archive rule via the rules
  * service, visible/deletable in the rules settings.
+ *
+ * Send again (batch C3): an expanded message whose thread sits in the
+ * account's sent folder grows a "Send again" entry beside View source —
+ * it reopens the message as a brand-new draft through
+ * services/composer/send-again.ts (original recipients/subject/body,
+ * fresh threading, attachments restored only when their bytes are
+ * recoverable, with a visible notice when they are not).
  */
 
 export interface MailDisplayProps {
@@ -203,6 +233,12 @@ export interface MailDisplayProps {
    * the real online store in both realms.)
    */
   unsubscribeDeps?: UnsubscribeDeps
+  /**
+   * The raw-source seam (task 1.2): overrides the provider round-trip.
+   * Production resolves through the provider factory; tests inject a stub
+   * so the jsdom realm stays network-free.
+   */
+  sourceDeps?: MessageSourceDeps
 }
 
 export function MailDisplay({
@@ -217,11 +253,47 @@ export function MailDisplay({
   attachmentDeps,
   pgpDeps,
   unsubscribeDeps,
+  sourceDeps,
 }: MailDisplayProps) {
   const senderName =
     message.from_name || message.from_address || "Unknown sender"
   const initials = getInitials(message.from_name, message.from_address)
   const avatarClass = avatarTokenClass(message.from_address)
+  /** Raw-source dialog (task 1.2): mounted fresh per open below. */
+  const [sourceOpen, setSourceOpen] = useState(false)
+
+  // Send again (batch C3): the affordance exists only for SENT messages —
+  // resolved per message from the ground truth (the thread sits in the
+  // account's sent-role folder), the same membership model the Sent list
+  // itself uses. A lookup failure degrades to hiding the action, like
+  // every other advisory read in this component.
+  const [inSentFolder, setInSentFolder] = useState(false)
+  useEffect(() => {
+    if (!account) return
+    let cancelled = false
+    resolveExecutor()
+      .then((executor) =>
+        isThreadInSentFolder(executor, account.id, message.thread_id)
+      )
+      .then((inSent) => {
+        if (!cancelled) setInSentFolder(inSent)
+      })
+      .catch((error) => {
+        console.warn("[mail-display] sent-folder lookup failed", error)
+        if (!cancelled) setInSentFolder(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [account, message.thread_id])
+
+  /** Send again (batch C3): opens the composer prefilled as a NEW message
+   * from this sent one — see services/composer/send-again.ts. */
+  const handleSendAgain = () => {
+    void openSendAgainForMessage(message.id, {
+      ...(attachmentDeps ? { attachmentDeps } : {}),
+    })
+  }
 
   if (!expanded) {
     return (
@@ -294,6 +366,39 @@ export function MailDisplay({
           <span className="text-xs text-muted-foreground">
             {formatFullTimestamp(message.date)}
           </span>
+          {/* Authentication verdicts (task 2.2, design D10): compact
+           * pass/fail/none chips beside the header metadata; absent
+           * auth_results renders nothing (spec: no headers, no badge). */}
+          <AuthBadge authResults={message.auth_results} />
+          {/* Send again (batch C3): sent messages only — reopens the
+              message as a brand-new draft (fresh thread, no reply
+              headers; attachments restored when their bytes survive). */}
+          {inSentFolder && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1 text-xs text-muted-foreground"
+              data-testid="send-again"
+              onClick={handleSendAgain}
+            >
+              <SendHorizontal className="size-3.5" />
+              Send again
+            </Button>
+          )}
+          {/* Raw message source (task 1.2, design D6): fetches through the
+           * provider seam on open and renders inert in the sandboxed frame
+           * (source-view-dialog) — read-only with an exact-copy affordance,
+           * no read-state change beyond the open that already happened. */}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 gap-1 text-xs text-muted-foreground"
+            data-testid="view-source"
+            onClick={() => setSourceOpen(true)}
+          >
+            <FileCodeIcon className="size-3.5" />
+            View source
+          </Button>
           <Button
             variant="ghost"
             size="sm"
@@ -321,6 +426,19 @@ export function MailDisplay({
         account={account}
         attachmentDeps={attachmentDeps}
       />
+      {/* Task 1.2: the raw-source dialog behind the View source entry.
+          Mounted only while open so every open refetches (design D6: no
+          cache) and the loading/copy states start clean. The fetch targets
+          the message's OWNING account, like every account-scoped action. */}
+      {sourceOpen && (
+        <SourceViewDialog
+          message={message}
+          account={account}
+          open
+          onOpenChange={setSourceOpen}
+          deps={sourceDeps}
+        />
+      )}
     </div>
   )
 }
@@ -864,6 +982,23 @@ function MessageBody({
   )
   const [phishingDismissed, setPhishingDismissed] = useState(false)
 
+  // DMARC failure → phishing treatment (task 2.2, design D10). The
+  // stored auth verdicts are parsed with the shared accessor; a dmarc
+  // `fail` is folded into the SAME banner the analysis findings drive —
+  // D10's "phishing-banner integration reuses the existing warning banner
+  // with a dmarc-fail trigger" — as one synthetic finding appended after
+  // the analysis results. The display memo (not the cache) carries it, so
+  // the ingestion-owned phishingCache stays free of display-side input.
+  const authResults = useMemo(
+    () => parseStoredAuthResults(message.auth_results),
+    [message.auth_results]
+  )
+  const dmarcFailed = authResults?.dmarc === "fail"
+  const displayFindings = useMemo(
+    () => (dmarcFailed ? [...findings, DMARC_FAIL_FINDING] : findings),
+    [findings, dmarcFailed]
+  )
+
   // ---- Junk filter banner (task 18.10, design D19) -----------------------
 
   // "junk" shows the banner; "corrected" hides it (the Not-spam click —
@@ -1160,7 +1295,7 @@ function MessageBody({
     <div className="pt-3">
       {junkBanner}
       {unsubscribeBanner}
-      {findings.length > 0 && !phishingDismissed && (
+      {displayFindings.length > 0 && !phishingDismissed && (
         <div
           data-testid="phishing-banner"
           role="alert"
@@ -1171,7 +1306,7 @@ function MessageBody({
             <div className="min-w-0 flex-1">
               <p className="font-medium">Suspicious message</p>
               <ul className="mt-1 grid gap-0.5">
-                {findings.map((finding) => (
+                {displayFindings.map((finding) => (
                   <li key={finding.kind}>{finding.detail}</li>
                 ))}
               </ul>
@@ -1460,6 +1595,18 @@ interface PhishingEntry {
 const phishingCache = new Map<string, PhishingEntry>()
 
 /**
+ * The synthetic finding a stored DMARC failure rides into the banner
+ * (task 2.2, design D10): never produced by analyzePhishing — it comes
+ * from the ingested Authentication-Results verdicts — but rendered
+ * through the same finding list so the banner copy covers the auth angle.
+ */
+const DMARC_FAIL_FINDING: PhishingFinding = {
+  kind: "dmarc-fail",
+  detail:
+    "DMARC authentication FAILED — this message may be impersonating the sender it claims to be from.",
+}
+
+/**
  * Per-account contacts memo for the phishing analysis: every expanded
  * message of one account used to re-run listContactsByAccount — a full
  * contacts SELECT per message in the thread view. Keyed by the render
@@ -1694,7 +1841,25 @@ function AttachmentItem({
   // The malware verdict of the last open attempt (D18) — only ever set
   // after a scan actually ran; unknown/offline outcomes render nothing.
   const [verdict, setVerdict] = useState<ScanOutcome | null>(null)
+  // Add-to-calendar preview (task 5.5): opens for .ics / text/calendar
+  // rows; the dialog owns parsing + the v1 add/RSVP seam contract.
+  const [icsOpen, setIcsOpen] = useState(false)
   const risk = attachmentRisk(attachment.filename)
+  const isCalendar = isCalendarAttachment(attachment)
+
+  /** The .ics text loader handed to the preview dialog (D15 seam). */
+  const loadIcsText = useCallback(() => {
+    if (!account) return Promise.reject(new Error("attachment has no account"))
+    return resolveExecutor().then((executor) =>
+      readIcsAttachmentText(
+        executor,
+        account,
+        message,
+        attachment,
+        attachmentDeps ?? {}
+      )
+    )
+  }, [account, message, attachment, attachmentDeps])
 
   function handleSave(): void {
     if (!account || busy) return
@@ -1791,6 +1956,19 @@ function AttachmentItem({
         )}
       </div>
       <div className="flex shrink-0 items-center gap-1">
+        {isCalendar && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1"
+            data-testid="attachment-add-to-calendar"
+            disabled={!account || busy !== null}
+            onClick={() => setIcsOpen(true)}
+          >
+            <CalendarPlus className="size-3.5" />
+            Add to calendar
+          </Button>
+        )}
         <Button
           variant="outline"
           size="sm"
@@ -1813,6 +1991,13 @@ function AttachmentItem({
           {busy === "open" ? "Opening…" : "Open"}
         </Button>
       </div>
+      {isCalendar && (
+        <IcsPreviewDialog
+          open={icsOpen}
+          onOpenChange={setIcsOpen}
+          loadIcs={loadIcsText}
+        />
+      )}
     </div>
   )
 }

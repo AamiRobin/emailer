@@ -61,6 +61,24 @@ export interface ContactRow {
   interaction_count: number
   last_interaction_at: number | null
   created_at: number
+  /** Provenance (migration v17, parity-round-2 task 4.2): 'local' rows
+   * come from exchanged mail; 'carddav' rows mirror a server card and
+   * carry the columns below. Every reader (browser, autocomplete,
+   * avatars) treats both sources identically — these fields exist for the
+   * sync service and the write-back path only. */
+  source: "local" | "carddav"
+  /** The vCard UID — the per-book upsert identity. */
+  uid: string | null
+  /** The card's resource URL on the CardDAV server. */
+  href: string | null
+  /** The stored ETag — the If-Match precondition for the next write. */
+  etag: string | null
+  /** The RAW vCard as the server holds it: unknown-property preservation.
+   * Edits re-serialize from this, so PHOTO / X- extensions / extra TEL
+   * lines the UI does not show survive a write-back. */
+  carddav_raw: string | null
+  /** The owning carddav_books row; NULL for local contacts. */
+  book_id: string | null
 }
 
 /** Address + optional display name, as gathered from a message header. */

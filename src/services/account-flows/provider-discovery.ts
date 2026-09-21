@@ -198,15 +198,56 @@ export function discoverBrandByEmail(email: string): ProviderBrandId | null {
 }
 
 /**
+ * Consumer Microsoft mailbox domains: these addresses are Graph-eligible
+ * (parity-round-2 task 3.5) — the "Add Microsoft 365" flow is the right
+ * path for them, not IMAP (basic auth is deprecated on M365).
+ */
+const MICROSOFT_GRAPH_DOMAINS = [
+  "outlook.com",
+  "hotmail.com",
+  "live.com",
+  "msn.com",
+  "passport.com",
+]
+
+/**
+ * True when the domain is a Microsoft CONSUMER mailbox domain
+ * (outlook.com/hotmail.com/live.com/msn.com and friends). Work/school M365
+ * tenants use custom domains that cannot be recognized from the address
+ * alone — the Add Microsoft 365 flow accepts any address the user enters;
+ * this predicate only powers the IMAP flow's "this address should use
+ * Microsoft 365 instead" hint and the UI's brand resolution.
+ */
+export function isMicrosoftGraphDomain(domain: string): boolean {
+  const candidate = domain.trim().toLowerCase()
+  if (!candidate) return false
+  return MICROSOFT_GRAPH_DOMAINS.some(
+    (known) => candidate === known || candidate.endsWith(`.${known}`)
+  )
+}
+
+/**
+ * True when the email address is a known Microsoft Graph consumer
+ * address. Null-safe for invalid addresses (returns false).
+ */
+export function isMicrosoftGraphEmail(email: string): boolean {
+  const domain = extractDomain(email)
+  return domain !== null && isMicrosoftGraphDomain(domain)
+}
+
+/**
  * Brand to render for a stored account: gmail accounts are gmail by
- * type; IMAP accounts are detected from the email domain, so existing
- * rows gain their brand with no migration.
+ * type, microsoft accounts are outlook by type; IMAP accounts are
+ * detected from the email domain, so existing rows gain their brand with
+ * no migration.
  */
 export function brandForAccount(
   type: AccountType,
   email: string
 ): ProviderBrandId | null {
-  return type === "gmail" ? "gmail" : discoverBrandByEmail(email)
+  if (type === "gmail") return "gmail"
+  if (type === "microsoft") return "outlook"
+  return discoverBrandByEmail(email)
 }
 
 /**

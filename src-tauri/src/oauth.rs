@@ -31,8 +31,13 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
 /// Redirect query parameters relayed to the caller (values percent-decoded).
 ///
-/// Success: `code` + `state` are present. Denied/failed consent: `error`
-/// (and optionally `error_description`) are present instead.
+/// Success: `code` + `state` are present (plus `scope`, the space-separated
+/// grant list Google echoes back). Denied/failed consent: `error` (and
+/// optionally `error_description`) are present instead, and `scope` is
+/// `None`. The scope string is relayed verbatim — the TS side owns scope
+/// policy: the mail flow's authorization URL is built without the calendar
+/// scope (task 5.1, design D5), and the calendar connect checks that the
+/// granted list really contains it before persisting tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OauthCallback {
@@ -43,6 +48,8 @@ pub struct OauthCallback {
     pub state: Option<String>,
     pub error: Option<String>,
     pub error_description: Option<String>,
+    /// Granted scopes as Google echoed them (success redirects only).
+    pub scope: Option<String>,
 }
 
 // ---------- Bind / port selection ----------
@@ -131,6 +138,46 @@ impl Drop for CancelGuard {
 }
 
 // ---------- Commands ----------
+
+/// Find a free loopback port for the OAuth redirect, BEFORE the browser is
+/// opened. With no `preferred` port this binds `127.0.0.1:0`, reads the
+/// ephemeral port and drops the listener — the Microsoft flow passes that
+/// port on to [`start_oauth_server`] explicitly (Microsoft accepts any
+/// localhost port for public clients, RFC 8252 §7.3, so a busy default
+/// port can never black-hole the redirect). With `preferred` set (the
+/// Google flow's fixed registered port) the exact port must be bound or
+/// the flow cannot work at all — an occupied port comes back as an Err so
+/// the TS side fails fast with an actionable message instead of letting
+/// the browser redirect land nowhere and the wait time out.
+#[tauri::command]
+pub async fn find_free_loopback_port(preferred: Option<u16>) -> Result<u16, String> {
+    match preferred {
+        Some(port) => {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+                .await
+                .map_err(|e| {
+                    format!("loopback port {port} is not available: {e}")
+                })?;
+            let bound = listener
+                .local_addr()
+                .map_err(|e| format!("could not read the bound loopback port: {e}"))?
+                .port();
+            drop(listener);
+            Ok(bound)
+        }
+        None => {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|e| format!("could not bind an ephemeral loopback port: {e}"))?;
+            let port = listener
+                .local_addr()
+                .map_err(|e| format!("could not read the bound loopback port: {e}"))?
+                .port();
+            drop(listener);
+            Ok(port)
+        }
+    }
+}
 
 /// Wait for Google's OAuth redirect on a localhost port and return the
 /// authorization code (or the consent error) to the caller.
@@ -229,6 +276,7 @@ async fn accept_loop(listener: &TcpListener, port: u16) -> Result<OauthCallback,
                     state: params.state,
                     error: params.error,
                     error_description: params.error_description,
+                    scope: params.scope,
                 });
             }
             Err(err) => {
@@ -336,6 +384,7 @@ struct CallbackParams {
     state: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
+    scope: Option<String>,
 }
 
 fn extract_callback_params(query: &str) -> CallbackParams {
@@ -348,6 +397,7 @@ fn extract_callback_params(query: &str) -> CallbackParams {
             "error_description" if out.error_description.is_none() => {
                 out.error_description = Some(value)
             }
+            "scope" if out.scope.is_none() => out.scope = Some(value),
             _ => {}
         }
     }
@@ -461,6 +511,86 @@ mod tests {
         assert_eq!(params.state.as_deref(), Some("st+ate"));
         assert_eq!(params.error, None);
         assert_eq!(params.error_description, None);
+    }
+
+    // ----- Scope relay (task 5.1, design D5) -----
+    //
+    // The server never decides scope policy — the authorization URL (and
+    // its scope list) is built TS-side, and this relay hands Google's
+    // GRANTED scope string back verbatim so the calendar connect can verify
+    // the calendar scope actually landed while the mail flow (whose URL
+    // never requests it) is unaffected.
+
+    #[test]
+    fn granted_scope_is_captured_verbatim() {
+        // A calendar-connect success redirect: mail + calendar grants,
+        // URL-encoded, possibly in a non-canonical order. Decoded value
+        // must come back exactly as Google sent it.
+        let params = extract_callback_params(
+            "state=s1&code=4%2F0XYZ&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar%20https%3A%2F%2Fmail.google.com%2F%20email",
+        );
+        assert_eq!(params.scope.as_deref(), Some(
+            "https://www.googleapis.com/auth/calendar https://mail.google.com/ email"
+        ));
+        assert_eq!(params.code.as_deref(), Some("4/0XYZ"));
+        assert_eq!(params.error, None);
+    }
+
+    #[test]
+    fn mail_only_grant_relayed_without_special_casing() {
+        // A plain mail flow redirect: no calendar scope was requested, so
+        // none appears in the grant — relayed as-is (no scope filtering of
+        // any kind lives Rust-side).
+        let params = extract_callback_params(
+            "code=4%2F0ABC&state=s2&scope=https%3A%2F%2Fmail.google.com%2F%20email",
+        );
+        assert_eq!(
+            params.scope.as_deref(),
+            Some("https://mail.google.com/ email")
+        );
+        assert!(!params
+            .scope
+            .as_deref()
+            .unwrap_or_default()
+            .contains("auth/calendar"));
+    }
+
+    #[test]
+    fn consent_denial_carries_no_scope() {
+        let params = extract_callback_params(
+            "error=access_denied&error_description=Consent%20was%20denied&state=abc",
+        );
+        assert_eq!(params.error.as_deref(), Some("access_denied"));
+        assert_eq!(params.scope, None);
+    }
+
+    #[test]
+    fn duplicate_scope_keys_keep_first() {
+        let params =
+            extract_callback_params("scope=a%20b&scope=c&code=x");
+        assert_eq!(params.scope.as_deref(), Some("a b"));
+    }
+
+    #[tokio::test]
+    async fn round_trip_relays_the_granted_scope() {
+        let bound = bind_listener(Some(0)).await.unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+        let waiter = tokio::spawn(serve_once(bound.listener, bound.port, rx));
+
+        let mut conn = TcpStream::connect((Ipv4Addr::LOCALHOST, bound.port))
+            .await
+            .unwrap();
+        conn.write_all(
+            b"GET /oauth?code=4%2F0S&state=st&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar%20email HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let callback = waiter.await.unwrap().expect("should resolve");
+        assert_eq!(
+            callback.scope.as_deref(),
+            Some("https://www.googleapis.com/auth/calendar email")
+        );
+        assert_eq!(callback.code.as_deref(), Some("4/0S"));
     }
 
     #[test]
@@ -594,6 +724,32 @@ mod tests {
             .await
             .expect("some loopback port should bind");
         assert!(bound.port > 0);
+    }
+
+    #[tokio::test]
+    async fn free_port_probe_returns_an_ephemeral_port() {
+        let port = find_free_loopback_port(None).await.expect("port 0 always binds");
+        assert_ne!(port, 0);
+    }
+
+    #[tokio::test]
+    async fn free_port_probe_honours_a_free_preferred_port() {
+        // Occupy an ephemeral port, then pick a different one for the probe.
+        let occupant = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let taken = occupant.local_addr().unwrap().port();
+        let port = find_free_loopback_port(Some(0)).await.unwrap();
+        assert_ne!(port, 0);
+        assert_ne!(port, taken);
+    }
+
+    #[tokio::test]
+    async fn free_port_probe_reports_a_taken_preferred_port() {
+        let occupant = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let taken = occupant.local_addr().unwrap().port();
+        let error = find_free_loopback_port(Some(taken))
+            .await
+            .expect_err("a bound port cannot be handed out");
+        assert!(error.contains("not available"), "{error}");
     }
 
     // ----- Full round-trip against a real (loopback, ephemeral) listener -----

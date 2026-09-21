@@ -1449,6 +1449,109 @@ describe("task 18.3: unsubscribe affordance", () => {
 })
 
 // ---------------------------------------------------------------------------
+// Authentication badge + DMARC phishing treatment (task 2.2, design D10):
+// the header badge reads the messages.auth_results column (task 2.1) and
+// renders one chip per stored mechanism — NOTHING when the column is null
+// (spec: no headers → no badge, never a failure). A stored DMARC failure
+// additionally surfaces the SAME phishing-warning banner as an analysis
+// finding, via a synthetic "dmarc-fail" finding.
+// ---------------------------------------------------------------------------
+
+describe("task 2.2: authentication badge", () => {
+  /** Seed a body-carrying message with (or without) the stored compact
+   * auth verdicts, returning the full row (updateMessage's patch path is
+   * the same one the sync flows write the column through). */
+  async function seedAuthMessage(
+    authResults: string | null
+  ): Promise<MessageRow> {
+    const message = await seedMessage("<p>auth body</p>")
+    if (authResults !== null) {
+      await updateMessage(executor, message.id, { authResults })
+    }
+    const rows = await executor.select<MessageRow>(
+      "SELECT * FROM messages WHERE id = $1",
+      [message.id]
+    )
+    if (!rows[0]) throw new Error("seeded message row missing")
+    return rows[0]
+  }
+
+  it("renders the all-pass badge and no phishing banner", async () => {
+    const message = await seedAuthMessage("spf=pass;dkim=pass;dmarc=pass")
+    renderDisplay(message)
+
+    await waitFor(() => expect(frameSrcdoc()).toContain("auth body"))
+    expect(screen.getByTestId("auth-badge")).not.toBeNull()
+    expect(screen.getByTestId("auth-spf").getAttribute("data-result")).toBe(
+      "pass"
+    )
+    expect(screen.getByTestId("auth-dkim").getAttribute("data-result")).toBe(
+      "pass"
+    )
+    expect(screen.getByTestId("auth-dmarc").getAttribute("data-result")).toBe(
+      "pass"
+    )
+    // All mechanisms passed: the phishing treatment stays off.
+    expect(screen.queryByTestId("phishing-banner")).toBeNull()
+  })
+
+  it("a DMARC fail shows the badge failure AND the phishing banner", async () => {
+    const message = await seedAuthMessage("spf=pass;dkim=pass;dmarc=fail")
+    renderDisplay(message)
+
+    await waitFor(() => expect(frameSrcdoc()).toContain("auth body"))
+    expect(screen.getByTestId("auth-dmarc").getAttribute("data-result")).toBe(
+      "fail"
+    )
+    // The banner appears from the auth verdict ALONE (no spoof findings):
+    // the synthetic dmarc-fail finding rides the existing banner path.
+    const banner = screen.getByTestId("phishing-banner")
+    expect(banner).not.toBeNull()
+    expect(banner.textContent).toContain("DMARC")
+    // The body still renders — advisory, never blocked (spec).
+    expect(frameSrcdoc()).toContain("auth body")
+  })
+
+  it("renders no badge at all when auth_results is null", async () => {
+    const message = await seedAuthMessage(null)
+    renderDisplay(message)
+
+    await waitFor(() => expect(frameSrcdoc()).toContain("auth body"))
+    expect(screen.queryByTestId("auth-badge")).toBeNull()
+    expect(screen.queryByTestId("auth-spf")).toBeNull()
+    expect(screen.queryByTestId("auth-dmarc")).toBeNull()
+  })
+
+  it("renders only the mechanisms present for partial data", async () => {
+    const message = await seedAuthMessage("dkim=pass")
+    renderDisplay(message)
+
+    await waitFor(() => expect(frameSrcdoc()).toContain("auth body"))
+    expect(screen.getByTestId("auth-badge")).not.toBeNull()
+    expect(screen.getByTestId("auth-dkim").getAttribute("data-result")).toBe(
+      "pass"
+    )
+    expect(screen.queryByTestId("auth-spf")).toBeNull()
+    expect(screen.queryByTestId("auth-dmarc")).toBeNull()
+    // One passing mechanism alone never triggers the phishing treatment.
+    expect(screen.queryByTestId("phishing-banner")).toBeNull()
+  })
+
+  it("maps quasi-fail tokens (softfail) to the neutral display state", async () => {
+    const message = await seedAuthMessage("spf=softfail;dkim=pass")
+    renderDisplay(message)
+
+    await waitFor(() => expect(frameSrcdoc()).toContain("auth body"))
+    expect(screen.getByTestId("auth-spf").getAttribute("data-result")).toBe(
+      "none"
+    )
+    expect(screen.getByTestId("auth-dkim").getAttribute("data-result")).toBe(
+      "pass"
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Contacts loading for the phishing analysis (task 18.1): memoized per
 // account for the render session's executor, so N expanded messages of
 // one thread run ONE listContactsByAccount query.
@@ -1501,5 +1604,49 @@ describe("contacts memoization (phishing analysis)", () => {
     await waitFor(() => expect(frameSrcdoc()).toContain("second body"))
 
     expect(listContactsByAccount).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Raw message source (task 1.2): the View source entry on an expanded
+// message opens the inert source dialog through the injected seam.
+// ---------------------------------------------------------------------------
+
+describe("task 1.2: view source entry", () => {
+  it("opens the dialog, fetches through sourceDeps once and renders inert", async () => {
+    const message = await seedMessage("<p>Body</p>")
+    const source = "From: ada <ada@example.com>\r\n\r\n<p>raw body</p>"
+    const fetchSource = vi.fn(async () => source)
+
+    render(
+      <MailDisplay
+        message={message}
+        threadSubject="With images"
+        imagesAllowed={false}
+        onAllowSender={vi.fn()}
+        initiallyUnread={false}
+        expanded={true}
+        onToggleExpanded={vi.fn()}
+        account={account}
+        sourceDeps={{ fetchSource }}
+      />
+    )
+
+    fireEvent.click(screen.getByTestId("view-source"))
+
+    // The dialog fetches exactly once through the injected seam and shows
+    // the source ESCAPED inside the sandboxed frame (no live elements).
+    // The DIALOG's frame is the last iframe — the message body frame
+    // renders one first.
+    const dialogSrcdoc = () => {
+      const frames = document.querySelectorAll("iframe")
+      return frames[frames.length - 1]?.getAttribute("srcdoc") ?? ""
+    }
+    await waitFor(() => expect(dialogSrcdoc()).toContain("&lt;p&gt;"))
+    expect(fetchSource).toHaveBeenCalledTimes(1)
+    const srcdoc = dialogSrcdoc()
+    expect(srcdoc).toContain("&lt;p&gt;raw body&lt;/p&gt;")
+    expect(srcdoc).not.toContain("<p>raw body</p>")
+    expect(screen.getByTestId("source-view-copy")).not.toBeNull()
   })
 })

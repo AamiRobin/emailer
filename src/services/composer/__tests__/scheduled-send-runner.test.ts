@@ -113,6 +113,7 @@ describe("scheduled-send runner (task 10.2)", () => {
     trash: async () => {},
     moveToFolder: async () => {},
     deleteForever: async () => {},
+    getMessageSource: async () => "",
     sendMessage: async () => {
       throw new Error("scheduled sends never use the structured send")
     },

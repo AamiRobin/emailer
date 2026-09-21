@@ -1,11 +1,12 @@
 import { SHORTCUTS, type ShortcutId } from "@/constants/shortcuts"
 import { ACCENTS, applyAccent, DEFAULT_ACCENT_ID } from "@/lib/accent"
+import { invoke } from "@tauri-apps/api/core"
 import type { SqlExecutor } from "@/services/db/executor"
 import { getSetting, setSetting } from "@/services/db/settings"
 import { decryptCredentials, encryptCredentials } from "@/services/crypto/credentials"
 import type { ThreadSortOption } from "@/services/db/thread-sort"
 import { isThreadSortOption } from "@/services/db/thread-sort"
-import type { ReadingPanePosition } from "@/stores/ui-store"
+import type { ComposerSizeMode, ReadingPanePosition } from "@/stores/ui-store"
 import { useUiStore } from "@/stores/ui-store"
 import {
   clampSendDelaySeconds,
@@ -42,6 +43,9 @@ import {
  *   setNotificationsEnabled (persist + in-memory cache invalidation);
  *   reading goes through db/settings getNotificationsEnabled. The 30s TTL
  *   cache is the notifier's concern — this module stays cache-free.
+ * - notification sounds (task 1.5): plain settings-table rows read fresh
+ *   at each play attempt (notifications/sounds.ts) — plays are rare, so
+ *   no cache, and a settings flip takes effect on the very next event.
  */
 
 /** Settings-table keys owned by this module (new keys beyond the ones
@@ -51,6 +55,11 @@ const PREFERENCE_KEYS = {
   density: "appearance.density",
   fontScale: "appearance.fontScale",
   readingPane: "mail.readingPane",
+  /** Composer surface size (centered card vs shell-filling full overlay).
+   * One global enum string, persisted by the composer header's size
+   * toggle and re-applied at boot; the same single-dial shape as
+   * mail.readingPane. */
+  composerMode: "mail.composerMode",
   accentId: "appearance.accentId",
   themeMode: "appearance.themeMode",
   /** Per-account undo-send window base; the accountId is appended as
@@ -118,6 +127,59 @@ const PREFERENCE_KEYS = {
    * junk-filter settings section is the writer; the sync engines and the
    * thread-actions training hooks read it. */
   junkFilterEnabled: "mail.junkFilterEnabled",
+  /** Close-to-tray vs quit (task 1.2, spec desktop-integration "System
+   * tray"): what closing the main window does. One global enum string;
+   * the webview owns the settings row and pushes the live value to the
+   * Rust side (desktop::set_close_action) at boot and on every write —
+   * the Rust copy is a runtime cache for the window CloseRequested
+   * handler, never an independent store. */
+  closeAction: "desktop.closeAction",
+  /** The mailto default-handler bookkeeping (task 1.4): the bundle id of
+   * the OS default mail client Emailer displaced when the user took over
+   * (macOS LaunchServices cannot name it afterwards). One global JSON
+   * string or null; the Desktop settings section is the only writer. */
+  mailtoPreviousHandler: "desktop.mailtoPreviousHandler",
+  /** Global compose shortcut (task 1.5, spec "Global compose shortcut"):
+   * the accelerator string in the plugin's format ("CmdOrCtrl+Shift+E"),
+   * or null when no shortcut is registered. The webview owns the row and
+   * pushes it to the Rust registration (desktop::set_global_compose_
+   * shortcut) at boot and on every write. */
+  composeShortcut: "desktop.composeShortcut",
+  /** Global Gravatar opt-in (task 2.5, design D12): whether contact
+   * avatars may be fetched from gravatar.com. One GLOBAL boolean, default
+   * OFF — enabling discloses a one-way SHA-256 hash of each contact's
+   * email address to an external service, so corrupt rows must read as
+   * off and failures must fail toward off (the privacy default). The
+   * appearance settings section is the writer; the avatars service
+   * (src/services/contacts/avatars.ts) reads it BEFORE any network IPC. */
+  gravatarEnabled: "contacts.gravatarEnabled",
+  /** Mark-as-read on open (task 1.4, settings spec): one GLOBAL boolean,
+   * default ON — the historical behavior is the safe default. Consulted
+   * only at the reading pane's open seam (thread-view.tsx
+   * markThreadReadOnOpen); manual mark read/unread controls and the
+   * rules engine's mark_read action call setThreadRead directly and are
+   * deliberately NOT gated by it. The reading settings section is the
+   * writer. */
+  markReadOnOpen: "mail.markReadOnOpen",
+  /** Notification sounds (task 1.5, settings spec, design D12): one
+   * GLOBAL boolean each for the new-mail chime (default ON — matches the
+   * notifications toggle's default and the historical behavior once a
+   * notification shows) and the sent-confirmation chime (default OFF —
+   * a send happens in an active window, where an unprompted sound is
+   * noise until asked for). Both are consulted ONLY at their sound seams
+   * (notifications/sounds.ts), which themselves sit behind the
+   * notification gates — a suppressed message never reaches the new-mail
+   * sound. The notifications settings section is the writer. */
+  newMailSound: "notifications.soundNewMail",
+  sentSound: "notifications.soundSent",
+  /** Profile color markers (parity-round-2 task 4.5, design D10): one
+   * GLOBAL boolean, default ON (spec: markers default to shown). Consulted
+   * only at the thread-list mount seam (thread-list.tsx) to gate the
+   * leading-edge marker rendering in cross-account scopes; toggling off
+   * removes the markers everywhere while single-account views are
+   * unaffected either way (they never render markers). The appearance
+   * settings section is the writer. */
+  profileColorMarkers: "mail.profileColorMarkers",
 } as const
 
 /** Theme mode as next-themes models it (theme-provider passes it to
@@ -257,6 +319,39 @@ export async function setReadingPanePreference(
 ): Promise<void> {
   await setSetting(executor, PREFERENCE_KEYS.readingPane, position)
   useUiStore.getState().setReadingPane(position)
+}
+
+// ---------------------------------------------------------------------------
+// Composer surface size
+// ---------------------------------------------------------------------------
+
+const COMPOSER_SIZE_MODES: readonly ComposerSizeMode[] = ["centered", "full"]
+
+/** Read the persisted composer size (defaults to the centered card). */
+export async function getComposerModePreference(
+  executor: SqlExecutor
+): Promise<ComposerSizeMode> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.composerMode,
+    "centered"
+  )
+  return COMPOSER_SIZE_MODES.includes(stored as ComposerSizeMode)
+    ? (stored as ComposerSizeMode)
+    : "centered"
+}
+
+/**
+ * Persist the composer surface size and push it into the ui-store via its
+ * regular setComposerMode API — the same write-and-apply path the reading
+ * pane uses, so the header's size toggle is the only writer.
+ */
+export async function setComposerModePreference(
+  executor: SqlExecutor,
+  mode: ComposerSizeMode
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.composerMode, mode)
+  useUiStore.getState().setComposerMode(mode)
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +910,260 @@ export async function setShortcutOverrides(
 }
 
 // ---------------------------------------------------------------------------
+// Close-to-tray vs quit (task 1.2, spec desktop-integration)
+// ---------------------------------------------------------------------------
+
+/** What closing the main window does when a tray exists: `hide` keeps the
+ * app running in the tray (sync + notifications live), `quit` exits. */
+export type CloseAction = "quit" | "hide"
+
+const CLOSE_ACTIONS: readonly CloseAction[] = ["quit", "hide"]
+
+export function isCloseAction(value: unknown): value is CloseAction {
+  return CLOSE_ACTIONS.some((action) => action === value)
+}
+
+/**
+ * The persisted close action: default "quit" (a windowed app that exits
+ * on close unless the user opts into the tray lifecycle), corrupt rows
+ * read as the default.
+ */
+export async function getCloseAction(executor: SqlExecutor): Promise<CloseAction> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.closeAction,
+    "quit"
+  )
+  return isCloseAction(stored) ? stored : "quit"
+}
+
+/**
+ * Persist the close action and push it to the Rust side (best-effort —
+ * plain-vite mock runs have no desktop state; the persisted value is
+ * re-pushed at every boot by applyBootPreferences, so a missed push
+ * self-heals on the next launch).
+ */
+export async function setCloseActionPreference(
+  executor: SqlExecutor,
+  action: CloseAction
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.closeAction, action)
+  try {
+    await invoke("set_close_action", { action })
+  } catch {
+    // Non-Tauri runtime (mock mode): the DB row is the record of truth.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mailto previous-default bookkeeping (task 1.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * The recorded previous mailto handler (bundle id), or null when Emailer
+ * has not taken the mailto association over. Unset/corrupt reads null —
+ * failing toward "nothing to restore" (the Rust unset path then falls
+ * back to the OS stock client).
+ */
+export async function getMailtoPreviousHandler(
+  executor: SqlExecutor
+): Promise<string | null> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.mailtoPreviousHandler,
+    null
+  )
+  if (typeof stored !== "string") return null
+  const trimmed = stored.trim()
+  return trimmed === "" ? null : trimmed
+}
+
+/** Persist (or clear with null) the recorded previous mailto handler. */
+export async function setMailtoPreviousHandler(
+  executor: SqlExecutor,
+  handler: string | null
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.mailtoPreviousHandler, handler)
+}
+
+// ---------------------------------------------------------------------------
+// Global compose shortcut (task 1.5)
+// ---------------------------------------------------------------------------
+
+/** The stored accelerator string, or null when unset/corrupt — null is
+ * the "no shortcut registered" state and the boot fallback. */
+export async function getComposeShortcut(
+  executor: SqlExecutor
+): Promise<string | null> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.composeShortcut,
+    null
+  )
+  if (typeof stored !== "string") return null
+  const trimmed = stored.trim()
+  return trimmed === "" ? null : trimmed
+}
+
+/**
+ * Persist the accelerator and push it to the Rust registration. The Rust
+ * command validates first — an accelerator the OS rejects throws here
+ * before anything is persisted, so the settings row never disagrees with
+ * the OS registration. Outside Tauri the invoke rejects with the same
+ * effect (nothing persisted).
+ */
+export async function setComposeShortcutPreference(
+  executor: SqlExecutor,
+  accelerator: string | null
+): Promise<void> {
+  await invoke("set_global_compose_shortcut", { accelerator })
+  await setSetting(executor, PREFERENCE_KEYS.composeShortcut, accelerator)
+}
+
+// ---------------------------------------------------------------------------
+// Global Gravatar avatar opt-in (task 2.5, design D12)
+// ---------------------------------------------------------------------------
+
+/**
+ * The global "Contact avatars (Gravatar)" toggle (`contacts.gravatarEnabled`):
+ * default off, and anything but a stored JSON `true` reads as off (corrupt
+ * rows included). Off is the privacy default — loading a Gravatar discloses
+ * a one-way hash of the contact's email address to gravatar.com — so the
+ * avatars service treats every failure here as "off" and never fetches.
+ */
+export async function getGravatarEnabled(
+  executor: SqlExecutor
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.gravatarEnabled,
+    false
+  )
+  return stored === true
+}
+
+/** Persist the global Gravatar opt-in. */
+export async function setGravatarEnabledPreference(
+  executor: SqlExecutor,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.gravatarEnabled, enabled)
+}
+
+// ---------------------------------------------------------------------------
+// Mark-as-read on open (task 1.4, settings spec)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether OPENING a message marks it read: default ON — every corrupt or
+ * missing row reads as the historical behavior, so only an explicit
+ * stored `false` (the toggle off) suppresses the open-time mark. Manual
+ * mark read/unread controls and rules' mark_read actions are not
+ * consulted against this flag; only the reading pane's open seam reads
+ * it, right before it would mark the thread read.
+ */
+export async function getMarkReadOnOpen(executor: SqlExecutor): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.markReadOnOpen,
+    true
+  )
+  return stored !== false
+}
+
+/** Persist the mark-as-read-on-open toggle. */
+export async function setMarkReadOnOpenPreference(
+  executor: SqlExecutor,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.markReadOnOpen, enabled)
+}
+
+// ---------------------------------------------------------------------------
+// Notification sounds (task 1.5, settings spec, design D12)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the new-mail notification plays its chime: default ON, and only
+ * an explicit stored `false` silences it. The reader sits BEHIND the
+ * notifier's own gates (the sound is requested only after the banner was
+ * actually shown), so this toggle adds to — never replaces — the
+ * notification rules.
+ */
+export async function getNewMailSoundEnabled(
+  executor: SqlExecutor
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.newMailSound,
+    true
+  )
+  return stored !== false
+}
+
+/** Persist the new-mail sound toggle. */
+export async function setNewMailSoundPreference(
+  executor: SqlExecutor,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.newMailSound, enabled)
+}
+
+/**
+ * Whether an accepted send plays its confirmation chime: default OFF —
+ * anything but a stored JSON `true` reads as off (corrupt rows included),
+ * so a fresh install is silent until the user asks for it.
+ */
+export async function getSentSoundEnabled(
+  executor: SqlExecutor
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.sentSound,
+    false
+  )
+  return stored === true
+}
+
+/** Persist the sent-confirmation sound toggle. */
+export async function setSentSoundPreference(
+  executor: SqlExecutor,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.sentSound, enabled)
+}
+
+// ---------------------------------------------------------------------------
+// Profile color markers (parity-round-2 task 4.5, mailbox-ui spec)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether cross-account thread lists render the per-account profile color
+ * markers: default ON — only an explicit stored `false` (the toggle off)
+ * suppresses them, so a fresh install shows markers and every corrupt or
+ * missing row reads as shown. The thread list reads this once per mount;
+ * the appearance settings section is the only writer.
+ */
+export async function getProfileColorMarkersEnabled(
+  executor: SqlExecutor
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.profileColorMarkers,
+    true
+  )
+  return stored !== false
+}
+
+/** Persist the profile-color-markers toggle. */
+export async function setProfileColorMarkersPreference(
+  executor: SqlExecutor,
+  enabled: boolean
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.profileColorMarkers, enabled)
+}
+
+// ---------------------------------------------------------------------------
 // Boot application
 // ---------------------------------------------------------------------------
 
@@ -823,8 +1172,9 @@ export async function setShortcutOverrides(
  * shell's mount effect (after bootstrap() made the database available):
  * sets the --density/--font-scale tokens, restores the accent from the DB
  * mirror (only when a mirror row exists — see the accent note above), and
- * feeds the saved reading-pane position into the ui-store. Theme mode is
- * NOT applied here — next-themes bootstrap owns it.
+ * feeds the saved reading-pane position and composer surface size into
+ * the ui-store. Theme mode is NOT applied here — next-themes bootstrap
+ * owns it.
  *
  * Never throws: a database hiccup keeps the in-code defaults (tokens are
  * already 1, the accent is whatever initAccent() applied, pane "right").
@@ -833,11 +1183,15 @@ export async function applyBootPreferences(
   executor: SqlExecutor
 ): Promise<void> {
   try {
-    const [density, fontScale, readingPane] = await Promise.all([
-      getDensity(executor),
-      getFontScale(executor),
-      getReadingPanePreference(executor),
-    ])
+    const [density, fontScale, readingPane, composerMode, closeAction, composeShortcut] =
+      await Promise.all([
+        getDensity(executor),
+        getFontScale(executor),
+        getReadingPanePreference(executor),
+        getComposerModePreference(executor),
+        getCloseAction(executor),
+        getComposeShortcut(executor),
+      ])
     applyDensity(density)
     applyFontScale(fontScale)
     // Raw read with a sentinel: apply the mirrored accent only when the
@@ -853,6 +1207,28 @@ export async function applyBootPreferences(
     }
     if (readingPane !== useUiStore.getState().readingPane) {
       useUiStore.getState().setReadingPane(readingPane)
+    }
+    if (composerMode !== useUiStore.getState().composerMode) {
+      useUiStore.getState().setComposerMode(composerMode)
+    }
+    // Desktop integration: the Rust close-request handler starts from its
+    // in-code default ("quit"); sync the persisted choice before the user
+    // can close the window (best-effort — see setCloseActionPreference).
+    try {
+      await invoke("set_close_action", { action: closeAction })
+    } catch {
+      // Non-Tauri runtime (mock mode).
+    }
+    // Global compose shortcut: re-register the persisted accelerator at
+    // boot (registrations die with the process). Best-effort, like the
+    // close action — a boot-time failure must not block startup; the
+    // settings UI re-registers on the next edit.
+    try {
+      await invoke("set_global_compose_shortcut", {
+        accelerator: composeShortcut,
+      })
+    } catch {
+      // Non-Tauri runtime (mock mode), or the accelerator is now invalid.
     }
   } catch (error) {
     console.warn("[preferences] boot apply failed; defaults kept", error)

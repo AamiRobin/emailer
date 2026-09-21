@@ -1,5 +1,7 @@
 import type { SqlExecutor } from "./executor"
 import { placeholders } from "./executor"
+import type { Category } from "../categorization/classify"
+import { parseCategory } from "../categorization/classify"
 import type { SpecialUse } from "./labels"
 import type { ContactRef, MessageRow } from "./messages"
 import { parseContacts } from "./messages"
@@ -52,6 +54,18 @@ export interface ThreadRow {
   held_until?: number | null
   /** Set when a hold releases / a snooze wakes, topping the inbox ordering. */
   delivered_at?: number | null
+  /**
+   * Inbox category (migration v9, task 3.3, design D4): 'primary' |
+   * 'updates' | 'promotions' | 'social' | 'newsletters'. NULL means "not
+   * yet categorized" — rows that predate the column until the task 3.4
+   * backfill runs. New threads INSERT as NULL and are written by the
+   * ingestion categorization pass (categorization/ingestion.ts) before
+   * notifications; unmatched mail is stored as 'primary', never NULL.
+   * The pass never overwrites a non-NULL value, so a per-thread user
+   * override (task 3.4) is stable across later arrivals. The tab UI
+   * (task 3.5) renders NULL and 'primary' identically in the Primary tab.
+   */
+  category?: string | null
   gmail_thread_id: string | null
   folder_label_id: string | null
   is_archived: number
@@ -452,7 +466,8 @@ async function buildFolderListQuery(
   accountIds: string[] | null,
   folder: FolderSelection,
   sort: ThreadSortOption | undefined,
-  limit: number | undefined
+  limit: number | undefined,
+  category?: Category
 ): Promise<{ sql: string; params: unknown[] } | null> {
   const params: unknown[] = []
   const where: string[] = []
@@ -522,6 +537,21 @@ async function buildFolderListQuery(
   } else {
     predicate = PRESET_PREDICATES[folder.preset]
   }
+
+  // Category narrowing (task 3.5, design D4): appended AFTER the folder
+  // predicate, so a category scope is "the same list, one category". The
+  // Primary tab includes NULL — the migration v9 contract renders "not yet
+  // categorized" as Primary (the backfill's EXISTS guard keeps that set
+  // meaningful; a thread without messages can never leave NULL).
+  if (category) {
+    const categoryParam = params.length + 1
+    predicate +=
+      category === "primary"
+        ? ` AND (threads.category = $${categoryParam} OR threads.category IS NULL)`
+        : ` AND threads.category = $${categoryParam}`
+    params.push(category)
+  }
+
   where.push(predicate)
 
   const limitClause = limit ? ` LIMIT $${params.length + 1}` : ""
@@ -593,6 +623,193 @@ export async function listThreadsAcrossAccounts(
   )
   if (!query) return []
   return executor.select<ThreadRow>(query.sql, query.params)
+}
+
+/**
+ * Category-scoped inbox list (task 3.5, design D4, mailbox-ui spec
+ * "Category tab presentation"): the UNIFIED inbox's exact query — the
+ * inbox membership predicate plus the trash/spam/snooze/mute/done/hold
+ * exclusions, across the active account set — narrowed to one category.
+ * `primary` also matches `category IS NULL` (the migration v9 "not yet
+ * categorized" contract renders NULL ≡ Primary; the tab UI and this query
+ * agree). Rows keep `threads.*` with their `account_id`, so the category
+ * tabs are a cross-account scope like unified.
+ */
+export interface ListThreadsByCategoryOptions {
+  /** Restrict to these accounts; omitted/empty = no account filter. */
+  accountIds?: string[]
+  category: Category
+  sort?: ThreadSortOption
+  limit?: number
+}
+
+export async function listThreadsByCategoryAcrossAccounts(
+  executor: SqlExecutor,
+  options: ListThreadsByCategoryOptions
+): Promise<ThreadRow[]> {
+  const query = await buildFolderListQuery(
+    executor,
+    options.accountIds ?? null,
+    { kind: "preset", preset: "inbox" },
+    options.sort,
+    options.limit,
+    options.category
+  )
+  if (!query) return []
+  return executor.select<ThreadRow>(query.sql, query.params)
+}
+
+/** Per-category thread counts the tab badges render (task 3.5). `total`
+ * is the tab's thread count and `unread` the unread badge number — both
+ * over the same inbox scope the category tab lists. */
+export interface CategoryThreadCounts {
+  total: number
+  unread: number
+}
+
+/**
+ * Grouped per-category counts over the unified-inbox scope (task 3.5):
+ * ONE aggregate query — the inbox membership predicate (special-use
+ * labels, so gmail INBOX membership resolves exactly like the list) plus
+ * the inbox exclusions, `COUNT(*)` + `SUM(unread_count)` grouped by
+ * category with NULL folded into `primary`. Every category is present in
+ * the result (zero defaults), so consumers index freely; a stored value
+ * outside the closed set is dropped rather than shown under a wrong tab.
+ * An empty account set (no active accounts) counts nothing.
+ */
+export async function countThreadsByCategoryAcrossAccounts(
+  executor: SqlExecutor,
+  accountIds: string[]
+): Promise<Record<Category, CategoryThreadCounts>> {
+  const empty: Record<Category, CategoryThreadCounts> = {
+    primary: { total: 0, unread: 0 },
+    updates: { total: 0, unread: 0 },
+    promotions: { total: 0, unread: 0 },
+    social: { total: 0, unread: 0 },
+    newsletters: { total: 0, unread: 0 },
+  }
+  if (!accountIds.length) return empty
+  const inboxLabelIds = await findSpecialUseLabelIds(executor, "inbox", [
+    ...accountIds,
+  ])
+  if (!inboxLabelIds.length) return empty
+  const params: unknown[] = [...accountIds]
+  const accountFilter = `threads.account_id IN (${placeholders(
+    accountIds.length
+  )})`
+  // membershipPredicate appends its own (doubled) placeholders after the
+  // account filter — the same predicate buildFolderListQuery uses.
+  const membership = membershipPredicate(params, inboxLabelIds)
+  const rows = await executor.select<{
+    category: string | null
+    total: number
+    unread: number
+  }>(
+    `SELECT threads.category AS category,
+            COUNT(*) AS total,
+            COALESCE(SUM(threads.unread_count), 0) AS unread
+     FROM threads
+     WHERE ${accountFilter} AND ${membership}
+       AND threads.is_trashed = 0 AND threads.is_spam = 0
+       AND threads.snoozed_until IS NULL AND threads.muted_at IS NULL
+       AND threads.done_at IS NULL AND threads.held_until IS NULL
+     GROUP BY threads.category`,
+    params
+  )
+  const result = { ...empty }
+  for (const row of rows) {
+    // NULL (not yet categorized) counts as Primary — the tab UI's
+    // documented rendering; unknown values are skipped. The NULL group and
+    // an explicit 'primary' group BOTH fold into primary, so the counts
+    // merge rather than overwrite.
+    const category = parseCategory(row.category ?? "primary")
+    if (!category) continue
+    const existing = result[category]
+    result[category] = {
+      total: existing.total + row.total,
+      unread: existing.unread + row.unread,
+    }
+  }
+  return result
+}
+
+/**
+ * Threads still awaiting the category backfill (task 3.5's "Categorizing…
+ * N of M" estimate): the count of the EXACT candidate set the backfill
+ * selects — `category IS NULL` and at least one message, global like the
+ * job itself (the backfill has no account scope). Decrements as the job's
+ * keep-first writes land, so scanned + remaining is a live total estimate.
+ */
+export async function countCategoryBackfillRemaining(
+  executor: SqlExecutor
+): Promise<number> {
+  const rows = await executor.select<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM threads
+     WHERE category IS NULL
+       AND EXISTS (SELECT 1 FROM messages WHERE messages.thread_id = threads.id)`
+  )
+  return rows[0]?.count ?? 0
+}
+
+/** Options for listRecentThreadsByParticipant (task 2.7). */
+export interface RecentThreadsByParticipantOptions {
+  /** Maximum rows returned; default 5. */
+  limit?: number
+  /** The open thread — excluded so the sidebar never lists it. */
+  excludeThreadId?: string | null
+}
+
+/**
+ * Recent threads involving `email` (task 2.7, contacts spec "Contact
+ * sidebar", design D14 — no new storage): the reading-pane sidebar's
+ * "threads exchanged with this contact" list. Deliberately NOT
+ * account-scoped — a contact is an address, and the same person writing
+ * to two accounts surfaces once (rows carry account_id; opening a foreign
+ * thread resolves its owning account, the task 9.2 semantics).
+ *
+ * Matching runs against the threads.participants display cache (migration
+ * v2) with a quoted-address LIKE — `"email":"<address>"` — so only exact
+ * serialized addresses match (the closing quote blocks suffix bleed such
+ * as ada@… inside canada@…; SQLite LIKE is case-insensitive for ASCII, so
+ * header casing variants still match). Trashed/spam threads are excluded,
+ * mirroring listContactThreads: deliberate placements are not
+ * correspondence worth surfacing.
+ *
+ * Known limitation (accepted for v1, like the nudges detection): the
+ * predicate is a substring JSON match, so an address that also appears
+ * inside another participant's cached NAME value can false-positive; and
+ * the cache only covers the NEWEST message's from + up to two
+ * to-recipients, so a thread where the contact only participated earlier
+ * may be missed. Ordering is last_message_at DESC (id ASC tiebreak), and
+ * the result is capped at `limit`.
+ */
+export async function listRecentThreadsByParticipant(
+  executor: SqlExecutor,
+  email: string,
+  options: RecentThreadsByParticipantOptions = {}
+): Promise<ThreadRow[]> {
+  const normalized = email.trim().toLowerCase()
+  if (!normalized) return []
+  // Same escape rule as contacts.ts: `%`/`_` in the address match
+  // literally, paired with the ESCAPE clause below.
+  const escaped = normalized.replace(/[\\%_]/g, (char) => `\\${char}`)
+  const params: unknown[] = []
+  const where = ["threads.is_trashed = 0", "threads.is_spam = 0"]
+  if (options.excludeThreadId) {
+    params.push(options.excludeThreadId)
+    where.push(`threads.id != $${params.length}`)
+  }
+  params.push(`%"email":"${escaped}"%`)
+  where.push(`threads.participants LIKE $${params.length} ESCAPE '\\'`)
+  params.push(options.limit ?? 5)
+  // placeholder numbers ascend by occurrence in the SQL text (see executor.ts)
+  return executor.select<ThreadRow>(
+    `SELECT threads.* FROM threads
+     WHERE ${where.join("\n       AND ")}
+     ORDER BY threads.last_message_at DESC, threads.id ASC
+     LIMIT $${params.length}`,
+    params
+  )
 }
 
 export interface ThreadWithMessages {

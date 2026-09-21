@@ -74,6 +74,14 @@ export interface ImapMessage {
   listUnsubscribe?: string | null
   /** `List-Unsubscribe-Post` value, verbatim; null when absent. */
   listUnsubscribePost?: string | null
+  /**
+   * Consolidated SPF/DKIM/DMARC verdicts from the message's
+   * Authentication-Results headers (task 2.1, design D10) — compact
+   * "spf=pass;dkim=fail;dmarc=none", parsed Rust-side at ingestion
+   * (imap::auth_results owns the grammar and the worst-wins rule);
+   * null when the message carries no such header (no badge).
+   */
+  authResults?: string | null
   subject?: string | null
   from: ImapAddress[]
   to: ImapAddress[]
@@ -203,6 +211,20 @@ export function imapFetchFlags(
   last?: number
 ): Promise<ImapUidFlags[]> {
   return invoke("imap_fetch_flags", { params, folder, uidSet, last })
+}
+
+/**
+ * One message's complete raw RFC 822 source by UID (task 1.2, design D6)
+ * — the Rust side fetches BODY.PEEK[] (the same full-message fetch the
+ * body sync uses, no \Seen side effect) and returns the bytes standard
+ * base64 encoded; decoding happens here.
+ */
+export function imapFetchSource(
+  params: ImapParams,
+  folder: string,
+  uid: number
+): Promise<string> {
+  return invoke("imap_fetch_source", { params, folder, uid })
 }
 
 /** `flags` are system flags or keywords, e.g. ["\\Seen"]; add=false removes. */

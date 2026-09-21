@@ -20,6 +20,7 @@ import { imapFetchFlagsChanged } from "./flag-sync"
 import { ProviderAuthError } from "../email/types"
 import { syncGmailAccount } from "./gmail-sync"
 import { syncImapAccount } from "./imap-sync"
+import { syncMicrosoftAccount } from "./microsoft-sync"
 import { useSyncStore } from "../../stores/sync-store"
 import { useAccountStore } from "../../stores/account-store"
 import { useFolderCountsStore } from "../../stores/folder-counts-store"
@@ -128,9 +129,12 @@ export interface SchedulerOptions {
 async function credentialsFor(
   account: EmailAccount
 ): Promise<ProviderCredentials> {
-  // Gmail is OAuth-only: createGmailProvider decrypts the token envelope
-  // from account.credentialsJson lazily; the imap-style password is unused.
-  if (account.type === "gmail") return { password: "" }
+  // Gmail and Microsoft are OAuth-only: createGmailProvider /
+  // createMicrosoftGraphProvider decrypt the token envelope from
+  // account.credentialsJson lazily; the imap-style password is unused.
+  if (account.type === "gmail" || account.type === "microsoft") {
+    return { password: "" }
+  }
   const envelope = await decryptCredentials<ProviderCredentials>(
     account.credentialsJson ?? null
   )
@@ -161,6 +165,17 @@ async function runAccountSync(
   const provider = getProvider(account, credentials)
   if (account.type === "gmail") {
     const summary = await syncGmailAccount({
+      executor,
+      provider,
+      accountId: account.id,
+    })
+    return { newMessages: summary.newMessages }
+  }
+  // Microsoft Graph (parity-round-2, task 3.2): folder list + per-folder
+  // deltaLinks through the dedicated engine. The provider instance is
+  // the factory's MicrosoftGraphProvider (syncFolderDelta seam).
+  if (account.type === "microsoft") {
+    const summary = await syncMicrosoftAccount({
       executor,
       provider,
       accountId: account.id,

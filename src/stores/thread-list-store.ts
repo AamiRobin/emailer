@@ -5,6 +5,7 @@ import { useShallow } from "zustand/react/shallow"
 
 import type { SqlExecutor } from "@/services/db/executor"
 import { getExecutor } from "@/services/db/executor"
+import type { Category } from "@/services/categorization/classify"
 import { listDrafts } from "@/services/composer/drafts"
 import type { DraftRecord } from "@/services/composer/drafts"
 import { listActiveAccounts } from "@/services/db/accounts"
@@ -21,9 +22,11 @@ import type {
 import {
   getLabelsForThreads,
   listThreadsAcrossAccounts,
+  listThreadsByCategoryAcrossAccounts,
   listThreadsByFolder,
 } from "@/services/db/threads"
 import {
+  searchThreadsWithRelaxedFallback,
   searchThreadsAcrossAccounts,
   searchThreadsQuery,
 } from "@/services/search"
@@ -100,6 +103,13 @@ interface ThreadListState {
    */
   scope: ThreadListScope | null
   threads: ThreadRow[]
+  /**
+   * True when the CURRENT rows came from the relaxed any-term retry
+   * (task 1.3, design D7): the search box's strict query matched nothing
+   * and the operator-free query was re-run in OR mode. Reset on every
+   * page change/refresh; only the `search` scope can ever set it.
+   */
+  searchRelaxed: boolean
   /**
    * Local composer drafts for the current view — populated ONLY in the
    * Drafts folder view (see the module docstring's drafts exception),
@@ -243,6 +253,10 @@ export type ThreadListScope =
    * search pipeline, pinned to one account (`accountId`) or across the
    * active accounts (omitted). */
   | { kind: "split"; name: string; query: string; accountId?: string }
+  /** A category tab (task 3.5, design D4): the unified inbox's query
+   * narrowed to one category (NULL ≡ primary) across the active
+   * accounts. */
+  | { kind: "category"; category: Category }
   /** A saved search (task 7.1 rows) as a listing: a global operator
    * query across every active account. */
   | { kind: "saved-search"; name: string; query: string }
@@ -284,6 +298,11 @@ export function resolveScope(
           name: override.name,
           query: override.query,
         }
+      case "category":
+        // The category tab row (task 3.5): the descriptor carries just the
+        // category — the account set (active accounts) is resolved at
+        // query time like the other across-accounts scopes.
+        return { kind: "category", category: override.category }
     }
   }
   switch (view.kind) {
@@ -292,6 +311,16 @@ export function resolveScope(
     case "contacts":
       // The Contacts browser (task 20.2) replaces the mailbox panes like
       // settings and lists no threads, so it shares the settings scope.
+      return { kind: "settings" }
+    case "attachments":
+      // The Attachments browser (task 3.7, design D14) replaces the
+      // mailbox panes like settings and lists no threads (it renders the
+      // attachment index itself), so it shares the settings scope.
+      return { kind: "settings" }
+    case "calendar":
+      // The Calendar view (task 5.3, design D5) replaces the mailbox
+      // panes like settings and lists no threads (it renders the cached
+      // calendar_events ranges itself), so it shares the settings scope.
       return { kind: "settings" }
     case "search":
       return { kind: "search", accountId, query: view.query }
@@ -355,6 +384,10 @@ export function scopeSortKey(scope: ThreadListScope): string {
       return `split:${scope.name}`
     case "saved-search":
       return `saved-search:${scope.name}`
+    case "category":
+      // One list identity per category across the active accounts (the
+      // tabs are account-set-wide, like unified).
+      return `category:${scope.category}`
     case "settings":
       return "settings"
   }
@@ -392,6 +425,7 @@ export function scopeSpansAccounts(scope: ThreadListScope): boolean {
     scope.kind === "priority" ||
     scope.kind === "nudges" ||
     scope.kind === "saved-search" ||
+    scope.kind === "category" ||
     (scope.kind === "split" && scope.accountId === undefined)
   )
 }
@@ -405,7 +439,12 @@ function scopeNeedsActiveAccounts(scope: ThreadListScope): boolean {
   return scopeSpansAccounts(scope)
 }
 
-async function queryThreads(
+/**
+ * The scope's plain query (task 9.1). The search scope runs STRICT here —
+ * the search box's relaxed retry lives in queryThreads below, so splits
+ * and saved searches keep their exact stored semantics.
+ */
+async function runScopeQuery(
   executor: SqlExecutor,
   scope: ThreadListScope,
   sort: ThreadSortOption,
@@ -486,6 +525,44 @@ async function queryThreads(
         scope.query,
         { sort }
       )
+    case "category":
+      // A category tab (task 3.5, design D4): the unified inbox's exact
+      // predicates across the active accounts, narrowed to one category
+      // (Primary includes the not-yet-categorized NULL rows). Same
+      // empty-guard as the other across-accounts scopes.
+      if (!activeAccountIds.length) return []
+      return listThreadsByCategoryAcrossAccounts(executor, {
+        accountIds: activeAccountIds,
+        category: scope.category,
+        sort,
+      })
+  }
+}
+
+/**
+ * The page's query + relaxed flag (task 1.3, design D7): every scope runs
+ * its plain query; the per-account SEARCH scope (the search box) runs the
+ * strict-then-relaxed entry, so a zero-result operator-free query is
+ * retried in OR mode and its rows flagged for the UI's "relaxed search"
+ * badge. The flag is false for every other scope, by construction.
+ */
+async function queryThreads(
+  executor: SqlExecutor,
+  scope: ThreadListScope,
+  sort: ThreadSortOption,
+  activeAccountIds: string[]
+): Promise<{ threads: ThreadRow[]; relaxed: boolean }> {
+  if (scope.kind === "search") {
+    return searchThreadsWithRelaxedFallback(
+      executor,
+      [scope.accountId],
+      scope.query,
+      { sort }
+    )
+  }
+  return {
+    threads: await runScopeQuery(executor, scope, sort, activeAccountIds),
+    relaxed: false,
   }
 }
 
@@ -504,6 +581,7 @@ export const useThreadListStore = create<ThreadListState>((set, get) => ({
   view: null,
   scope: null,
   threads: [],
+  searchRelaxed: false,
   drafts: [],
   labelsByThreadId: {},
   userLabels: [],
@@ -610,6 +688,7 @@ export const useThreadListStore = create<ThreadListState>((set, get) => ({
         view,
         scope,
         threads: [],
+        searchRelaxed: false,
         drafts: [],
         labelsByThreadId: {},
         userLabels: [],
@@ -667,7 +746,7 @@ export const useThreadListStore = create<ThreadListState>((set, get) => ({
         activeAccountSet = JSON.stringify(activeAccountIds)
         if (isStale()) return
       }
-      const threads = await queryThreads(
+      const { threads, relaxed } = await queryThreads(
         executor,
         scope,
         sort,
@@ -706,6 +785,7 @@ export const useThreadListStore = create<ThreadListState>((set, get) => ({
         view,
         scope,
         threads,
+        searchRelaxed: relaxed,
         drafts,
         labelsByThreadId: Object.fromEntries(labels),
         userLabels: allLabels
@@ -744,6 +824,7 @@ export const useThreadListStore = create<ThreadListState>((set, get) => ({
           loading: false,
           loaded: true,
           threads: [],
+          searchRelaxed: false,
           drafts: [],
           labelsByThreadId: {},
           userLabels: [],
@@ -898,6 +979,12 @@ export interface UseThreadListResult {
   userLabels: ThreadLabelLite[]
   loading: boolean
   loaded: boolean
+  /**
+   * True when the loaded rows are the relaxed any-term fallback of the
+   * search box's zero-result strict query (task 1.3) — the list renders
+   * its "relaxed search" badge from this.
+   */
+  searchRelaxed: boolean
 }
 
 /**
@@ -922,6 +1009,7 @@ export function useThreadList(): UseThreadListResult {
       userLabels: state.userLabels,
       loading: state.loading,
       loaded: state.loaded,
+      searchRelaxed: state.searchRelaxed,
     }))
   )
 }

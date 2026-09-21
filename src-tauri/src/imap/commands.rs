@@ -142,6 +142,23 @@ pub async fn imap_fetch_attachment(
     result
 }
 
+/// Fetch one message's complete raw RFC 822 source by UID ("View source",
+/// parity-round-2 task 1.2). `BODY.PEEK[]` — the same full-message fetch
+/// the body sync uses — so read state is untouched; the bytes come back
+/// standard-base64-encoded (decoding happens TS-side, like the importer's
+/// rawBase64).
+#[tauri::command]
+pub async fn imap_fetch_source(
+    params: ImapParams,
+    folder: String,
+    uid: u32,
+) -> Result<String, String> {
+    let mut session = client::connect(&params).await?;
+    let result = client::fetch_source(&mut session, &folder, uid).await;
+    client::logout(session).await;
+    result
+}
+
 /// CREATE a mailbox (folder-level label creation for IMAP accounts).
 /// Server rejections (name already exists, invalid name, no permission)
 /// surface as the server's error text.

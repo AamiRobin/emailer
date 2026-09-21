@@ -100,6 +100,85 @@ export function parseRuleCriteria(criteriaJson: string): ParsedQuery | null {
   return isEmptyQuery(parsed) ? null : parsed
 }
 
+/**
+ * The condition-operator vocabulary, as the natural-language rule assist
+ * (parity-round-2 task 2.5, design D9) names it in its fixed prompt.
+ * Single source of truth by construction: the rule-assist prompt composes
+ * from this list, and the rule-assist tests probe each entry through
+ * parseSearchQuery so an operator the parser ever stops recognizing (or a
+ * description that drifted from its semantics) fails a test instead of
+ * silently teaching the model a fiction. The rules engine remains the
+ * actual schema — this list describes it, it does not define it.
+ */
+export interface RuleConditionOperator {
+  /** The operator token as the search grammar spells it (no value). */
+  token: string
+  /** What the value matches, in prompt-facing wording. */
+  matches: string
+  /** Example value shown in the prompt's grammar line. */
+  example: string
+}
+
+export const RULE_CONDITION_OPERATORS: readonly RuleConditionOperator[] = [
+  {
+    token: "from:",
+    matches: "the sender address or display name contains the value",
+    example: "from:news@shop.example",
+  },
+  {
+    token: "to:",
+    matches: "any To/Cc/Bcc recipient contains the value",
+    example: "to:team@example.com",
+  },
+  {
+    token: "subject:",
+    matches: "the subject contains the value",
+    example: "subject:invoice",
+  },
+  {
+    token: "label:",
+    matches:
+      "the message has a label whose name equals the value or ends with '/<value>'",
+    example: "label:receipts",
+  },
+  {
+    token: "has:attachment",
+    matches: "the message has attachment parts (no value)",
+    example: "has:attachment",
+  },
+  {
+    token: "is:unread",
+    matches: "the message is unread on arrival (no value)",
+    example: "is:unread",
+  },
+  {
+    token: "is:starred",
+    matches: "the message is starred (no value)",
+    example: "is:starred",
+  },
+  {
+    token: "larger:",
+    matches: "the message size exceeds the byte threshold (k/m suffixes ok)",
+    example: "larger:10m",
+  },
+  {
+    token: "smaller:",
+    matches: "the message size is under the byte threshold (k/m suffixes ok)",
+    example: "smaller:500k",
+  },
+  {
+    token: "before:",
+    matches: "the arrival date is before the YYYY-MM-DD boundary (exclusive)",
+    example: "before:2026-01-01",
+  },
+  {
+    token: "after:",
+    matches:
+      "the arrival date is on or after the YYYY-MM-DD boundary (inclusive)",
+    example: "after:2026-01-01",
+  },
+] as const
+
 /** Case-insensitive substring; null/undefined never matches. */
 function containsIgnoreCase(
   haystack: string | null | undefined,

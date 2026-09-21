@@ -1,13 +1,8 @@
 import { useState } from "react"
 import { Check, Pencil, SquarePen, Trash2, X } from "lucide-react"
 
-import { cn } from "@/lib/utils"
 import { AccountBadge } from "@/components/email/account-badge"
-import {
-  getInitials,
-  avatarTokenClass,
-  formatFullTimestamp,
-} from "@/components/email/message-utils"
+import { formatFullTimestamp } from "@/components/email/message-utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -16,6 +11,7 @@ import { Textarea } from "@/components/ui/textarea"
 import type { ContactRow } from "@/services/db/contacts"
 import type { AccountInfo } from "@/stores/account-store"
 import { formatRowTimestamp } from "@/stores/thread-list-store"
+import { ContactAvatar } from "./contact-avatar"
 import { ContactDeleteDialog } from "./contact-delete-dialog"
 import {
   composeToContact,
@@ -126,17 +122,15 @@ export function ContactDetail({
 }
 
 function AvatarBlock({ contact }: { contact: ContactRow }) {
-  const initials = getInitials(contact.name, contact.email)
+  // Task 2.5 (spec contacts "Contact avatars", design D12): Gravatar
+  // when avatar loading is enabled, deterministic initials otherwise —
+  // and zero fetches while the setting is off.
   return (
-    <span
-      aria-hidden
-      className={cn(
-        "flex size-10 shrink-0 items-center justify-center rounded-full text-sm font-medium",
-        avatarTokenClass(contact.email)
-      )}
-    >
-      {initials}
-    </span>
+    <ContactAvatar
+      email={contact.email}
+      name={contact.name}
+      className="size-10 shrink-0"
+    />
   )
 }
 

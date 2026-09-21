@@ -1,4 +1,13 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
+import type { PointerEvent as ReactPointerEvent, ReactNode } from "react"
 import { DndContext, PointerSensor, useSensor, useSensors } from "@dnd-kit/core"
 import type { DragEndEvent } from "@dnd-kit/core"
 import { formatDistanceToNow } from "date-fns"
@@ -18,14 +27,23 @@ import { StatusBar } from "@/components/layout/status-bar"
 import { OfflineBanner } from "@/components/layout/offline-banner"
 import { SearchField } from "@/components/search/search-field"
 import { CommandPalette } from "@/components/search/command-palette"
+import { HelpCenterDialog } from "@/components/help/help-center"
 import { SplitsTabBar } from "@/components/layout/splits-tab-bar"
+import { CATEGORY_LABELS } from "@/components/layout/use-categories"
 import { AddAccountDialog } from "@/components/accounts/add-account-dialog"
 import { UndoSendBanner } from "@/components/composer/undo-send-banner"
+import { ComposerTrayChip } from "@/components/composer/composer-tray-chip"
 import { ContactsBrowser } from "@/components/contacts/contacts-browser"
+import { AttachmentsBrowser } from "@/components/attachments/attachments-browser"
+import { CalendarView } from "@/components/calendar/calendar-view"
 import { WelcomePanel } from "@/components/email/welcome-panel"
 import { accountHue } from "@/components/email/account-hue"
 import { ReadingPane } from "@/components/email/reading-pane"
 import { ThreadList } from "@/components/email/thread-list"
+// Quick steps (task 3.2): the shell-level confirm-once dialog host plus
+// the per-step digit shortcut listener — both global, like the palette.
+import { QuickStepConfirmHost } from "@/components/email/quick-step-confirm-dialog"
+import { useQuickStepShortcuts } from "@/hooks/use-quick-step-shortcuts"
 import { applyDroppedLabels, labelDropDeps } from "@/components/email/label-dnd"
 import { Toaster } from "@/components/ui/sonner"
 import { initAccountStore, useAccountStore } from "@/stores/account-store"
@@ -37,6 +55,14 @@ import { useThreadListStore } from "@/stores/thread-list-store"
 import { initOnlineTracking, onOnlineChange } from "@/services/online"
 import { useOnlineStore } from "@/stores/online-store"
 import { getExecutor } from "@/services/db/executor"
+import {
+  initialMailtoLinks,
+  mailtoBodyToHtml,
+  onMailtoLink,
+  parseMailto,
+} from "@/services/desktop/mailto"
+import { onComposeRequest } from "@/services/desktop/tray"
+import { installThreadSyncBridge } from "@/services/desktop/thread-sync-bridge"
 import { applyBootPreferences } from "@/services/settings/preferences"
 import { useUiStore, viewDisplayName } from "@/stores/ui-store"
 
@@ -101,8 +127,10 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
   const priority = listScope?.kind === "priority"
   const nudges = listScope?.kind === "nudges"
   // An active split tab (task 9.3) retitles too — its stored name is the
-  // list's identity; the underlying folder title would be wrong.
+  // list's identity; the underlying folder title would be wrong. An active
+  // category tab (task 3.5) retitles with the category's display name.
   const splitScope = listScope?.kind === "split" ? listScope : null
+  const categoryScope = listScope?.kind === "category" ? listScope : null
   // The dots stand for the ACTIVE accounts — exactly the set the unified
   // scope aggregates (listActiveAccounts).
   const activeAccounts = useMemo(
@@ -128,7 +156,9 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
                 ? "Nudges"
                 : splitScope
                   ? splitScope.name
-                  : viewDisplayName(view)}
+                  : categoryScope
+                    ? CATEGORY_LABELS[categoryScope.category]
+                    : viewDisplayName(view)}
         </h1>
         <div className="flex items-center gap-2">
           {unified && activeAccounts.length > 1 && (
@@ -196,11 +226,23 @@ export function MailShell({
   const composerOpen = useUiStore((state) => state.composerOpen)
   const settingsOpen = useUiStore((state) => state.view.kind === "settings")
   const contactsOpen = useUiStore((state) => state.view.kind === "contacts")
-  // Full-pane pages (settings 11.1, Contacts browser 20.2) replace the
-  // mailbox panes; the sidebar stays so the user can navigate elsewhere.
-  const fullPageOpen = settingsOpen || contactsOpen
+  const attachmentsOpen = useUiStore(
+    (state) => state.view.kind === "attachments"
+  )
+  const calendarOpen = useUiStore((state) => state.view.kind === "calendar")
+  // Full-pane pages (settings 11.1, Contacts browser 20.2, Attachments
+  // browser 3.7, Calendar view 5.3) replace the mailbox panes; the sidebar
+  // stays so the user can navigate elsewhere.
+  const fullPageOpen =
+    settingsOpen || contactsOpen || attachmentsOpen || calendarOpen
   // The composer's own visibility flag (it renders null while closed).
   const composerVisible = useComposerStore((state) => state.open)
+  // Minimized (batch C2): the overlay stays MOUNTED but display-none, so
+  // the TipTap instance, autosave and every transient state survive; the
+  // tray chip below is the only visible composer surface.
+  const composerMinimized = useComposerStore((state) => state.minimized)
+  // Surface size (batch C2): full-surface overlay or the centered card.
+  const composerMode = useUiStore((state) => state.composerMode)
   const [addAccountOpen, setAddAccountOpen] = useState(false)
   const panelRef = usePanelRef()
 
@@ -217,6 +259,10 @@ export function MailShell({
   }
 
   const openAddAccount = () => setAddAccountOpen(true)
+
+  // Per-step quick-step digit shortcuts (task 3.2): one global keydown
+  // listener mounted beside the shell, like the 6.6 shortcuts hook.
+  useQuickStepShortcuts()
 
   // Load accounts, unread counts and the last active account once; the
   // switcher renders the "No accounts" empty state until this resolves.
@@ -238,6 +284,59 @@ export function MailShell({
     }
   }, [])
 
+  // Tray menu (1.2): the tray's Compose item emits tray-compose from Rust
+  // (which first surfaces the window); mirror the sidebar Compose click.
+  // Degrades to a no-op unsubscribe outside the Tauri runtime.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    let disposed = false
+    void onComposeRequest(() => {
+      useUiStore.getState().setComposerOpen(true)
+    }).then((off) => {
+      if (disposed) off()
+      else unlisten = off
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
+
+  // Mailto links (1.4): live links (warm start, all platforms) arrive via
+  // the deep-link event; links that started this process (cold start) are
+  // queried once at boot — the startup event fires before the webview
+  // listens. Both paths converge on openMailtoDraft below. The parse is
+  // pure (services/desktop/mailto.ts); this effect owns the composer
+  // bridging, mirroring what the reply openers do with their setters.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    let disposed = false
+    const openDraft = (url: string): void => {
+      const draft = parseMailto(url)
+      if (!draft) return
+      const composer = useComposerStore.getState()
+      composer.openNew(useAccountStore.getState().activeAccountId)
+      if (draft.to.length > 0) composer.setTo(draft.to)
+      if (draft.cc.length > 0) composer.setCc(draft.cc)
+      if (draft.bcc.length > 0) composer.setBcc(draft.bcc)
+      if (draft.subject !== null) composer.setSubject(draft.subject)
+      if (draft.body !== null) composer.setHtml(mailtoBodyToHtml(draft.body))
+      useUiStore.getState().setComposerOpen(true)
+    }
+    void onMailtoLink(openDraft).then((off) => {
+      if (disposed) off()
+      else unlisten = off
+    })
+    void initialMailtoLinks().then((urls) => {
+      if (disposed) return
+      for (const url of urls) openDraft(url)
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
+
   // Connectivity (6.8): mirror window online/offline events into the
   // online store (drives the offline banner). initOnlineTracking seeds
   // the store and attaches the listeners; the subscription re-pushes
@@ -249,6 +348,10 @@ export function MailShell({
       useOnlineStore.getState().setOnline(online)
     })
   }, [])
+
+  // Cross-window convergence (1.9): remote thread changes (made in pop-out
+  // windows) refresh the list, the badges and the open reading pane here.
+  useEffect(() => installThreadSyncBridge(), [])
 
   // Composer mounting contract (composer-store docstring, 8.1): the shell
   // flag ui-store.composerOpen is what the sidebar/palette set; the
@@ -435,6 +538,44 @@ export function MailShell({
               </ResizablePanel>
             </ResizablePanelGroup>
           )}
+          {/* Attachments browser (task 3.7, design D14): the current
+            account's attachments replace the mailbox panes exactly like
+            the settings/contacts pages above; the sidebar's Attachments
+            entry navigates here. */}
+          {attachmentsOpen && (
+            <ResizablePanelGroup
+              key="attachments"
+              orientation="horizontal"
+              className="min-h-0 flex-1 items-stretch"
+              onLayoutChange={onSidebarLayoutChange}
+              onLayoutChanged={onSidebarLayoutChanged}
+            >
+              {sidebarPane}
+              <ResizableHandle withHandle />
+              <ResizablePanel defaultSize="80%" minSize="40%">
+                <AttachmentsBrowser />
+              </ResizablePanel>
+            </ResizablePanelGroup>
+          )}
+          {/* Calendar view (task 5.3, design D5): the connected calendars'
+            month/week/day grid replaces the mailbox panes exactly like the
+            settings/contacts/attachments pages above; the sidebar's
+            Calendar entry navigates here. */}
+          {calendarOpen && (
+            <ResizablePanelGroup
+              key="calendar"
+              orientation="horizontal"
+              className="min-h-0 flex-1 items-stretch"
+              onLayoutChange={onSidebarLayoutChange}
+              onLayoutChanged={onSidebarLayoutChanged}
+            >
+              {sidebarPane}
+              <ResizableHandle withHandle />
+              <ResizablePanel defaultSize="80%" minSize="40%">
+                <CalendarView />
+              </ResizablePanel>
+            </ResizablePanelGroup>
+          )}
           {!fullPageOpen && readingPane === "right" && (
             <ResizablePanelGroup
               key="right"
@@ -510,23 +651,173 @@ export function MailShell({
           the palette store. The global Cmd/Ctrl+K binding is wired by the
           shortcuts task (6.6) — mounting here is the whole contract. */}
         <CommandPalette />
-        {/* Composer (8.1/8.2): full-surface overlay while open. Gated on the
+        {/* Quick-step confirm-once dialog (task 3.2): one global host the
+          context menu / palette / digit shortcuts raise requests against
+          (see run-with-confirm.ts). Renders nothing until a destructive
+          first run needs the gate. */}
+        <QuickStepConfirmHost />
+        {/* Help center dialog (task 2.9): one global instance, driven by
+          ui-store.helpCenterOpen (the command palette's "Open help center"
+          entry is the app's help-menu hook — there is no OS menu bar).
+          The Settings → Help section mounts the same center inline. */}
+        <HelpCenterDialog />
+        {/* Composer (8.1/8.2; batch C2 size modes + minimize): Gated on the
           composer store (renders null when closed); ui-store.composerOpen
-          is bridged into openNew above. */}
+          is bridged into openNew above. CENTERED (the default) is
+          deliberately NON-modal: the wrapper is pointer-events-none and
+          carries no backdrop dim, so the mailbox behind stays visible and
+          clickable while the card floats above it (the keyboard layer
+          routes keys by focus — see use-keyboard-shortcuts gate 3.25).
+          FULL keeps the original shell-filling modal surface. Minimized
+          keeps the view mounted behind display:none — only the tray chip
+          shows. */}
         {composerVisible && (
           <div
             data-testid="composer-overlay"
-            className="fixed inset-0 z-40 bg-background"
+            data-composer-mode={composerMode}
+            className={cn(
+              "fixed inset-0 z-40",
+              composerMinimized && "hidden",
+              // The flex classes must drop out while minimized: `flex` and
+              // `hidden` are both display utilities, and whichever comes
+              // later in the generated stylesheet wins — with both applied
+              // the card visibly stayed on screen next to the tray chip.
+              composerMode === "centered" &&
+                !composerMinimized &&
+                "pointer-events-none flex items-center justify-center p-4"
+            )}
           >
-            <Suspense fallback={null}>
-              <Composer />
-            </Suspense>
+            {composerMode === "centered" ? (
+              <CenteredComposerCard>
+                <Suspense fallback={null}>
+                  <Composer />
+                </Suspense>
+              </CenteredComposerCard>
+            ) : (
+              <div className="h-full w-full bg-background">
+                <Suspense fallback={null}>
+                  <Composer />
+                </Suspense>
+              </div>
+            )}
           </div>
         )}
+        {/* Minimized-composer tray chip (batch C2): docked bottom-right,
+            the only visible composer surface while minimized. */}
+        <ComposerTrayChip />
         {/* Toast host: theme-aware, bottom-right per the notifications UX. */}
         <Toaster position="bottom-right" />
       </TooltipProvider>
     </DndContext>
+  )
+}
+
+/**
+ * The centered composer's draggable card: the floating card can be moved
+ * by its header strip (the row carrying data-composer-drag-handle inside
+ * the composer surface — buttons and fields inside it are excluded), so
+ * the user can park it beside the thread they are reading while the
+ * mailbox behind stays interactive. Pointer capture keeps the drag alive
+ * over the click-through overlay; the offset clamps to the viewport so
+ * the card can never be dropped off-screen; double-click on the header
+ * snaps it back to center. State is deliberately component-local — the
+ * card unmounts with the overlay when the composer closes, which is the
+ * reset, while a minimize (the overlay stays mounted behind display:
+ * none) keeps the parked position.
+ */
+function CenteredComposerCard({ children }: { children: ReactNode }) {
+  const [offset, setOffset] = useState<{ x: number; y: number } | null>(null)
+  const cardRef = useRef<HTMLDivElement>(null)
+  const dragRef = useRef<{
+    pointerId: number
+    startX: number
+    startY: number
+    baseX: number
+    baseY: number
+    left: number
+    top: number
+    width: number
+    height: number
+  } | null>(null)
+
+  const isHandleTarget = (target: EventTarget | null): boolean =>
+    target instanceof Element &&
+    target.closest('[data-composer-drag-handle]') !== null &&
+    // Buttons inside the header row keep their click; dragging starts on
+    // the title strip and the empty space around it only.
+    target.closest("button, a, input, select, textarea, [role='button']") ===
+      null
+
+  function onPointerDown(event: ReactPointerEvent<HTMLDivElement>): void {
+    if (event.button !== 0) return
+    if (!isHandleTarget(event.target)) return
+    const card = cardRef.current
+    if (!card) return
+    const rect = card.getBoundingClientRect()
+    const current = offset ?? { x: 0, y: 0 }
+    dragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      baseX: current.x,
+      baseY: current.y,
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  function onPointerMove(event: ReactPointerEvent<HTMLDivElement>): void {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    // Clamp to the viewport (16px gutter): the dragged card stays fully
+    // reachable — a card wider/taller than the window degrades to the
+    // gutter edge on that axis.
+    const gutter = 16
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    const nx = Math.min(
+      Math.max(
+        drag.baseX + (event.clientX - drag.startX),
+        drag.baseX + gutter - drag.left
+      ),
+      drag.baseX + vw - gutter - drag.left - drag.width
+    )
+    const ny = Math.min(
+      Math.max(
+        drag.baseY + (event.clientY - drag.startY),
+        drag.baseY + gutter - drag.top
+      ),
+      drag.baseY + vh - gutter - drag.top - drag.height
+    )
+    setOffset({ x: nx, y: ny })
+  }
+
+  function onPointerUp(event: ReactPointerEvent<HTMLDivElement>): void {
+    if (dragRef.current?.pointerId !== event.pointerId) return
+    dragRef.current = null
+  }
+
+  return (
+    <div
+      ref={cardRef}
+      data-testid="composer-card"
+      className="pointer-events-auto flex h-[85vh] max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border bg-background shadow-2xl"
+      style={
+        offset ? { transform: `translate(${offset.x}px, ${offset.y}px)` } : undefined
+      }
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onDoubleClick={(event) => {
+        if (isHandleTarget(event.target)) setOffset(null)
+      }}
+    >
+      {children}
+    </div>
   )
 }
 

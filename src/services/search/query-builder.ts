@@ -1,4 +1,9 @@
-import { escapeLikePattern, toFtsMatch } from "./fts"
+import {
+  accentGlob,
+  escapeLikePattern,
+  foldText,
+  toFtsMatch,
+} from "./fts"
 import type { ParsedQuery } from "./parser"
 import type { ThreadSortOption } from "../db/thread-sort"
 import { DEFAULT_THREAD_SORT, threadSortOrderClause } from "../db/thread-sort"
@@ -59,17 +64,24 @@ import { DEFAULT_THREAD_SORT, threadSortOrderClause } from "../db/thread-sort"
  *    against the UTC-midnight boundary (before: exclusive `<`, after:
  *    inclusive `>=`) — the pair tiles time without gaps. `-before:` /
  *    `-after:` → NOT EXISTS over the same boundary comparison.
- * 10. Free text → a single EXISTS over messages: positive terms of ≥3 chars go
- *    through the external-content messages_fts trigram index (combined
- *    into one quoted MATCH string, so ONE message must match ALL terms —
- *    same semantics as the original search.ts); terms shorter than 3 chars
- *    can never produce a trigram token, so each falls back to a LIKE scan
- *    over the same columns the FTS index covers (subject, from_name,
- *    from_address, to_json, body_text, snippet). Each NEGATED term gets
- *    its own NOT EXISTS (FTS or LIKE by the same length split) — negated
- *    terms never enter the positive MATCH string, so mixed polarity keeps
- *    clean semantics: some message carries every positive term, and no
- *    message carries any negated one.
+ * 10. Free text → a single EXISTS over messages: positive terms are
+ *    accent-FOLDED (fts.ts foldText — NFD diacritic-strip, task 1.3) and
+ *    then split by length; folded terms of ≥3 chars go through the
+ *    external-content messages_fts trigram index (combined into one quoted
+ *    MATCH string, so ONE message must match ALL terms — same semantics as
+ *    the original search.ts — or ANY term with `freeTextMatch: "any"`, the
+ *    relaxed fallback's OR mode), terms shorter than 3 chars can never
+ *    produce a trigram token, so each falls back to a LIKE scan over the
+ *    same columns the FTS index covers (subject, from_name, from_address,
+ *    to_json, body_text, snippet), bridged across accents by accentGlob.
+ *    The index itself folds too — migration
+ *    v13 rebuilds messages_fts with the `remove_diacritics 1` trigram
+ *    tokenizer — so unaccented queries match accented text ("be don dep"
+ *    finds "Bé Dọn Dẹp") and vice versa. Each NEGATED term gets its own
+ *    NOT EXISTS (FTS or LIKE by the same length split) — negated terms
+ *    never enter the positive MATCH string, so mixed polarity keeps clean
+ *    semantics: some message carries every positive term, and no message
+ *    carries any negated one.
  *
  * A query of only negations yields a query matching every in-scope thread
  * except the excluded set — callers' empty-query short-circuits key off
@@ -97,6 +109,15 @@ export interface SearchThreadsOptions {
    * parameter list is identical to the plain build.
    */
   countOnly?: boolean
+  /**
+   * How the POSITIVE free-text terms combine (task 1.3, design D7):
+   * "all" (default) requires ONE message to carry every term; "any" — the
+   * relaxed fallback's OR mode — puts a thread in the results when ONE
+   * message carries ANY single term. Only the positive terms are loosened:
+   * each negated term keeps its own NOT EXISTS under either mode, so a
+   * mixed-polarity relaxed query still excludes what it excluded strictly.
+   */
+  freeTextMatch?: "all" | "any"
 }
 
 export interface BuiltThreadSearchSql {
@@ -307,14 +328,30 @@ export function buildThreadSearchSql(
   }
 
   // 10. Free text — positive terms in ONE EXISTS (a single message must
-  // match every term); each negated term gets its own NOT EXISTS so a
-  // mixed-polarity query never forces one message to carry both.
-  const longTerms = parsed.freeText.filter((term) => term.length >= 3)
-  const shortTerms = parsed.freeText.filter((term) => term.length < 3)
+  // match every term, or any single term in the relaxed "any" mode); each
+  // negated term gets its own NOT EXISTS so a mixed-polarity query never
+  // forces one message to carry both. Terms are FOLDED first (task 1.3,
+  // design D7) — the FTS index is written by the v13 tokenizer
+  // (`remove_diacritics 1`), which strips the same diacritics from the
+  // indexed text, so folded queries match accented content. Folding runs
+  // BEFORE the length split: a term that only sheds its marks ("dé" →
+  // "de") must fall to the LIKE scan a 2-char term belongs to, never into
+  // a trigram MATCH it can never satisfy. Sub-trigram terms run a GLOB
+  // over the RAW stored columns through accentGlob — one bracket class per
+  // character carrying every precomposed spelling that folds back to it —
+  // because SQLite has no way to fold a stored column in SQL; exact text
+  // always matches. The operator comparisons
+  // (from:/to:/subject:) deliberately keep exact-text LIKE semantics —
+  // they are filters on identifiers, not scored text, and label: MUST
+  // stay exact.
+  const anyMode = options?.freeTextMatch === "any"
+  const foldedFreeText = parsed.freeText.map(foldText)
+  const longTerms = foldedFreeText.filter((term) => term.length >= 3)
+  const shortTerms = foldedFreeText.filter((term) => term.length < 3)
   if (longTerms.length || shortTerms.length) {
     const termConditions: string[] = []
     if (longTerms.length) {
-      params.push(toFtsMatch(longTerms))
+      params.push(toFtsMatch(longTerms, anyMode ? "or" : "and"))
       termConditions.push(
         `m.rowid IN (
           SELECT rowid FROM messages_fts WHERE messages_fts MATCH $${params.length}
@@ -322,23 +359,39 @@ export function buildThreadSearchSql(
       )
     }
     for (const term of shortTerms) {
+      // Sub-trigram scan, accent-bridged (see accentGlob): one GLOB per
+      // column whose bracket classes carry every precomposed spelling that
+      // folds back to the term, so the folded query still meets raw stored
+      // text ("be" finds "Bé"). GLOB has no ESCAPE — terms with GLOB
+      // metacharacters fall back to the plain escaped LIKE. Either way,
       // one bound parameter per occurrence — repeated $N tokens would need
       // multiple binds under positional drivers (see executor.ts)
-      const likes = SHORT_TERM_LIKE_COLUMNS.map((column) => {
-        params.push(`%${escapeLikePattern(term)}%`)
-        return `${column} LIKE $${params.length} ESCAPE '\\'`
-      })
-      termConditions.push(`(${likes.join(" OR ")})`)
+      const glob = accentGlob(term)
+      if (glob !== null) {
+        const globs = SHORT_TERM_LIKE_COLUMNS.map((column) => {
+          params.push(glob)
+          return `${column} GLOB $${params.length}`
+        })
+        termConditions.push(`(${globs.join(" OR ")})`)
+      } else {
+        const likes = SHORT_TERM_LIKE_COLUMNS.map((column) => {
+          params.push(`%${escapeLikePattern(term)}%`)
+          return `${column} LIKE $${params.length} ESCAPE '\\'`
+        })
+        termConditions.push(`(${likes.join(" OR ")})`)
+      }
     }
     conditions.push(
       `EXISTS (
         SELECT 1 FROM messages m
         JOIN messages_fts ON messages_fts.rowid = m.rowid
-        WHERE m.thread_id = threads.id AND ${termConditions.join(" AND ")}
+        WHERE m.thread_id = threads.id AND ${termConditions.join(anyMode ? " OR " : " AND ")}
       )`
     )
   }
-  for (const term of parsed.negatedFreeText) {
+  for (const rawTerm of parsed.negatedFreeText) {
+    // Negated terms fold too — the same index the positive side matches.
+    const term = foldText(rawTerm)
     if (term.length >= 3) {
       params.push(toFtsMatch([term]))
       conditions.push(
@@ -350,16 +403,30 @@ export function buildThreadSearchSql(
         )`
       )
     } else {
-      const likes = SHORT_TERM_LIKE_COLUMNS.map((column) => {
-        params.push(`%${escapeLikePattern(term)}%`)
-        return `${column} LIKE $${params.length} ESCAPE '\\'`
-      })
-      conditions.push(
-        `NOT EXISTS (
-          SELECT 1 FROM messages m
-          WHERE m.thread_id = threads.id AND (${likes.join(" OR ")})
-        )`
-      )
+      const glob = accentGlob(term)
+      if (glob !== null) {
+        const globs = SHORT_TERM_LIKE_COLUMNS.map((column) => {
+          params.push(glob)
+          return `${column} GLOB $${params.length}`
+        })
+        conditions.push(
+          `NOT EXISTS (
+            SELECT 1 FROM messages m
+            WHERE m.thread_id = threads.id AND (${globs.join(" OR ")})
+          )`
+        )
+      } else {
+        const likes = SHORT_TERM_LIKE_COLUMNS.map((column) => {
+          params.push(`%${escapeLikePattern(term)}%`)
+          return `${column} LIKE $${params.length} ESCAPE '\\'`
+        })
+        conditions.push(
+          `NOT EXISTS (
+            SELECT 1 FROM messages m
+            WHERE m.thread_id = threads.id AND (${likes.join(" OR ")})
+          )`
+        )
+      }
     }
   }
 

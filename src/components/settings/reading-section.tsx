@@ -12,18 +12,25 @@ import { Switch } from "@/components/ui/switch"
 import { getNotificationsEnabled } from "@/services/db/settings"
 import { getExecutor } from "@/services/db/executor"
 import { setNotificationsEnabled } from "@/services/notifications/new-mail-notifier"
-import { setReadingPanePreference } from "@/services/settings/preferences"
+import {
+  getMarkReadOnOpen,
+  setMarkReadOnOpenPreference,
+  setReadingPanePreference,
+} from "@/services/settings/preferences"
 import type { ReadingPanePosition } from "@/stores/ui-store"
 import { useUiStore } from "@/stores/ui-store"
 
 /**
  * Settings "Reading" section (tasks 11.2/11.3): the default reading-pane
  * position (persisted through the settings table and applied to the
- * ui-store live — the same API the shell's pane switcher uses) and the
+ * ui-store live — the same API the shell's pane switcher uses), the
  * new-mail notification toggle (persisted via the notifier's
- * setNotificationsEnabled, which also invalidates its settings cache).
- * Unread counts are unaffected by the toggle — it only gates the OS
- * notification, not the badge computations.
+ * setNotificationsEnabled, which also invalidates its settings cache) and
+ * the mark-as-read-on-open toggle (task 1.4, settings spec: persisted
+ * through the preferences service; only gates the reading pane's open
+ * seam — manual mark controls and rules keep marking read).
+ * Unread counts are unaffected by the notification toggle — it only gates
+ * the OS notification, not the badge computations.
  */
 
 const PANE_OPTIONS: { value: ReadingPanePosition; label: string }[] = [
@@ -41,19 +48,26 @@ const PANE_HINTS: Record<ReadingPanePosition, string> = {
 export function ReadingSection() {
   const readingPane = useUiStore((state) => state.readingPane)
   const [notifications, setNotifications] = useState(true)
+  const [markReadOnOpen, setMarkReadOnOpen] = useState(true)
   // Set as soon as the user toggles: the async initial load must never
   // clobber a change with a stale DB read.
   const dirtyRef = useRef(false)
+  const markReadDirtyRef = useRef(false)
 
-  // Load the persisted notification setting once (the shell only mounts
-  // this page after bootstrap(), so the executor is available). The pane
-  // position needs no load — the ui-store is the live source, seeded at
-  // boot by applyBootPreferences. Failures keep the default (on).
+  // Load the persisted toggles once (the shell only mounts this page after
+  // bootstrap(), so the executor is available). The pane position needs no
+  // load — the ui-store is the live source, seeded at boot by
+  // applyBootPreferences. Failures keep the defaults (both on).
   useEffect(() => {
     try {
       void getNotificationsEnabled(getExecutor())
         .then((enabled) => {
           if (!dirtyRef.current) setNotifications(enabled)
+        })
+        .catch(() => {})
+      void getMarkReadOnOpen(getExecutor())
+        .then((enabled) => {
+          if (!markReadDirtyRef.current) setMarkReadOnOpen(enabled)
         })
         .catch(() => {})
     } catch (error) {
@@ -84,6 +98,20 @@ export function ReadingSection() {
     } catch (error) {
       setNotifications(previous)
       console.warn("[reading] failed to persist notifications", error)
+    }
+  }
+
+  async function changeMarkReadOnOpen(enabled: boolean): Promise<void> {
+    const previous = markReadOnOpen
+    markReadDirtyRef.current = true
+    setMarkReadOnOpen(enabled)
+    try {
+      // Persists to the settings table; the open seam reads it fresh on
+      // every open, so no cache invalidation is needed.
+      await setMarkReadOnOpenPreference(getExecutor(), enabled)
+    } catch (error) {
+      setMarkReadOnOpen(previous)
+      console.warn("[reading] failed to persist mark-as-read-on-open", error)
     }
   }
 
@@ -139,6 +167,24 @@ export function ReadingSection() {
             checked={notifications}
             onCheckedChange={(checked) => {
               void changeNotifications(checked)
+            }}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-6 py-3">
+          <div className="grid gap-0.5">
+            <Label htmlFor="reading-mark-read-on-open">
+              Mark as read on open
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              Opening a message marks it read. Manual mark read/unread and
+              rules always work as usual.
+            </p>
+          </div>
+          <Switch
+            id="reading-mark-read-on-open"
+            checked={markReadOnOpen}
+            onCheckedChange={(checked) => {
+              void changeMarkReadOnOpen(checked)
             }}
           />
         </div>

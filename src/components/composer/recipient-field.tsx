@@ -3,6 +3,7 @@ import { X } from "lucide-react"
 
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
+import { ContactAvatar } from "@/components/contacts/contact-avatar"
 import { searchContactsRanked, type ContactRow } from "@/services/db/contacts"
 import { getExecutor } from "@/services/db/executor"
 import type { Recipient } from "@/stores/composer-store"
@@ -195,12 +196,24 @@ export function RecipientField({
               invalid ? `${chipLabel} is not a valid email address` : chipLabel
             }
             className={cn(
-              "inline-flex max-w-full items-center gap-0.5 rounded-md border px-1.5 py-0.5 text-xs",
+              "inline-flex max-w-full items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs",
               invalid
                 ? "border-destructive bg-destructive/10 text-destructive"
                 : "border-border bg-muted text-foreground"
             )}
           >
+            {/* Task 2.5 (spec contacts "Contact avatars"): avatar on
+                valid chips only — invalid text is not an address and
+                must never be probed against gravatar.com. The component
+                itself stays inert (initials or nothing) while the
+                setting is off. */}
+            {!invalid && (
+              <ContactAvatar
+                email={recipient.email}
+                name={recipient.name}
+                className="size-4 shrink-0"
+              />
+            )}
             <span className="truncate">{chipLabel}</span>
             {invalid ? (
               <span className="sr-only">(invalid address)</span>
@@ -253,17 +266,27 @@ export function RecipientField({
               onMouseEnter={() => setHighlighted(index)}
               onClick={() => acceptSuggestion(row)}
               className={cn(
-                "flex w-full flex-col items-start gap-0 rounded-md px-2 py-1 text-start outline-none",
+                "flex w-full items-center gap-2 rounded-md px-2 py-1 text-start outline-none",
                 index === highlighted
                   ? "bg-accent text-accent-foreground"
                   : "hover:bg-muted"
               )}
             >
-              <span className="w-full truncate text-sm">
-                {row.name ?? row.email}
-              </span>
-              <span className="w-full truncate text-xs text-muted-foreground">
-                {row.email}
+              {/* Task 2.5 (spec contacts "Contact avatars"): the same
+                  avatar as everywhere else — initials until the setting
+                  is on and a Gravatar resolves. */}
+              <ContactAvatar
+                email={row.email}
+                name={row.name}
+                className="size-6 shrink-0"
+              />
+              <span className="grid min-w-0 flex-1">
+                <span className="truncate text-sm">
+                  {row.name ?? row.email}
+                </span>
+                <span className="truncate text-xs text-muted-foreground">
+                  {row.email}
+                </span>
               </span>
             </button>
           ))}

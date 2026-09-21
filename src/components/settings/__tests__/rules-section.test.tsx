@@ -369,6 +369,37 @@ describe("RulesSection", () => {
     expect(toastMock.success).toHaveBeenCalledTimes(1)
   })
 
+  it("builds a set_category action through the action builder", async () => {
+    // Task 3.4 (design D4): the action vocabulary gains the category
+    // action — the dropdown offers it and a category select names one of
+    // the five categories.
+    render(<RulesSection />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Rule" }))
+    await screen.findByRole("dialog")
+
+    fireEvent.change(screen.getByLabelText("Name"), {
+      target: { value: "Deals" },
+    })
+    fireEvent.change(screen.getByLabelText("From"), {
+      target: { value: "deals@x.com" },
+    })
+    fireEvent.click(screen.getByRole("combobox", { name: "Action 1 type" }))
+    chooseOption(await screen.findByRole("option", { name: "Set category" }))
+    // The category select appears with the five categories; pick one.
+    fireEvent.click(screen.getByRole("combobox", { name: "Action 1 category" }))
+    chooseOption(await screen.findByRole("option", { name: "Promotions" }))
+    fireEvent.click(screen.getByRole("button", { name: "Create Rule" }))
+
+    await screen.findByText("Category: Promotions")
+    const rows = await listRules(executor, accountId)
+    expect(rows).toHaveLength(1)
+    expect(JSON.parse(rows[0]!.actions_json)).toEqual([
+      { type: "set_category", category: "promotions" },
+    ])
+    expect(toastMock.success).toHaveBeenCalledTimes(1)
+  })
+
   it("toggles enabled on the row and persists immediately", async () => {
     await createRule(executor, {
       accountId,

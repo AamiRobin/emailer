@@ -35,8 +35,12 @@ export type ShortcutId =
   | "snooze"
   | "reply"
   | "compose"
+  | "send-message"
+  | "close-composer"
   | "refresh"
+  | "print-thread"
   | "focus-search"
+  | "find-in-message"
   | "palette"
   | "help"
   | "dismiss"
@@ -143,6 +147,12 @@ export const SHORTCUTS: ReadonlyArray<ShortcutBinding> = [
     group: "compose",
   },
   {
+    id: "send-message",
+    keys: "Cmd/Ctrl+Enter",
+    description: "Send the message being composed",
+    group: "compose",
+  },
+  {
     id: "refresh",
     keys: "Shift+R",
     description: "Sync all accounts now",
@@ -155,10 +165,22 @@ export const SHORTCUTS: ReadonlyArray<ShortcutBinding> = [
     group: "search",
   },
   {
+    id: "find-in-message",
+    keys: "Cmd/Ctrl+F",
+    description: "Find in the open message",
+    group: "search",
+  },
+  {
     id: "palette",
     keys: "Cmd/Ctrl+K",
     description: "Toggle the command palette",
     group: "search",
+  },
+  {
+    id: "print-thread",
+    keys: "Cmd/Ctrl+P",
+    description: "Print the open thread",
+    group: "actions",
   },
   {
     id: "help",
@@ -171,6 +193,22 @@ export const SHORTCUTS: ReadonlyArray<ShortcutBinding> = [
     keys: "Esc",
     description: "Dismiss the shortcuts reference",
     group: "general",
+  },
+  {
+    // Shares Esc with "dismiss" and deliberately sits AFTER it in the
+    // table: matchShortcutEvent returns the first match, so outside the
+    // composer Esc keeps meaning "dismiss" (help overlay, find bar). With
+    // the composer open the hook interprets either id as the composer's
+    // MINIMIZE (batch C2 — the draft stays behind the shell's tray chip;
+    // the close button is the save-and-close path) — and if the user
+    // rebinds "dismiss" away from Esc, Esc falls through to this binding
+    // and still minimizes the composer. That context-scoped overlap is
+    // why the default table carries one duplicate key here. The id keeps
+    // its C1 name so persisted overrides stay addressable.
+    id: "close-composer",
+    keys: "Esc",
+    description: "Minimize the composer (the draft keeps autosaving)",
+    group: "compose",
   },
 ]
 
@@ -332,4 +370,15 @@ export function shortcutKeysFromEvent(event: KeyboardEvent): string | null {
     return `Shift+${key.toUpperCase()}`
   }
   return key
+}
+
+/**
+ * The default display string of one binding ("Esc", "Cmd/Ctrl+Enter") for
+ * inline UI hints — tooltips and titles next to the affordance the
+ * binding drives. Reads the DEFAULT table; a persisted override changes
+ * the effective binding (the reference UIs render those) but not this
+ * hint, which is accepted drift for a static tooltip.
+ */
+export function defaultShortcutKeys(id: ShortcutId): string | null {
+  return SHORTCUTS.find((binding) => binding.id === id)?.keys ?? null
 }

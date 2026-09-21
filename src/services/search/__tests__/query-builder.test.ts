@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import type { ThreadSortOption } from "../../db/thread-sort"
+import { accentGlob } from "../fts"
 import { parseSearchQuery } from "../parser"
 import { buildThreadSearchSql } from "../query-builder"
 
@@ -99,7 +100,7 @@ describe("buildThreadSearchSql", () => {
     expect(params).toEqual(["acc-1", '"planning" "roadmap"'])
   })
 
-  it("falls back to a LIKE scan for terms shorter than 3 chars", () => {
+  it("falls back to a sub-trigram GLOB scan for terms shorter than 3 chars", () => {
     const { sql, params } = build("zz qq")
     expect(sql).not.toContain("MATCH")
     for (const column of [
@@ -110,22 +111,23 @@ describe("buildThreadSearchSql", () => {
       "m.body_text",
       "m.snippet",
     ]) {
-      expect(sql).toContain(`${column} LIKE`)
+      expect(sql).toContain(`${column} GLOB`)
     }
+    // the accent-bridged pattern of each term, bound once per column
     expect(params).toEqual([
       "acc-1",
-      "%zz%",
-      "%zz%",
-      "%zz%",
-      "%zz%",
-      "%zz%",
-      "%zz%",
-      "%qq%",
-      "%qq%",
-      "%qq%",
-      "%qq%",
-      "%qq%",
-      "%qq%",
+      ...Array.from({ length: 6 }, () => accentGlob("zz")),
+      ...Array.from({ length: 6 }, () => accentGlob("qq")),
+    ])
+  })
+
+  it("falls back to a plain LIKE for terms with GLOB metacharacters", () => {
+    const { sql, params } = build("a*")
+    expect(sql).not.toContain(" GLOB ")
+    expect(sql).toContain("LIKE")
+    expect(params).toEqual([
+      "acc-1",
+      ...Array.from({ length: 6 }, () => "%a*%"),
     ])
   })
 
@@ -170,17 +172,12 @@ describe("buildThreadSearchSql", () => {
   it("gives each negated free-text term its own NOT EXISTS", () => {
     const { sql, params } = build("-zz -planning")
     expect(sql.split("NOT EXISTS").length - 1).toBe(2)
-    // long negated terms go through FTS, short ones through LIKE; the
-    // LIKE scan binds six column params before the FTS term
+    // long negated terms go through FTS, short ones through the accent
+    // GLOB; the GLOB binds six column params before the FTS term
     expect(sql).toContain("MATCH $8")
     expect(params).toEqual([
       "acc-1",
-      "%zz%",
-      "%zz%",
-      "%zz%",
-      "%zz%",
-      "%zz%",
-      "%zz%",
+      ...Array.from({ length: 6 }, () => accentGlob("zz")),
       '"planning"',
     ])
   })
@@ -277,12 +274,8 @@ describe("buildThreadSearchSql", () => {
       "d",
       "%/d", // label: exact, suffix
       '"longenough"', // free text ≥3 chars
-      "%zq%",
-      "%zq%",
-      "%zq%",
-      "%zq%",
-      "%zq%",
-      "%zq%", // free text <3 chars
+      // free text <3 chars: the accent-class GLOB of "zq", six columns
+      ...Array.from({ length: 6 }, () => accentGlob("zq")),
       25, // limit
     ])
     expect(sql).toContain("LIMIT $" + params.length)
@@ -509,5 +502,78 @@ describe("buildThreadSearchSql countOnly option (task 11.4)", () => {
     } finally {
       executor.close()
     }
+  })
+})
+
+describe("buildThreadSearchSql folding + OR mode (task 1.3)", () => {
+  /** Build with explicit options, whitespace-collapsed like build(). */
+  function buildWithOptions(
+    input: string,
+    options?: Parameters<typeof buildThreadSearchSql>[2]
+  ) {
+    const { sql, params } = buildThreadSearchSql(
+      "acc-1",
+      parseSearchQuery(input),
+      options
+    )
+    return { sql: sql.replace(/\s+/g, " ").trim(), params }
+  }
+
+  it("folds free-text terms before the trigram MATCH string", () => {
+    const { params } = buildWithOptions("Bé Dọn")
+    // both terms fold to base letters; "Be" (2 chars folded) drops to the
+    // accent GLOB scan, "Don" (3 chars folded) rides the index
+    expect(params).toContain('"Don"')
+    expect(params).toContain(accentGlob("be"))
+  })
+
+  it("keeps a term that only sheds marks at FTS length on the FTS path", () => {
+    const { params } = buildWithOptions("café")
+    // "café" folds to "cafe" (4 chars) — still FTS
+    expect(params).toContain('"cafe"')
+  })
+
+  it("folds negated free-text terms too", () => {
+    const { params } = buildWithOptions("roadmap -drafté")
+    expect(params).toContain('"drafte"')
+  })
+
+  it("joins positive term conditions with AND by default", () => {
+    const { sql, params } = buildWithOptions("alpha beta")
+    expect(params).toContain('"alpha" "beta"')
+    expect(sql).not.toContain(" OR ")
+  })
+
+  it('joins positive term conditions with OR when freeTextMatch is "any"', () => {
+    const { sql, params } = buildWithOptions("alpha beta", {
+      freeTextMatch: "any",
+    })
+    expect(params).toContain('"alpha" OR "beta"')
+    expect(params).toEqual(["acc-1", '"alpha" OR "beta"'])
+    // the OR lives in the bound MATCH string; the SQL shape is unchanged
+    expect(sql).toContain("messages_fts MATCH $2")
+  })
+
+  it("OR mode mixes long and short terms with OR between their conditions", () => {
+    const { sql, params } = buildWithOptions("alpha zz", {
+      freeTextMatch: "any",
+    })
+    // "alpha" → FTS branch; "zz" → accent-GLOB branch; the two branches
+    // OR up inside the one EXISTS
+    expect(params[1]).toBe('"alpha"')
+    expect(sql).toContain("m.body_text GLOB")
+    const existsInner = sql.slice(sql.indexOf("EXISTS"))
+    expect(existsInner).toMatch(/\) OR \(/)
+    expect(params.length).toBe(8) // account + FTS + 6 GLOB binds
+  })
+
+  it("OR mode never loosens negated terms — they keep their own NOT EXISTS", () => {
+    const { sql, params } = buildWithOptions("alpha -beta", {
+      freeTextMatch: "any",
+    })
+    expect(params[1]).toBe('"alpha"')
+    expect(sql).toContain("NOT EXISTS")
+    // the negated term is excluded from the positive MATCH string
+    expect(params).not.toContain('"alpha" OR "beta"')
   })
 })

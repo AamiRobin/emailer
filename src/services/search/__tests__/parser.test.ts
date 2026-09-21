@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { isEmptyQuery, parseSearchQuery } from "../parser"
+import { isEmptyQuery, parseSearchQuery, usesOperators } from "../parser"
 
 describe("parseSearchQuery", () => {
   it("returns an all-empty query for empty and whitespace-only input", () => {
@@ -345,5 +345,55 @@ describe("parseSearchQuery", () => {
     expect(isEmptyQuery(parseSearchQuery("from:alice"))).toBe(false)
     expect(isEmptyQuery(parseSearchQuery("has:attachment"))).toBe(false)
     expect(isEmptyQuery(parseSearchQuery("zz"))).toBe(false)
+  })
+})
+
+describe("usesOperators (task 1.3: the relaxed fallback's rewrite gate)", () => {
+  it("is false for pure free text, quoted or not", () => {
+    expect(usesOperators(parseSearchQuery("banking report"))).toBe(false)
+    expect(usesOperators(parseSearchQuery('"annual report" budget'))).toBe(
+      false
+    )
+    // accented input does not make an operator
+    expect(usesOperators(parseSearchQuery("bé dọn dẹp"))).toBe(false)
+  })
+
+  it("is false for a negation-only free-text query", () => {
+    expect(usesOperators(parseSearchQuery("-spam"))).toBe(false)
+  })
+
+  it("sees every positive operator", () => {
+    for (const query of [
+      "from:maria banking",
+      "to:bob",
+      "subject:invoice",
+      "label:receipts",
+      "has:attachment",
+      "is:unread",
+      "is:starred",
+      "larger:10m",
+      "smaller:500k",
+      "before:2026-01-01",
+      "after:2025-01-01",
+    ]) {
+      expect(usesOperators(parseSearchQuery(query)), query).toBe(true)
+    }
+  })
+
+  it("sees negated operators too — they are operators", () => {
+    for (const query of [
+      "-from:maria",
+      "-is:unread report",
+      "-has:attachment",
+      "-before:2026-01-01",
+    ]) {
+      expect(usesOperators(parseSearchQuery(query)), query).toBe(true)
+    }
+  })
+
+  it("is false when an unknown key degrades to free text", () => {
+    // `foo:bar` is searched as the literal text it spells — no operator
+    // predicate, so an otherwise-term-free query may still fall back.
+    expect(usesOperators(parseSearchQuery("foo:bar"))).toBe(false)
   })
 })

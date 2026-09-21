@@ -95,6 +95,7 @@ function createFakeProvider(accountId: string): EmailProvider & {
     trash: vi.fn(async () => {}),
     moveToFolder: vi.fn(async () => {}),
     deleteForever: vi.fn(async () => {}),
+    getMessageSource: vi.fn(async () => ""),
     sendMessage: vi.fn(async (input: { subject: string }) => {
       calls.push(`send:${input.subject}`)
       return { messageId: "generated" }

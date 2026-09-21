@@ -28,7 +28,7 @@ import {
 } from "../email/invoke"
 import { base64ToBytes } from "../email/mime-builder"
 import { getProvider } from "../email/provider-factory"
-import type { ProviderCredentials } from "../email/types"
+import type { AccountType, ProviderCredentials } from "../email/types"
 import { createUserLabel } from "../labels/label-admin"
 import {
   findThreadByMessageIdHeader,
@@ -406,7 +406,7 @@ interface TargetFolder {
  */
 async function resolveTargetFolder(
   executor: SqlExecutor,
-  account: { id: string; type: "gmail" | "imap" },
+  account: { id: string; type: AccountType },
   destination: ImportDestination
 ): Promise<TargetFolder> {
   if (destination.kind === "folderId") {
@@ -447,7 +447,7 @@ function folderNameOf(label: LabelRow): string {
  * the folder label (thread_labels is gmail's folder model). */
 async function existsInFolder(
   executor: SqlExecutor,
-  account: { id: string; type: "gmail" | "imap" },
+  account: { id: string; type: AccountType },
   folder: TargetFolder,
   variants: string[]
 ): Promise<boolean> {
@@ -551,7 +551,7 @@ interface CacheDeps {
  */
 async function insertImportedMessage(
   executor: SqlExecutor,
-  account: { id: string; type: "gmail" | "imap" },
+  account: { id: string; type: AccountType },
   folder: TargetFolder,
   parsed: ParsedEml,
   threadId: string,

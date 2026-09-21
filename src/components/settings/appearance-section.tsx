@@ -15,16 +15,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { clearAvatarCache } from "@/services/contacts/avatars"
 import { getExecutor } from "@/services/db/executor"
 import {
   DENSITY_PRESETS,
   FONT_SCALES,
   getDensity,
   getFontScale,
+  getGravatarEnabled,
+  getProfileColorMarkersEnabled,
   setAccentPreference,
   setDensityPreference,
   setFontScalePreference,
+  setGravatarEnabledPreference,
+  setProfileColorMarkersPreference,
   setThemeModePreference,
   type DensityPreset,
   type ThemeMode,
@@ -38,6 +44,15 @@ import { useTheme } from "@/components/theme-provider"
  * accent through their own owners (next-themes localStorage; accent
  * localStorage + settings-table mirror), density and font scale through
  * the settings table feeding the --density/--font-scale tokens.
+ *
+ * Also hosts the opt-in contact-avatar toggle (task 2.5, design D12):
+ * OFF by default because fetching a Gravatar discloses a one-way hash of
+ * each contact's email address to gravatar.com — the privacy trade-off
+ * is spelled out on the row (the spec's "documented as a privacy
+ * trade-off at the toggle"). Flipping it clears the avatars service's
+ * blob cache: OFF revokes the URLs so cached avatars leave display (the
+ * spec's "disabling … SHALL remove cached avatars from display"); ON
+ * wakes already-mounted avatars to run their now-permitted fetches.
  */
 
 function SettingRow({
@@ -79,6 +94,12 @@ export function AppearanceSection() {
   const [density, setDensity] = useState<DensityPreset>("default")
   const [fontScale, setFontScale] = useState(1)
   const [accentId, setAccentId] = useState(getStoredAccentId())
+  // Contact avatars (Gravatar): default OFF — the privacy default (see
+  // the module docstring); the persisted value replaces it after load.
+  const [gravatarEnabled, setGravatarEnabled] = useState(false)
+  // Profile color markers (task 4.5): default shown (the spec default);
+  // the persisted value replaces it after load.
+  const [profileColorMarkers, setProfileColorMarkers] = useState(true)
   // Set as soon as the user changes anything: the async initial load must
   // never clobber a change with a stale DB read.
   const dirtyRef = useRef(false)
@@ -95,6 +116,16 @@ export function AppearanceSection() {
       void getFontScale(executor).then((value) => {
         if (!dirtyRef.current) setFontScale(value)
       })
+      void getGravatarEnabled(executor)
+        .then((value) => {
+          if (!dirtyRef.current) setGravatarEnabled(value)
+        })
+        .catch(() => {})
+      void getProfileColorMarkersEnabled(executor)
+        .then((value) => {
+          if (!dirtyRef.current) setProfileColorMarkers(value)
+        })
+        .catch(() => {})
     } catch (error) {
       console.warn("[appearance] preference load failed", error)
     }
@@ -149,6 +180,56 @@ export function AppearanceSection() {
       })
     } catch (error) {
       console.warn("[appearance] failed to persist font size", error)
+    }
+  }
+
+  /**
+   * Optimistic Gravatar toggle (the reading section's notification
+   * pattern): flip immediately, persist, then clear the avatars service's
+   * blob cache — OFF revokes every blob URL so cached avatars leave
+   * display; ON wakes mounted avatars to fetch under the new permission.
+   * A failed persist reverts the switch and skips the cache clear.
+   */
+  function changeGravatarAvatars(enabled: boolean): void {
+    const previous = gravatarEnabled
+    dirtyRef.current = true
+    setGravatarEnabled(enabled)
+    try {
+      void setGravatarEnabledPreference(getExecutor(), enabled)
+        .then(() => clearAvatarCache())
+        .catch((error) => {
+          setGravatarEnabled(previous)
+          console.warn("[appearance] failed to persist avatars", error)
+        })
+    } catch (error) {
+      setGravatarEnabled(previous)
+      console.warn("[appearance] failed to persist avatars", error)
+    }
+  }
+
+  /**
+   * Toggle the profile color markers (task 4.5): flip immediately,
+   * persist (default shown — see preferences.ts), revert on failure.
+   * Cross-account thread lists re-read the value on their next mount, so
+   * leaving settings re-renders them without markers everywhere.
+   */
+  function changeProfileColorMarkers(enabled: boolean): void {
+    const previous = profileColorMarkers
+    dirtyRef.current = true
+    setProfileColorMarkers(enabled)
+    try {
+      void setProfileColorMarkersPreference(getExecutor(), enabled).catch(
+        (error) => {
+          setProfileColorMarkers(previous)
+          console.warn(
+            "[appearance] failed to persist profile color markers",
+            error
+          )
+        }
+      )
+    } catch (error) {
+      setProfileColorMarkers(previous)
+      console.warn("[appearance] failed to persist profile color markers", error)
     }
   }
 
@@ -269,6 +350,28 @@ export function AppearanceSection() {
               ))}
             </SelectContent>
           </Select>
+        </SettingRow>
+        <SettingRow
+          controlId="appearance-contact-avatars"
+          label="Contact avatars"
+          hint="Off by default — enabling sends a one-way hash of each contact's email address to gravatar.com. Avatars are cached locally; turning this off hides them again."
+        >
+          <Switch
+            id="appearance-contact-avatars"
+            checked={gravatarEnabled}
+            onCheckedChange={(checked) => changeGravatarAvatars(checked)}
+          />
+        </SettingRow>
+        <SettingRow
+          controlId="appearance-profile-markers"
+          label="Profile color markers"
+          hint="Show a colored bar at the start of each thread in cross-account lists, colored by the account's profile or account color."
+        >
+          <Switch
+            id="appearance-profile-markers"
+            checked={profileColorMarkers}
+            onCheckedChange={(checked) => changeProfileColorMarkers(checked)}
+          />
         </SettingRow>
       </div>
     </section>

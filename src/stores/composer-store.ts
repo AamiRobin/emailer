@@ -58,8 +58,11 @@ import {
  *   composer component's useDraftAutosave mount; rehydrates with
  *   `openWith` + setters. `draftKey` below is the per-open instance key
  *   that autosave and the send/discard deletions address the row by.
- *   Attachment BYTES are not persisted — drafts carry metadata
- *   only, so attachments survive within the session (see drafts.ts).
+ *   Attachment BYTES persist too since batch C1 (fix 1): the draft-
+ *   attachments service mirrors the list into the `draft_attachments`
+ *   table on every list change and the resume path re-registers the
+ *   bytes into this registry (drafts.ts attachments_json keeps carrying
+ *   the descriptors).
  * - 8.7 (send) reads the payload via getComposerPayload and hands it to
  *   sendComposerDraft from the composer component.
  * - 16.2 (send-as, design D10): `fromAlias` holds the From-picker
@@ -183,6 +186,9 @@ export interface UndoSendSnapshot {
    * defaulting to off. */
   pgpSign?: boolean
   pgpEncrypt?: boolean
+  /** The signature selection at window start (fix 3); optional for the
+   * same reason — a cancel restores it, defaulting to "No signature". */
+  signatureSelection?: string | null
 }
 
 /** The live window state the banner reads: the snapshot plus countdown. */
@@ -195,6 +201,16 @@ interface ComposerState {
   /** Composer visibility once mounted; the shell mounts it via
    * ui-store.composerOpen (see module docstring). */
   open: boolean
+  /**
+   * Minimized-to-tray state (batch C2): true while the overlay is hidden
+   * behind the shell's tray chip. Deliberately KEEPS `open` true — the
+   * autosave keeps polling, the global shortcut gates keep treating the
+   * composer as open (the `c` binding restores instead of stacking a new
+   * compose), and the in-flight undo window is untouched (it already
+   * survives navigation; minimize is just another navigation). Cleared by
+   * openNew/openWith/close/reset and by undo-window restore.
+   */
+  minimized: boolean
   mode: ComposerMode
   /** Account the message is composed from; send uses its identity (8.7). */
   activeAccountId: string | null
@@ -237,6 +253,30 @@ interface ComposerState {
   pgpSign: boolean
   pgpEncrypt: boolean
 
+  /**
+   * The per-message signature selection (composer batch C1, fix 3): the
+   * account whose signature currently occupies the managed
+   * `emailer-signature` block in the body, or null for "No signature".
+   * It is a SELECTION, not a copy — the html itself is the body field;
+   * this only says which option the signature control shows. Reset to
+   * null with every other draft field (openNew/openWith/reset); the
+   * reply/forward prefill sets it to the sending account when its
+   * signature was embedded (preserving the reply-prefill behavior), and
+   * the signature control writes it on change.
+   */
+  signatureSelection: string | null
+
+  /**
+   * A one-line draft notice the composer renders as a dismissible info
+   * line above the attachment strip (batch C3 send-again: "Original
+   * attachments couldn't be restored" — the visible record that the new
+   * draft differs from the message it was prefilled from). Transient UI,
+   * not draft data: never autosaved and never part of the undo-window
+   * snapshot; cleared with every other draft field on openNew/openWith/
+   * reset and by the composer's Dismiss button.
+   */
+  attachmentNotice: string | null
+
   /** The active undo-send window (design D3): null when no send is
    * pending. The shell-level banner renders from this wherever the user
    * has navigated. */
@@ -249,6 +289,13 @@ interface ComposerState {
   /** Hide the composer. Fields are kept so a later reopen (or task 8.6's
    * draft resume) can restore the in-progress message. */
   close: () => void
+  /** Minimize to the shell's tray chip (batch C2): the overlay hides,
+   * `open` stays true so autosave and the shortcut gates keep running,
+   * and restore() brings the surface back. No-op while closed. */
+  minimize: () => void
+  /** Leave the minimized state (chip click, the `c` binding). No-op when
+   * not minimized; never flips `open`. */
+  restore: () => void
   /** Drop the draft entirely and hide the composer (the Discard action). */
   reset: () => void
   setTo: (recipients: Recipient[]) => void
@@ -261,11 +308,19 @@ interface ComposerState {
   /** Append attachment metadata (task 8.5). The component registers each
    * attachment's bytes under its id BEFORE calling this. */
   addAttachments: (attachments: ComposerAttachment[]) => void
+  /** Replace the whole attachment list — the draft-resume path (fix 1)
+   * restores persisted descriptors after re-registering their bytes. */
+  setAttachments: (attachments: ComposerAttachment[]) => void
   /** Remove one attachment and its registered bytes. */
   removeAttachment: (id: string) => void
   /** Select the send-as identity for this draft (task 16.2); null
    * selects the bare account identity. */
   setFromAlias: (fromAlias: FromAliasSelection | null) => void
+  /** Select the per-message signature (fix 3): the account id whose
+   * signature occupies the managed block, or null for "No signature". */
+  setSignatureSelection: (signatureSelection: string | null) => void
+  /** Show (or clear with null) the composer's dismissible draft notice. */
+  setAttachmentNotice: (notice: string | null) => void
   /** Flip the per-message PGP sign / encrypt toggles (task 18.5). */
   togglePgpSign: () => void
   togglePgpEncrypt: () => void
@@ -292,6 +347,7 @@ interface ComposerState {
 
 interface InitialDraft {
   open: boolean
+  minimized: boolean
   mode: ComposerMode
   activeAccountId: string | null
   draftKey: string | null
@@ -306,10 +362,13 @@ interface InitialDraft {
   fromAlias: FromAliasSelection | null
   pgpSign: boolean
   pgpEncrypt: boolean
+  signatureSelection: string | null
+  attachmentNotice: string | null
 }
 
 const INITIAL: InitialDraft = {
   open: false,
+  minimized: false,
   mode: { kind: "new" } as ComposerMode,
   activeAccountId: null,
   draftKey: null,
@@ -324,6 +383,8 @@ const INITIAL: InitialDraft = {
   fromAlias: null,
   pgpSign: false,
   pgpEncrypt: false,
+  signatureSelection: null,
+  attachmentNotice: null,
 }
 
 /** The draft-dropping actions also clear the bytes registry so dropped
@@ -369,6 +430,9 @@ function restoreSnapshot(snapshot: UndoSendSnapshot): Partial<ComposerState> {
   }
   return {
     open: true,
+    // A restored snapshot always surfaces visibly — a window that was
+    // minimized when its send started reopens expanded.
+    minimized: false,
     mode: snapshot.mode,
     activeAccountId: snapshot.accountId,
     draftKey: snapshot.draftKey,
@@ -383,6 +447,7 @@ function restoreSnapshot(snapshot: UndoSendSnapshot): Partial<ComposerState> {
     fromAlias: snapshot.fromAlias,
     pgpSign: snapshot.pgpSign ?? false,
     pgpEncrypt: snapshot.pgpEncrypt ?? false,
+    signatureSelection: snapshot.signatureSelection ?? null,
   }
 }
 
@@ -410,7 +475,12 @@ export const useComposerStore = create<ComposerState>((set, get) => ({
       draftKey: crypto.randomUUID(),
     }),
 
-  close: () => set({ open: false }),
+  close: () => set({ open: false, minimized: false }),
+
+  minimize: () =>
+    set((state) => (state.open ? { minimized: true } : {})),
+
+  restore: () => set((state) => (state.minimized ? { minimized: false } : {})),
 
   reset: () => set(dropDraft()),
 
@@ -426,6 +496,8 @@ export const useComposerStore = create<ComposerState>((set, get) => ({
   addAttachments: (attachments) =>
     set((state) => ({ attachments: [...state.attachments, ...attachments] })),
 
+  setAttachments: (attachments) => set({ attachments }),
+
   removeAttachment: (id) => {
     deleteAttachmentBytes(id)
     set((state) => ({
@@ -436,6 +508,10 @@ export const useComposerStore = create<ComposerState>((set, get) => ({
   },
 
   setFromAlias: (fromAlias) => set({ fromAlias }),
+
+  setSignatureSelection: (signatureSelection) => set({ signatureSelection }),
+
+  setAttachmentNotice: (attachmentNotice) => set({ attachmentNotice }),
 
   togglePgpSign: () => set((state) => ({ pgpSign: !state.pgpSign })),
   togglePgpEncrypt: () => set((state) => ({ pgpEncrypt: !state.pgpEncrypt })),

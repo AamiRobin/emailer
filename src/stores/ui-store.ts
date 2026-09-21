@@ -1,6 +1,7 @@
 import { create } from "zustand"
 
 import type { SpecialUse } from "@/services/db/labels"
+import type { Category } from "@/services/categorization/classify"
 
 /**
  * View-state store (design D5): pure in-memory UI state for the mailbox
@@ -37,6 +38,12 @@ import type { SpecialUse } from "@/services/db/labels"
  * - {kind:"contacts"}
  *     → no thread list; the Contacts browser (task 20.2) replaces the
  *       mailbox panes exactly like the settings view
+ * - {kind:"attachments"}
+ *     → no thread list; the Attachments browser (task 3.7, design D14)
+ *       replaces the mailbox panes exactly like the settings view
+ * - {kind:"calendar"}
+ *     → no thread list; the Calendar view (task 5.3, design D5) replaces
+ *       the mailbox panes exactly like the settings view
  * - {kind:"settings"}
  *     → no thread list; the settings page (11.1) replaces the mailbox panes
  */
@@ -61,6 +68,8 @@ export type ViewSelection =
   | { kind: "label"; labelId: string; name: string }
   | { kind: "search"; query: string }
   | { kind: "contacts" }
+  | { kind: "attachments" }
+  | { kind: "calendar" }
   | { kind: "settings" }
 
 /**
@@ -72,6 +81,9 @@ export type ViewSelection =
  * of the folder/label/search selection, and any setView() clears it
  * again. `split` carries an optional account pin (one account) — omit it
  * for the across-accounts variant; `saved-search` is always global.
+ * `category` (task 3.5, design D4) is the inbox category tab row's scope:
+ * one of the five categories, across the active accounts — the tab-bar
+ * sibling of the split kind (categories ordered first in the row).
  * `priority` (task 13.2, design D7) is the priority inbox: the active
  * accounts' inbox threads whose newest sender classifies important — not
  * an operator query (the classification is a scored heuristic, not
@@ -79,8 +91,9 @@ export type ViewSelection =
  * unified/split/saved-search. `nudges` (task 14.1, design D8) is the same
  * kind of variant: the awaiting-reply threads the detection query in
  * db/nudges.ts finds — again not expressible as a search string. Task
- * 9.2/9.3/13.2/14.1 hang their UI on setListScope(); the thread-list store
- * resolves the override into its scope descriptors (ThreadListScope).
+ * 9.2/9.3/13.2/14.1/3.5 hang their UI on setListScope(); the thread-list
+ * store resolves the override into its scope descriptors
+ * (ThreadListScope).
  */
 export type ListScopeOverride =
   | { kind: "unified" }
@@ -88,6 +101,7 @@ export type ListScopeOverride =
   | { kind: "nudges" }
   | { kind: "split"; name: string; query: string; accountId?: string }
   | { kind: "saved-search"; name: string; query: string }
+  | { kind: "category"; category: Category }
 
 /** Default view on launch: the account's inbox (also the test reset base). */
 export const DEFAULT_VIEW: ViewSelection = {
@@ -127,17 +141,52 @@ export function viewDisplayName(view: ViewSelection): string {
       return `Search: ${view.query}`
     case "contacts":
       return "Contacts"
+    case "attachments":
+      return "Attachments"
+    case "calendar":
+      return "Calendar"
     case "settings":
       return "Settings"
   }
 }
 
+/**
+ * Composer surface size (batch C2): "centered" (the default) renders the
+ * composer as a large rounded card floating over the mailbox — non-modal:
+ * the mail behind stays visible and clickable (the shell's overlay lets
+ * pointer events through everywhere but the card). "full" is the
+ * shell-filling overlay the composer originally had, kept as the expand
+ * option. Persisted by the preferences service (`mail.composerMode`);
+ * the in-code default here is only the fresh-install value.
+ */
+export type ComposerSizeMode = "centered" | "full"
+
 interface UiState {
   view: ViewSelection
   sidebarCollapsed: boolean
   composerOpen: boolean
+  /** Composer surface mode (see ComposerSizeMode); toggled by the
+   * composer header's maximize/restore button. */
+  composerMode: ComposerSizeMode
+  /**
+   * Reading-pane find bar visibility (task 1.1, mail-reading spec "Find
+   * in message"): set by the global Ctrl/Cmd+F binding and by the frames'
+   * in-body key reach-through, consumed by ThreadView (the session and
+   * highlight state live there — this flag only decides whether the bar
+   * is mounted). Like composerOpen, pure in-memory view state.
+   */
+  readingPaneFindOpen: boolean
+  /** Help-center dialog visibility (task 2.9): set by the command
+   * palette's "Open help center" entry; the dialog is mounted at the
+   * mail-shell level. The Settings → Help section mounts the center
+   * inline and does not consult this flag. */
+  helpCenterOpen: boolean
   /** Thread shown in the reading pane; null = no selection. */
   activeThread: string | null
+  /** Bumped whenever the open thread changes in another window (task 1.9
+   * cross-window bridge): ThreadView keys on it, so the pane remounts and
+   * re-reads the thread from SQLite without the user reselecting it. */
+  activeThreadRevision: number
   /** Where the reading pane sits (task 6.5); default "right". */
   readingPane: ReadingPanePosition
   /**
@@ -168,7 +217,13 @@ interface UiState {
   /** Direct setter for pane-resize wiring (dragging the divider in/out). */
   setSidebarCollapsed: (collapsed: boolean) => void
   setComposerOpen: (open: boolean) => void
+  setComposerMode: (mode: ComposerSizeMode) => void
+  setReadingPaneFindOpen: (open: boolean) => void
+  setHelpCenterOpen: (open: boolean) => void
   setActiveThread: (threadId: string | null) => void
+  /** Remote thread-change signal (task 1.9): forces the reading pane to
+   * re-read the currently open thread. */
+  bumpActiveThreadRevision: () => void
   setReadingPane: (position: ReadingPanePosition) => void
 }
 
@@ -183,7 +238,11 @@ export const useUiStore = create<UiState>((set) => ({
   view: DEFAULT_VIEW,
   sidebarCollapsed: false,
   composerOpen: false,
+  composerMode: "centered",
+  readingPaneFindOpen: false,
+  helpCenterOpen: false,
   activeThread: null,
+  activeThreadRevision: 0,
   readingPane: "right",
   previousView: DEFAULT_VIEW,
   listScope: null,
@@ -197,12 +256,16 @@ export const useUiStore = create<UiState>((set) => ({
       listScope: null,
       // Remember the most recent mailbox selection; a search (including a
       // refined query) and the full-pane pages (settings, the Contacts
-      // browser, task 20.2) never clobber it, so the "cancel"/back paths
-      // (clearSearch, settings back) restore what the user was reading.
+      // browser, task 20.2, the Attachments browser, task 3.7, the
+      // Calendar view, task 5.3) never clobber it, so the "cancel"/back
+      // paths (clearSearch, settings back, the browsers' back controls)
+      // restore what the user was reading.
       previousView:
         view.kind === "search" ||
         view.kind === "settings" ||
-        view.kind === "contacts"
+        view.kind === "contacts" ||
+        view.kind === "attachments" ||
+        view.kind === "calendar"
           ? state.previousView
           : view,
     })),
@@ -212,7 +275,14 @@ export const useUiStore = create<UiState>((set) => ({
     set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
   setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
   setComposerOpen: (composerOpen) => set({ composerOpen }),
+  setComposerMode: (composerMode) => set({ composerMode }),
+  setReadingPaneFindOpen: (readingPaneFindOpen) => set({ readingPaneFindOpen }),
+  setHelpCenterOpen: (helpCenterOpen) => set({ helpCenterOpen }),
   setActiveThread: (activeThread) => set({ activeThread }),
+  bumpActiveThreadRevision: () =>
+    set((state) => ({
+      activeThreadRevision: state.activeThreadRevision + 1,
+    })),
   // In-memory only — persistence is the preferences service's job
   // (setReadingPanePreference), which calls this after its write.
   setReadingPane: (readingPane) => set({ readingPane }),

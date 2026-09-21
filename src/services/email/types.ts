@@ -8,7 +8,7 @@ import type { LabelType, SpecialUse } from "../db/labels"
  * invoke.ts; this file stays transport-free.
  */
 
-export type AccountType = "gmail" | "imap"
+export type AccountType = "gmail" | "imap" | "microsoft"
 
 export type AccountStatus = "active" | "auth-error"
 
@@ -151,6 +151,15 @@ export interface NormalizedMessage {
   listUnsubscribe?: string
   /** `List-Unsubscribe-Post` value (one-click = "List-Unsubscribe=One-Click"). */
   listUnsubscribePost?: string
+  /**
+   * Consolidated SPF/DKIM/DMARC verdicts from the message's
+   * Authentication-Results headers (task 2.1, design D10) — compact
+   * "spf=pass;dkim=fail;dmarc=none", worst value wins per mechanism
+   * across multiple headers (see email/auth-results.ts for the grammar,
+   * shared with the Rust parser). Undefined when no header evaluated any
+   * mechanism (spec: no headers → no badge).
+   */
+  authResults?: string
   // Gmail-shaped slots (4.2): the imap provider leaves these unset.
   /** Gmail unique message id. */
   gmailId?: string
@@ -160,6 +169,15 @@ export interface NormalizedMessage {
   labelIds?: string[]
   /** Gmail history id at fetch time. */
   historyId?: string
+  // Microsoft-Graph-shaped slots (parity-round-2, task 3.2): gmail/imap
+  // providers leave these unset. Graph has no labels — label operations
+  // are local-only for these accounts.
+  /** Graph message id (opaque, URL-safe base64-ish string). */
+  graphId?: string
+  /** Graph conversationId — the server-side thread grouping. */
+  graphThreadId?: string
+  /** Graph folder id the message was fetched from. */
+  graphFolderId?: string
 }
 
 /**
@@ -261,6 +279,9 @@ export interface FetchMessagesResult {
 export interface MessageFlags {
   uid: number
   flags: string[]
+  /** Exact provider message id when the provider has no numeric uids
+   * (microsoft: the Graph message id; gmail/imap leave it unset). */
+  providerMessageId?: string
 }
 
 /** Provider-agnostic message handle: imap addresses by (folder, uid); the
@@ -388,6 +409,18 @@ export interface EmailProvider {
 
   /** Hard delete: imap EXPUNGE / gmail delete-forever. */
   deleteForever(refs: MessageRef[]): Promise<void>
+
+  // ---- Reading ----
+
+  /**
+   * The message's raw RFC 822 source — transport headers plus body source,
+   * exactly as stored server-side (design D6, task 1.2). Fetched on demand
+   * (never cached, never persisted); the reading UI renders the string
+   * inert (escaped plain text in the sandboxed frame). gmail: messages.get
+   * with format=raw; imap: the BODY.PEEK[] full-message fetch via the
+   * imap_fetch_source command.
+   */
+  getMessageSource(ref: MessageRef): Promise<string>
 
   // ---- Send ----
 

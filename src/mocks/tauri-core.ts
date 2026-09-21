@@ -55,6 +55,48 @@ export async function invoke<T = unknown>(
   // Badge / UI-side commands: cosmetic, resolve immediately.
   if (command === "set_unread_badge") return null as T
 
+  // Gravatar avatars (task 2.5, design D12): mock mode never reaches the
+  // network — null means "no Gravatar", so the deterministic initials
+  // avatar renders everywhere.
+  if (command === "gravatar_fetch") return null as T
+
+  // Desktop integration commands (Phase 1): the browser mock has no tray,
+  // window state, or OS registrations, so tray availability is honestly
+  // false (the settings UI hides tray controls) and the live-value pushes
+  // resolve as no-ops.
+  if (command === "set_close_action") return null as T
+  if (command === "get_close_action") return "quit" as T
+  if (command === "tray_available") return false as T
+  if (command === "mailto_default_state") {
+    return { is_default: false, current_handler: null } as T
+  }
+  if (command === "mailto_set_default") return null as T
+  if (command === "initial_deep_links") return [] as T
+  if (command === "autostart_is_enabled") return false as T
+  if (command === "autostart_set_enabled") return null as T
+  if (command === "close_splashscreen") return null as T
+  // Pop-out windows (1.9): the mock browser has no window system — the
+  // open affordances are hidden outside the Tauri runtime anyway.
+  if (command === "open_thread_popout") return "popout-mock" as T
+  if (command === "force_close_popout") return null as T
+  // Global shortcut: the mock cannot validate OS accelerator syntax, so
+  // anything parseable-looking is accepted; null clears.
+  if (command === "set_global_compose_shortcut") {
+    const accelerator = readArg(args, "accelerator")
+    if (accelerator !== null && typeof accelerator !== "string") {
+      throw new Error("accelerator must be a string or null")
+    }
+    return null as T
+  }
+
+  // AI chat (task 4.2, design D1): mock mode has no provider network —
+  // every call succeeds with a canned reply so the AI surfaces can be
+  // exercised against a configured provider without hitting the real
+  // command (the wire shape mirrors ai/mod.rs's ChatResponse).
+  if (command === "ai_chat") {
+    return { content: "Mock AI reply.", model: "mock-model" } as T
+  }
+
   // IMAP commands: healthy empty folder state. The fixture folders'
   // uidvalidity matches the seeded folder_sync_state rows, so the sync
   // engine takes the delta path and finds zero new messages.
@@ -114,6 +156,30 @@ export async function invoke<T = unknown>(
       server: "mock-smtp.local",
       capabilities: ["PIPELINING", "8BITMIME", "SMTPUTF8"],
     } as T
+  }
+
+  // Storage usage (task 1.6): a canned breakdown in the wire shape of
+  // src-tauri/src/storage.rs so the settings section renders.
+  if (command === "storage_usage") {
+    return {
+      kinds: [
+        { kind: "attachments", bytes: 18 * 1024 * 1024 },
+        { kind: "databases", bytes: 64 * 1024 * 1024 },
+        { kind: "keys", bytes: 32 },
+        { kind: "other", bytes: 4096 },
+      ],
+      total: 18 * 1024 * 1024 + 64 * 1024 * 1024 + 32 + 4096,
+      unreadableEntries: 0,
+    } as T
+  }
+  // Delete-all (task 1.7): a real wipe would end the session — mock mode
+  // rejects so the flow's error path stays demonstrable.
+  if (command === "delete_all_local_data") {
+    const wipeError = new Error(
+      "[mock] delete-all-local-data is not available in mock mode"
+    )
+    warnOnce(command, wipeError)
+    throw wipeError
   }
 
   // Explicit rejections.

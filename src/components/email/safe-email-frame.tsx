@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -9,6 +10,19 @@ import {
 
 import { cn } from "@/lib/utils"
 import { sanitizeEmailHtml } from "@/services/renderer/sanitize"
+
+import {
+  EMAILER_FIND_ACTIVE_ATTR,
+  EMAILER_FIND_OPEN_TYPE,
+  EMAILER_FIND_MARK_ATTR,
+  FindSessionContext,
+  isFindFrameRequest,
+  isFindFrameState,
+} from "./find-session"
+import {
+  emailFindController,
+  findControllerParams,
+} from "./find-frame-controller"
 
 /**
  * Sandboxed email body frame (task 7.2, design D7).
@@ -31,6 +45,14 @@ import { sanitizeEmailHtml } from "@/services/renderer/sanitize"
  * document whenever the frame document is built — on content changes AND
  * on light/dark flips (the frame observes the host theme) — so the frame
  * tracks the active theme without sharing a CSS scope.
+ *
+ * Find-in-message (task 1.1, design D5): the frame also runs the search —
+ * the shell cannot mirror this document (opaque origin), so the injected
+ * controller highlights matches, reports counts and navigates on command
+ * over the same postMessage channel. Search is purely local DOM work: no
+ * fetch, no image unblocking, no network of any kind. The controller is
+ * serialized into the document (see its doc comment) and is exercised
+ * directly by the tests — jsdom does not run srcdoc scripts.
  */
 
 /** postMessage contract: { type: EMAILER_RESIZE_MESSAGE_TYPE, height: px }. */
@@ -48,6 +70,12 @@ export const MIN_EMAIL_FRAME_HEIGHT = 120
 export const MAX_EMAIL_FRAME_HEIGHT = 20_000
 
 const SANDBOX = "allow-scripts allow-popups allow-popups-to-escape-sandbox"
+
+/** Highlight styling for find marks: neutral yellow for matches, orange
+ * for the active one (works on light and dark backgrounds alike). */
+const FIND_MARK_CSS =
+  `mark[${EMAILER_FIND_MARK_ATTR}] { background-color: rgba(250, 204, 21, 0.5); color: inherit; }` +
+  `mark[${EMAILER_FIND_MARK_ATTR}][${EMAILER_FIND_ACTIVE_ATTR}] { background-color: #fb923c; color: #ffffff; }`
 
 /**
  * Injected at the end of <body>. Reports the frame document's height to the
@@ -84,6 +112,11 @@ const RESIZE_SCRIPT = `
 })()
 `
 
+/** Serialized controller invocation — the frame's find machinery. */
+const FIND_SCRIPT = `(${emailFindController.toString()})(${JSON.stringify(
+  findControllerParams()
+)});`
+
 function readHostToken(name: string): string {
   if (typeof window === "undefined") return ""
   return window
@@ -117,15 +150,21 @@ function useIsDarkTheme(): boolean {
 
 /**
  * Compose the frame document: sanitized content + theme values read from
- * the host tokens at build time + base typography + the resize reporter.
- * Fallback colors only apply where tokens are unreadable (tests/SSR); in
- * the app the host document always defines them.
+ * the host tokens at build time + base typography + the resize reporter
+ * (+ the find controller for message frames). Fallback colors only apply
+ * where tokens are unreadable (tests/SSR); in the app the host document
+ * always defines them.
  */
-function buildFrameDocument(html: string, isDark: boolean): string {
+function buildFrameDocument(
+  html: string,
+  isDark: boolean,
+  monospace: boolean
+): string {
   const background = readHostToken("--background") || "#ffffff"
   const foreground = readHostToken("--foreground") || "#1f2328"
-  const fontFamily =
-    readHostToken("--font-sans") || "'Inter Variable', sans-serif"
+  const fontFamily = monospace
+    ? readHostToken("--font-mono") || "ui-monospace, SFMono-Regular, monospace"
+    : readHostToken("--font-sans") || "'Inter Variable', sans-serif"
   const colorScheme = isDark ? "dark" : "light"
   return [
     '<!doctype html><html><head><meta charset="utf-8"><style>',
@@ -143,11 +182,14 @@ function buildFrameDocument(html: string, isDark: boolean): string {
     "img { max-width: 100%; height: auto; }",
     // Marker emitted by renderPlainTextAsHtml (services/renderer/plain-text).
     "[data-emailer-plaintext] { white-space: pre-wrap; }",
+    FIND_MARK_CSS,
     "</style></head><body>",
     html,
     "<script>",
     RESIZE_SCRIPT,
-    "</script></body></html>",
+    "</script>",
+    monospace ? "" : `<script>${FIND_SCRIPT}</script>`,
+    "</body></html>",
   ].join("")
 }
 
@@ -172,31 +214,88 @@ export interface SafeEmailFrameProps {
   html: string
   /** Extra classes for the iframe element (layout/spacing only). */
   className?: string
+  /**
+   * "message" (default) renders email content and joins the find-in-
+   * message session (task 1.1) when one is provided above. "source"
+   * (task 1.2) renders already-escaped raw text inert — monospace, no
+   * HTML execution, no remote loads, and deliberately NO find controller
+   * (the source dialog is not part of the reading pane's session).
+   */
+  variant?: "message" | "source"
 }
 
-export function SafeEmailFrame({ html, className }: SafeEmailFrameProps) {
+export function SafeEmailFrame({
+  html,
+  className,
+  variant = "message",
+}: SafeEmailFrameProps) {
   // Key the content component by html: a body change remounts the frame, so
   // height restarts at the floor and the freshly loaded document reports its
   // real height through the injected reporter — no stale sizing, no
   // setState-in-effect cascades.
-  return <FrameContent key={html} html={html} className={className} />
+  return (
+    <FrameContent
+      key={html}
+      html={html}
+      className={className}
+      variant={variant}
+    />
+  )
 }
 
-function FrameContent({ html, className }: SafeEmailFrameProps) {
+function FrameContent({
+  html,
+  className,
+  variant,
+}: SafeEmailFrameProps & { variant: "message" | "source" }) {
   const frameRef = useRef<HTMLIFrameElement>(null)
   const [height, setHeight] = useState(MIN_EMAIL_FRAME_HEIGHT)
   // The host theme is a memo input: a light/dark flip rebuilds srcDoc so
   // the injected token values (text/background colors) never go stale.
   const isDark = useIsDarkTheme()
+  // The thread's find session, when the frame is part of the reading pane
+  // (context is null in popouts and the source dialog → no find support).
+  const session = useContext(FindSessionContext)
+  const monospace = variant === "source"
+  const findEnabled = variant === "message" && session !== null
+  const findSessionRef = useRef(session)
+  const frameIdRef = useRef<string | null>(null)
 
   const srcDoc = useMemo(
     () =>
       buildFrameDocument(
         sanitizeEmailHtml(html, { blockRemoteImages: false }),
-        isDark
+        isDark,
+        monospace
       ),
-    [html, isDark]
+    [html, isDark, monospace]
   )
+
+  // Join the find session for the frame's lifetime: the handle posts
+  // commands into THIS frame's contentWindow; the id correlates the
+  // frame's reports back to its count slot (insertion order = document
+  // order, which is the global match order). srcDoc is a dependency on
+  // purpose: a theme flip rebuilds the frame document, the reload wipes
+  // the frame controller's marks and seq state, and re-running the effect
+  // re-registers — registerFrame posts the live round's term to a frame
+  // joining an open round, so the fresh document re-joins mid-search.
+  // The cleanup unregisters exactly the previous id once per cycle, so
+  // the session never double-counts the frame.
+  useEffect(() => {
+    if (!findEnabled || !session) return
+    const frame = frameRef.current
+    if (!frame) return
+    const id = session.registerFrame({
+      post: (command) => {
+        frame.contentWindow?.postMessage(command, "*")
+      },
+    })
+    frameIdRef.current = id
+    return () => {
+      frameIdRef.current = null
+      session.unregisterFrame(id)
+    }
+  }, [findEnabled, session, srcDoc])
 
   // Single listener for the frame's lifetime: the iframe element (and thus
   // contentWindow) survives html-prop changes, only its document reloads.
@@ -207,13 +306,30 @@ function FrameContent({ html, className }: SafeEmailFrameProps) {
       // filtered by identity, not by content.
       const frame = frameRef.current
       if (!frame || event.source !== frame.contentWindow) return
-      if (!isResizeMessage(event.data)) return
-      setHeight(
-        Math.min(
-          Math.max(Math.ceil(event.data.height), MIN_EMAIL_FRAME_HEIGHT),
-          MAX_EMAIL_FRAME_HEIGHT
+      if (isResizeMessage(event.data)) {
+        setHeight(
+          Math.min(
+            Math.max(Math.ceil(event.data.height), MIN_EMAIL_FRAME_HEIGHT),
+            MAX_EMAIL_FRAME_HEIGHT
+          )
         )
-      )
+        return
+      }
+      // Find traffic (task 1.1): reports aggregate into the session, key
+      // requests reach the reading pane's open/escape hooks.
+      if (!findSessionRef.current) return
+      if (isFindFrameState(event.data)) {
+        const id = frameIdRef.current
+        if (id !== null) findSessionRef.current.handleFrameState(id, event.data)
+        return
+      }
+      if (isFindFrameRequest(event.data)) {
+        if (event.data.type === EMAILER_FIND_OPEN_TYPE) {
+          findSessionRef.current.openRequest()
+        } else {
+          findSessionRef.current.escapeRequest()
+        }
+      }
     }
     window.addEventListener("message", onMessage)
     return () => window.removeEventListener("message", onMessage)

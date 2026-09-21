@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import { ProviderIcon } from "@/components/providers/provider-icon"
 import { providerBrandName } from "@/components/providers/provider-brands"
+import { ProfilesEditor } from "@/components/settings/profiles-editor"
 import { brandForAccount } from "@/services/account-flows"
 import type { AccountInfo } from "@/stores/account-store"
 import { useAccountStore } from "@/stores/account-store"
@@ -21,6 +22,11 @@ import { useAccountStore } from "@/stores/account-store"
  * dialog) plus Re-authenticate for accounts paused as auth-error. All
  * three dialogs are reused as-is from components/accounts; this section
  * only hosts them, exactly like the switcher does.
+ *
+ * Below the account list sits the Profiles editor (parity-round-2 task
+ * 4.4, design D10): named local account groups with colors and per-account
+ * overrides — a self-contained sub-section (./profiles-editor) so the
+ * account rows above stay untouched.
  */
 
 function AccountRow({
@@ -117,6 +123,10 @@ export function AccountsSection() {
           ))}
         </div>
       )}
+      {/* Profiles editor (parity-round-2 task 4.4): the named account
+          groups with colors/overrides — self-contained sub-section. */}
+      <Separator />
+      <ProfilesEditor />
       {/* Shared account dialogs (5.3–5.6), keyed by target like the
           switcher: every open remounts a fresh dialog instance. Keys are
           prefixed per dialog so two dialogs open on the same account never

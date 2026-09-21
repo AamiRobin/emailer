@@ -31,6 +31,7 @@ export const ACCENTS: readonly Accent[] = [
   { id: "orange", name: "Orange" },
   { id: "rose", name: "Rose" },
   { id: "teal", name: "Teal" },
+  { id: "cyan", name: "Cyan" },
 ]
 
 function isAccentId(value: string): boolean {

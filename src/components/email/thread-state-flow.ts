@@ -3,6 +3,7 @@ import { toast } from "sonner"
 import { refreshThreadList } from "@/stores/thread-list-store"
 import { useAccountStore } from "@/stores/account-store"
 import { useFolderCountsStore } from "@/stores/folder-counts-store"
+import { broadcastThreadChange } from "@/services/desktop/popout"
 import {
   markThreadDone,
   muteThread,
@@ -113,5 +114,12 @@ export async function applyThreadStatesWithRefresh(
     refreshes.push(useAccountStore.getState().refreshUnreadCounts())
   }
   await Promise.all(refreshes)
+  // Cross-window bridge (task 1.9): local-only states still move threads
+  // between views, so pop-outs and the main window converge on the change.
+  void broadcastThreadChange({
+    action: "thread_state",
+    accountId: null,
+    threadIds,
+  })
   return true
 }

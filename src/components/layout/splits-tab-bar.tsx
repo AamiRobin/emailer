@@ -6,6 +6,7 @@ import {
   EllipsisVertical,
   EyeOff,
   Eye,
+  Inbox,
   Settings2,
   Trash2,
 } from "lucide-react"
@@ -36,9 +37,27 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import type { Category } from "@/services/categorization/classify"
 import type { SplitConfig } from "@/services/settings/splits"
 import { useAccountStore } from "@/stores/account-store"
+import {
+  refreshThreadList,
+  useThreadListStore,
+} from "@/stores/thread-list-store"
 import { useUiStore } from "@/stores/ui-store"
+import { CategoryBackfillStatus } from "./category-backfill-status"
+import {
+  CATEGORIES,
+  CATEGORY_LABELS,
+  categorizeExistingMail,
+  enterCategory,
+  leaveCategory,
+  notifyCategoryMailChanged,
+  registerCategoryListRefresh,
+  setCategoryTabsEnabled,
+  useCategoriesEnabled,
+  useCategoryCounts,
+} from "./use-categories"
 import {
   createSplitWithToast,
   deleteSplitById,
@@ -51,17 +70,137 @@ import {
 } from "./use-splits"
 
 /**
- * The splits tab bar (task 9.3, mailbox-ui spec "Split inbox tabs"): one
- * tab per visible split, mounted above the thread list. A tab shows the
- * split's name and its thread count (countThreadsForQuery — the exact
- * search pipeline, see useSplitCounts for liveness); clicking enters the
- * split's list scope (ui-store setListScope, design D4), clicking the
+ * The mailbox tab bar: the category tabs (task 3.5, mailbox-ui spec
+ * "Category tab presentation") followed by the splits tabs (task 9.3,
+ * same spec "Split inbox tabs") — one row, categories ordered FIRST per
+ * the spec, Primary visually default while no category scope is active.
+ * A category tab shows its display name and its UNREAD count (the spec's
+ * "unread counts per category"; the total rides in the tooltip), and
+ * clicking enters that category's list scope (ui-store setListScope,
+ * design D4 — the exact split-tab sequence via use-categories.ts);
+ * clicking the active tab again leaves it. The row is hideable through
+ * `organization.categoriesEnabled` (default off — the bar then shows only
+ * the user's split tabs), the trailing category menu offers "Categorize
+ * existing mail…" (launches the backfill) and "Hide category tabs", and
+ * the backfill's progress surface (CategoryBackfillStatus) renders under
+ * the row while a job is in flight. Split tabs are unchanged by all of
+ * this — see their original docstring below.
+ *
+ * The splits half (task 9.3, mailbox-ui spec "Split inbox tabs"): one tab
+ * per visible split, each showing the split's name and its thread count
+ * (countThreadsForQuery — the exact search pipeline, see useSplitCounts
+ * for liveness); clicking enters the split's list scope, clicking the
  * active tab again leaves it. Each tab carries a menu (move left/right,
  * hide, delete); the trailing "+" opens the create dialog (name, operator
  * query, optional account pin) and a manage dialog that lists hidden
  * splits for unhide/delete. Splits are local config — deleting one never
  * touches mail.
  */
+
+// Category tab wiring (task 3.5): this module owns the thread-list store
+// connection the settings-safe use-categories module plugs into (the
+// design D11 lazy-load guard keeps crypto/pgp-transform out of the
+// settings graph, so use-categories must not import the list store
+// statically). Registered once at import: scope flips and the backfill's
+// done-summary refresh the list through here, and every list reload (the
+// post-action refresh) tells the counts hook to re-read its grouped
+// COUNT.
+registerCategoryListRefresh(refreshThreadList)
+useThreadListStore.subscribe((state, previous) => {
+  if (state.threads !== previous.threads) notifyCategoryMailChanged()
+})
+
+/**
+ * One category tab (task 3.5): display name + UNREAD count badge (the
+ * spec's "unread counts per category"; the total lives in the tooltip),
+ * split-tab styling. Active is the scoped category — Primary when NO
+ * category scope is active (the spec's "Primary SHALL be the default
+ * tab"). Clicking enters the category's list scope; clicking the active
+ * tab again leaves it (the split-tab contract).
+ */
+function CategoryTab({
+  category,
+  active,
+  unread,
+  total,
+}: {
+  category: Category
+  active: boolean
+  unread: number
+  total: number
+}) {
+  const label = CATEGORY_LABELS[category]
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      data-testid="category-tab"
+      data-category={category}
+      title={`${label} — ${total} ${total === 1 ? "thread" : "threads"}`}
+      className={cn(
+        "flex min-w-0 items-center gap-1.5 rounded-md py-1 ps-2.5 pe-2 text-sm",
+        active ? "bg-muted text-foreground" : "hover:bg-accent/50"
+      )}
+      onClick={() => {
+        if (active) {
+          void leaveCategory()
+        } else {
+          void enterCategory(category)
+        }
+      }}
+    >
+      <span className="max-w-40 truncate">{label}</span>
+      <span
+        data-testid="category-tab-count"
+        className={cn(
+          "rounded-full px-1.5 text-xs font-medium text-muted-foreground tabular-nums",
+          active ? "bg-background" : "bg-muted"
+        )}
+      >
+        {unread}
+      </span>
+    </button>
+  )
+}
+
+/**
+ * The category row's trailing menu (task 3.5): the on-demand
+ * back-categorization launch (mail-organization spec "the user enables
+ * categories and chooses to categorize existing mail" — the progress is
+ * the status row under the bar) and the row's hide affordance (the same
+ * `organization.categoriesEnabled` flag the settings section owns;
+ * disabling returns the bar to splits-only and leaves the list alone).
+ */
+function CategoryTabsMenu() {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Category options"
+            title="Category options"
+          >
+            <EllipsisVertical />
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="start">
+        <DropdownMenuItem onClick={() => void categorizeExistingMail()}>
+          <Inbox aria-hidden />
+          Categorize existing mail…
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => void setCategoryTabsEnabled(false)}>
+          <EyeOff aria-hidden />
+          Hide category tabs
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
 
 function SplitTabMenu({ split }: { split: SplitConfig }) {
   return (
@@ -367,6 +506,8 @@ function ManageSplitsDialog({
 export function SplitsTabBar() {
   const splits = useSplits()
   const listScope = useUiStore((state) => state.listScope)
+  const categoriesEnabled = useCategoriesEnabled()
+  const categoryCounts = useCategoryCounts()
   const visible = useMemo(
     () => splits.filter((split) => !split.hidden),
     [splits]
@@ -374,15 +515,39 @@ export function SplitsTabBar() {
   const hidden = useMemo(() => splits.filter((split) => split.hidden), [splits])
   const counts = useSplitCounts(visible)
   const [dialog, setDialog] = useState<"create" | "manage" | null>(null)
+  // The scoped category, or null while the bar shows the default state
+  // (Primary tab active, underlying view list untouched).
+  const activeCategory =
+    listScope?.kind === "category" ? listScope.category : null
 
   return (
     <>
       <div
         role="tablist"
-        aria-label="Splits"
+        aria-label="Mailbox tabs"
         data-testid="splits-tab-bar"
         className="flex items-center gap-0.5 border-b px-2 pb-1"
       >
+        {/* Category tabs (task 3.5): ordered FIRST, before the splits, per
+            the spec — rendered only while the row is enabled. */}
+        {categoriesEnabled && (
+          <>
+            {CATEGORIES.map((category) => (
+              <CategoryTab
+                key={category}
+                category={category}
+                active={
+                  activeCategory === null
+                    ? category === "primary"
+                    : activeCategory === category
+                }
+                unread={categoryCounts[category]?.unread ?? 0}
+                total={categoryCounts[category]?.total ?? 0}
+              />
+            ))}
+            <CategoryTabsMenu />
+          </>
+        )}
         {visible.map((split) => {
           const active =
             listScope?.kind === "split" && listScope.name === split.name
@@ -420,6 +585,9 @@ export function SplitsTabBar() {
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+      {/* Backfill progress (task 3.5): a status line under the tab row
+          while the categorization job runs; renders nothing otherwise. */}
+      {categoriesEnabled && <CategoryBackfillStatus />}
       {/* Remounted on every open so the forms always start fresh. */}
       {dialog === "create" && (
         <CreateSplitDialog
