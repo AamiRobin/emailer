@@ -713,20 +713,31 @@ export function MailShell({
 }
 
 /**
- * The centered composer's draggable card: the floating card can be moved
- * by its header strip (the row carrying data-composer-drag-handle inside
- * the composer surface — buttons and fields inside it are excluded), so
+ * The centered composer's draggable, resizable card: the floating card can
+ * be moved by its header strip (the row carrying data-composer-drag-handle
+ * inside the composer surface — buttons and fields inside it are excluded)
+ * and resized from its right/bottom edges and the bottom-right corner, so
  * the user can park it beside the thread they are reading while the
- * mailbox behind stays interactive. Pointer capture keeps the drag alive
- * over the click-through overlay; the offset clamps to the viewport so
- * the card can never be dropped off-screen; double-click on the header
- * snaps it back to center. State is deliberately component-local — the
- * card unmounts with the overlay when the composer closes, which is the
- * reset, while a minimize (the overlay stays mounted behind display:
- * none) keeps the parked position.
+ * mailbox behind stays interactive. Pointer capture keeps both gestures
+ * alive over the click-through overlay; the offset clamps to the viewport
+ * so the card can never be dropped off-screen; resizing anchors the
+ * top-left corner (compensating the flex centering through the same
+ * translate offset the drag uses); double-click on the header snaps it
+ * back to center. State is deliberately component-local — the card
+ * unmounts with the overlay when the composer closes, which is the reset,
+ * while a minimize (the overlay stays mounted behind display: none) keeps
+ * the parked position and size.
  */
+type ResizeDirection = "right" | "bottom" | "corner"
+
+const COMPOSER_MIN_WIDTH = 420
+const COMPOSER_MIN_HEIGHT = 340
+
 function CenteredComposerCard({ children }: { children: ReactNode }) {
   const [offset, setOffset] = useState<{ x: number; y: number } | null>(null)
+  const [size, setSize] = useState<{ width: number; height: number } | null>(
+    null
+  )
   const cardRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<{
     pointerId: number
@@ -738,6 +749,18 @@ function CenteredComposerCard({ children }: { children: ReactNode }) {
     top: number
     width: number
     height: number
+  } | null>(null)
+  const resizeRef = useRef<{
+    direction: ResizeDirection
+    pointerId: number
+    startX: number
+    startY: number
+    baseWidth: number
+    baseHeight: number
+    left: number
+    top: number
+    baseOffsetX: number
+    baseOffsetY: number
   } | null>(null)
 
   const isHandleTarget = (target: EventTarget | null): boolean =>
@@ -771,43 +794,112 @@ function CenteredComposerCard({ children }: { children: ReactNode }) {
 
   function onPointerMove(event: ReactPointerEvent<HTMLDivElement>): void {
     const drag = dragRef.current
-    if (!drag || drag.pointerId !== event.pointerId) return
-    // Clamp to the viewport (16px gutter): the dragged card stays fully
-    // reachable — a card wider/taller than the window degrades to the
-    // gutter edge on that axis.
+    if (drag) {
+      if (drag.pointerId !== event.pointerId) return
+      // Clamp to the viewport (16px gutter): the dragged card stays fully
+      // reachable — a card wider/taller than the window degrades to the
+      // gutter edge on that axis.
+      const gutter = 16
+      const vw = window.innerWidth
+      const vh = window.innerHeight
+      const nx = Math.min(
+        Math.max(
+          drag.baseX + (event.clientX - drag.startX),
+          drag.baseX + gutter - drag.left
+        ),
+        drag.baseX + vw - gutter - drag.left - drag.width
+      )
+      const ny = Math.min(
+        Math.max(
+          drag.baseY + (event.clientY - drag.startY),
+          drag.baseY + gutter - drag.top
+        ),
+        drag.baseY + vh - gutter - drag.top - drag.height
+      )
+      setOffset({ x: nx, y: ny })
+      return
+    }
+    const resize = resizeRef.current
+    if (!resize || resize.pointerId !== event.pointerId) return
     const gutter = 16
     const vw = window.innerWidth
     const vh = window.innerHeight
-    const nx = Math.min(
-      Math.max(
-        drag.baseX + (event.clientX - drag.startX),
-        drag.baseX + gutter - drag.left
-      ),
-      drag.baseX + vw - gutter - drag.left - drag.width
+    // Width/height follow the pointer, clamped to a usable minimum and to
+    // the viewport from where the top-left corner sits (the resize anchors
+    // that corner, so the bottom-right edge is the viewport limit).
+    const maxWidth = Math.max(
+      COMPOSER_MIN_WIDTH,
+      vw - gutter - resize.left
     )
-    const ny = Math.min(
-      Math.max(
-        drag.baseY + (event.clientY - drag.startY),
-        drag.baseY + gutter - drag.top
-      ),
-      drag.baseY + vh - gutter - drag.top - drag.height
+    const maxHeight = Math.max(
+      COMPOSER_MIN_HEIGHT,
+      vh - gutter - resize.top
     )
-    setOffset({ x: nx, y: ny })
+    const growX = resize.direction === "bottom" ? 0 : event.clientX - resize.startX
+    const growY = resize.direction === "right" ? 0 : event.clientY - resize.startY
+    const width = Math.min(
+      Math.max(resize.baseWidth + growX, COMPOSER_MIN_WIDTH),
+      maxWidth
+    )
+    const height = Math.min(
+      Math.max(resize.baseHeight + growY, COMPOSER_MIN_HEIGHT),
+      maxHeight
+    )
+    setSize({ width, height })
+    // The card is flex-centered, so growing it would otherwise grow both
+    // edges; shift the translate offset by half the delta to anchor the
+    // top-left corner where the user grabbed the edge.
+    setOffset({
+      x: resize.baseOffsetX + (width - resize.baseWidth) / 2,
+      y: resize.baseOffsetY + (height - resize.baseHeight) / 2,
+    })
   }
 
   function onPointerUp(event: ReactPointerEvent<HTMLDivElement>): void {
-    if (dragRef.current?.pointerId !== event.pointerId) return
-    dragRef.current = null
+    if (dragRef.current?.pointerId === event.pointerId) dragRef.current = null
+    if (resizeRef.current?.pointerId === event.pointerId) resizeRef.current = null
+  }
+
+  function onResizePointerDown(
+    event: ReactPointerEvent<HTMLDivElement>
+  ): void {
+    if (event.button !== 0) return
+    const direction = event.currentTarget.dataset.resizeDirection
+    if (direction !== "right" && direction !== "bottom" && direction !== "corner")
+      return
+    const card = cardRef.current
+    if (!card) return
+    const rect = card.getBoundingClientRect()
+    const current = offset ?? { x: 0, y: 0 }
+    resizeRef.current = {
+      direction,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      baseWidth: rect.width,
+      baseHeight: rect.height,
+      left: rect.left,
+      top: rect.top,
+      baseOffsetX: current.x,
+      baseOffsetY: current.y,
+    }
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
   }
 
   return (
     <div
       ref={cardRef}
       data-testid="composer-card"
-      className="pointer-events-auto flex h-[85vh] max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border bg-background shadow-2xl"
-      style={
-        offset ? { transform: `translate(${offset.x}px, ${offset.y}px)` } : undefined
+      className={
+        size
+          ? "pointer-events-auto relative flex flex-col overflow-hidden rounded-xl border bg-background shadow-2xl"
+          : "pointer-events-auto relative flex h-[85vh] max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border bg-background shadow-2xl"
       }
+      style={{
+        ...(size ? { width: size.width, height: size.height } : {}),
+        ...(offset ? { transform: `translate(${offset.x}px, ${offset.y}px)` } : {}),
+      }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -817,6 +909,30 @@ function CenteredComposerCard({ children }: { children: ReactNode }) {
       }}
     >
       {children}
+      {/* Resize affordances (pointer-only, aria-hidden): right edge, bottom
+          edge and the bottom-right corner. The edge handles stop short of
+          the rounded corners so the window border stays clean. */}
+      <div
+        aria-hidden="true"
+        data-testid="composer-resize-right"
+        data-resize-direction="right"
+        onPointerDown={onResizePointerDown}
+        className="absolute bottom-5 right-0 top-10 w-1.5 cursor-ew-resize touch-none"
+      />
+      <div
+        aria-hidden="true"
+        data-testid="composer-resize-bottom"
+        data-resize-direction="bottom"
+        onPointerDown={onResizePointerDown}
+        className="absolute bottom-0 left-10 right-5 h-1.5 cursor-ns-resize touch-none"
+      />
+      <div
+        aria-hidden="true"
+        data-testid="composer-resize-corner"
+        data-resize-direction="corner"
+        onPointerDown={onResizePointerDown}
+        className="absolute bottom-0 right-0 size-5 cursor-nwse-resize touch-none"
+      />
     </div>
   )
 }
