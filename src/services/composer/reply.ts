@@ -291,9 +291,20 @@ function joinSections(sections: string[]): string {
 }
 
 /**
+ * The empty paragraph every reply/forward body starts with — the caret
+ * line. It sits above the signature block so the composer can drop the
+ * selection here on open (batch C2 follow-up: "cursor above the
+ * signature"), and typing before sending never merges into the signature
+ * or the quote below.
+ */
+const REPLY_CARET_LINE = "<p></p>"
+
+/**
  * Build a reply prefill. Recipients per the spec (see module docstring);
- * subject "Re: <original>"; body = signature above the quoted history
- * (the new-message body starts empty — the user types above the quote).
+ * subject "Re: <original>"; body = caret line, signature, quoted history —
+ * the leading empty paragraph is where the caret lands on open (above the
+ * signature, so the user's first keystroke never lands inside the
+ * signature block); the new-message body starts empty.
  */
 export function buildReply(input: BuildReplyInput): ComposerPrefill {
   const { message, thread, account, replyAll, signatureHtml } = input
@@ -345,7 +356,11 @@ export function buildReply(input: BuildReplyInput): ComposerPrefill {
     to,
     cc,
     subject: ensureSubjectPrefix(message.subject ?? "", "Re:"),
-    html: joinSections([appendSignature("", signatureHtml ?? ""), quotedHtml]),
+    html: joinSections([
+      REPLY_CARET_LINE,
+      appendSignature("", signatureHtml ?? ""),
+      quotedHtml,
+    ]),
   }
 }
 
@@ -370,6 +385,10 @@ export function buildForward(input: BuildForwardInput): ComposerPrefill {
     to: [],
     cc: [],
     subject: ensureSubjectPrefix(message.subject ?? "", "Fwd:"),
-    html: joinSections([appendSignature("", signatureHtml ?? ""), quotedHtml]),
+    html: joinSections([
+      REPLY_CARET_LINE,
+      appendSignature("", signatureHtml ?? ""),
+      quotedHtml,
+    ]),
   }
 }

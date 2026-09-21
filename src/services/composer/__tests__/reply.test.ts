@@ -324,7 +324,8 @@ describe("buildReply", () => {
     expect(quote).toContain(
       "<blockquote><p>Original message text</p></blockquote>"
     )
-    expect(prefill.html).toBe(quote)
+    // The body is the caret line, one blank separator, then the quote.
+    expect(prefill.html).toBe(`<p></p><p><br></p>${quote}`)
   })
 
   it("quotes a plain-text original escaped and pre-wrap marked", () => {
@@ -364,9 +365,11 @@ describe("buildReply", () => {
     const quoteIndex = prefill.html.indexOf("<blockquote")
     expect(signatureIndex).toBeGreaterThan(-1)
     expect(signatureIndex).toBeLessThan(quoteIndex)
-    // fresh reply: nothing before the signature
-    expect(prefill.html.startsWith('<div class="emailer-signature">')).toBe(
-      true
+    // fresh reply: only the caret line sits before the signature — the
+    // empty paragraph the composer drops the selection into on open.
+    expect(prefill.html.startsWith("<p></p>")).toBe(true)
+    expect(prefill.html.indexOf("emailer-signature")).toBeGreaterThan(
+      "<p></p>".length
     )
     expect(prefill.html).toContain("Best, Me")
   })

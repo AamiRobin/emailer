@@ -1218,14 +1218,6 @@ function ComposerView() {
     })
   }
 
-  useEffect(() => {
-    // Spec: a new compose opens with focus in the To field. Reply/forward
-    // (8.4) pre-address the message, so body focus is their call.
-    if (mode.kind === "new") {
-      toInputRef.current?.focus()
-    }
-  }, [mode])
-
   // ---- Snippets (task 6.2) ----
 
   // Loaded once per open; the same rows feed the toolbar picker (state)
@@ -1358,7 +1350,24 @@ function ComposerView() {
       },
     },
     onUpdate: ({ editor: current }) => setHtml(current.getHTML()),
+    // Reply/forward caret placement (batch C2 follow-up): the prefill is
+    // [caret line][signature][quote], so on open the selection belongs on
+    // the empty first line — the user's first keystroke lands in their own
+    // paragraph, not the signature. onCreate is the first point where the
+    // command surface is live; running this in a render effect crashes
+    // (commands reads a dispatcher that is still null during mount).
+    onCreate: ({ editor: readyEditor }) => {
+      if (mode.kind !== "new") readyEditor.commands.focus("start")
+    },
   })
+
+  useEffect(() => {
+    // Spec: a new compose opens with focus in the To field. (Reply/forward
+    // are pre-addressed; their body caret is placed in onCreate above.)
+    if (mode.kind === "new") {
+      toInputRef.current?.focus()
+    }
+  }, [mode])
 
   /**
    * Signature selection write path (fix 3): swap the managed signature
