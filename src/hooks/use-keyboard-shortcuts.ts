@@ -16,6 +16,7 @@ import {
 import { getExecutor } from "@/services/db/executor"
 import type { SqlExecutor } from "@/services/db/executor"
 import type { ThreadRow } from "@/services/db/threads"
+import { setSidebarCollapsedWithPersist } from "@/services/settings/preferences"
 import { triggerRefresh } from "@/services/sync/scheduler"
 import { printThread } from "@/services/renderer/print"
 import { useAccountStore } from "@/stores/account-store"
@@ -538,6 +539,14 @@ export function useKeyboardShortcuts({
           void triggerRefresh().catch((error) => {
             console.warn("[use-keyboard-shortcuts] refresh failed", error)
           })
+          return
+        }
+        case "toggle-sidebar": {
+          event.preventDefault()
+          setSidebarCollapsedWithPersist(
+            getExecutor(),
+            !useUiStore.getState().sidebarCollapsed
+          )
           return
         }
         case "print-thread": {

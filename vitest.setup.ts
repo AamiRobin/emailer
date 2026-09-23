@@ -44,3 +44,16 @@ if (typeof Node !== "undefined" && typeof Document !== "undefined") {
     Range.prototype.getBoundingClientRect = zeroRect
   }
 }
+
+// jsdom's default innerWidth (1024) sits under the shell's 1200px
+// auto-rail threshold, so every MailShell mount would collapse the
+// sidebar and derail the desktop-mode assertions. Default tests to a
+// desktop-size window; the narrow-window suites override innerWidth
+// per test (configurable + writable, see the auto-rail describe).
+if (typeof window !== "undefined") {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: 1440,
+  })
+}

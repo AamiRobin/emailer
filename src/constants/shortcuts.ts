@@ -44,6 +44,7 @@ export type ShortcutId =
   | "palette"
   | "help"
   | "dismiss"
+  | "toggle-sidebar"
 
 export interface ShortcutBinding {
   /** Stable id — also the handler-map key in useKeyboardShortcuts. */
@@ -186,6 +187,12 @@ export const SHORTCUTS: ReadonlyArray<ShortcutBinding> = [
     id: "help",
     keys: "?",
     description: "Show this shortcuts reference",
+    group: "general",
+  },
+  {
+    id: "toggle-sidebar",
+    keys: "Cmd/Ctrl+\\",
+    description: "Collapse or expand the sidebar",
     group: "general",
   },
   {

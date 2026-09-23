@@ -616,6 +616,34 @@ describe("useKeyboardShortcuts — palette, help, refresh", () => {
   })
 })
 
+describe("useKeyboardShortcuts — toggle-sidebar", () => {
+  it("Cmd/Ctrl+\\ flips the sidebar flag both ways (Cmd and Ctrl aliases)", () => {
+    renderHarness()
+    press("\\", { ctrlKey: true })
+    expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+    press("\\", { ctrlKey: true })
+    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+    press("\\", { metaKey: true })
+    expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+  })
+
+  it("auto-repeat does not keep flipping the sidebar", () => {
+    renderHarness()
+    press("\\", { ctrlKey: true, repeat: true })
+    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+  })
+
+  it("does not fire while a modal dialog is open", () => {
+    renderHarness()
+    const dialog = document.createElement("div")
+    dialog.setAttribute("role", "dialog")
+    document.body.appendChild(dialog)
+    press("\\", { ctrlKey: true })
+    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+    dialog.remove()
+  })
+})
+
 /**
  * Effective bindings (task 20.1, design D15): the hook matches keydowns
  * against defaults merged with the persisted overrides (the shared

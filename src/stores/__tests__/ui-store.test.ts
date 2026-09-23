@@ -50,13 +50,11 @@ describe("ui store", () => {
     expect(viewDisplayName(views[5])).toBe("Settings")
   })
 
-  it("toggleSidebar flips the flag and setSidebarCollapsed sets it", () => {
-    useUiStore.getState().toggleSidebar()
-    expect(useUiStore.getState().sidebarCollapsed).toBe(true)
-    useUiStore.getState().toggleSidebar()
-    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+  it("setSidebarCollapsed sets the flag", () => {
     useUiStore.getState().setSidebarCollapsed(true)
     expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+    useUiStore.getState().setSidebarCollapsed(false)
+    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
   })
 
   it("setComposerOpen tracks the requested state", () => {

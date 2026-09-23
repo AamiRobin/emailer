@@ -28,8 +28,11 @@ import type { SqlExecutor } from "@/services/db/executor"
  * node:sqlite executor.
  */
 
-// jsdom lacks matchMedia (queried by the sonner Toaster) and
-// Element.scrollIntoView (selection scrolling in cmdk); stub both.
+// jsdom lacks matchMedia (queried by the sonner Toaster, the narrow-
+// viewport hooks, and cmdk) and Element.scrollIntoView (selection
+// scrolling in cmdk); stub both. The stub registers "change" listeners so
+// narrow-viewport tests can fire real threshold crossings.
+const matchMediaListeners = new Set<(event: unknown) => void>()
 beforeAll(() => {
   window.matchMedia ??= ((query: string) => ({
     matches: false,
@@ -37,8 +40,15 @@ beforeAll(() => {
     onchange: null,
     addListener: () => {},
     removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
+    addEventListener: (_type: string, listener: (event: unknown) => void) => {
+      matchMediaListeners.add(listener)
+    },
+    removeEventListener: (
+      _type: string,
+      listener: (event: unknown) => void
+    ) => {
+      matchMediaListeners.delete(listener)
+    },
     dispatchEvent: () => false,
   })) as unknown as typeof window.matchMedia
   Element.prototype.scrollIntoView = () => {}
@@ -515,5 +525,148 @@ describe("palette, composer and toaster mounts", () => {
       expect(restored.className).toContain("flex")
       expect(restored.className).not.toContain("hidden")
     })
+  })
+})
+
+describe("sidebar auto-rail (narrow windows)", () => {
+  // jsdom defaults to a 1440px desktop window (vitest.setup.ts); the
+  // narrow-window tests shrink it per test and always restore.
+  function setWindowWidth(width: number): void {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: width,
+    })
+  }
+
+  // The production path for a crossing is the browser firing matchMedia
+  // "change" (which useNarrowViewport listens to); simulate it after
+  // setWindowWidth moved the viewport across a threshold.
+  function fireViewportCrossing(): void {
+    for (const listener of matchMediaListeners) {
+      listener(new Event("change"))
+    }
+  }
+
+  it("a narrow window folds the sidebar to the rail at mount, without persisting it", async () => {
+    await seedMailbox()
+    setWindowWidth(1100)
+    try {
+      render(<MailShell />)
+      // The transient auto-collapse writes no settings row — the stored
+      // preference keeps whatever the user last chose explicitly.
+      await waitFor(() =>
+        expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+      )
+      const rows = await executor.select<{ value: string }>(
+        "SELECT value FROM settings WHERE key = $1",
+        ["appearance.sidebarCollapsed"]
+      )
+      expect(rows).toHaveLength(0)
+    } finally {
+      setWindowWidth(1440)
+    }
+  })
+
+  it("crossing down mid-session folds to the rail, without persisting it", async () => {
+    await seedMailbox()
+    render(<MailShell />)
+    await waitFor(() => expect(useAccountStore.getState().loaded).toBe(true))
+    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+    try {
+      setWindowWidth(1100)
+      act(() => {
+        fireViewportCrossing()
+      })
+      // The crossing itself must fold the sidebar — and being transient,
+      // it must not write the preference either.
+      expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+      const rows = await executor.select<{ value: string }>(
+        "SELECT value FROM settings WHERE key = $1",
+        ["appearance.sidebarCollapsed"]
+      )
+      expect(rows).toHaveLength(0)
+    } finally {
+      setWindowWidth(1440)
+    }
+  })
+
+  it("crossing up never auto-expands; an explicit expand persists", async () => {
+    await seedMailbox()
+    setWindowWidth(1100)
+    try {
+      render(<MailShell />)
+      await waitFor(() =>
+        expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+      )
+      // Widen past the threshold: no auto-expand (explicit gestures only).
+      setWindowWidth(1440)
+      act(() => {
+        fireViewportCrossing()
+      })
+      expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+      // The rail button is the explicit gesture: it expands and writes.
+      fireEvent.click(await screen.findByLabelText("Expand sidebar"))
+      expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+      await waitFor(async () => {
+        const rows = await executor.select<{ value: string }>(
+          "SELECT value FROM settings WHERE key = $1",
+          ["appearance.sidebarCollapsed"]
+        )
+        expect(JSON.parse(rows[0]?.value ?? "null")).toBe(false)
+      })
+    } finally {
+      setWindowWidth(1440)
+    }
+  })
+
+  it("a wide window boots expanded with no stored state", async () => {
+    await seedMailbox()
+    render(<MailShell />)
+    await waitFor(() => expect(useAccountStore.getState().loaded).toBe(true))
+    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+    // The mount-time adoption must not have written a preference either.
+    const rows = await executor.select<{ value: string }>(
+      "SELECT value FROM settings WHERE key = $1",
+      ["appearance.sidebarCollapsed"]
+    )
+    expect(rows).toHaveLength(0)
+  })
+})
+
+describe("saved panel layouts (useDefaultLayout storage)", () => {
+  const LAYOUT_KEY =
+    "react-resizable-panels:mail-right:sidebar:list:reading"
+
+  it("a corrupt localStorage entry does not crash the shell — defaults render", async () => {
+    await seedMailbox()
+    // Regression: useDefaultLayout's read path parses the stored value
+    // without a guard; the storage wrapper must sanitize first.
+    localStorage.setItem(LAYOUT_KEY, "NOT JSON{{{")
+    render(<MailShell />)
+    await waitFor(() => expect(useAccountStore.getState().loaded).toBe(true))
+    // The shell mounted and the lib applied SOME layout to the sidebar
+    // (in jsdom the zero-width group degrades to an equal split; the
+    // point is the corrupt entry degraded to defaults, not a crash).
+    const sidebar = document.getElementById("sidebar")
+    expect(sidebar).not.toBeNull()
+    expect(sidebar?.getAttribute("style")).toContain("flex")
+    // The corrupt value must not have been interpreted as a layout.
+    expect(sidebar?.getAttribute("style")).not.toContain("20")
+  })
+
+  it("a valid saved layout is restored instead of the defaults", async () => {
+    await seedMailbox()
+    localStorage.setItem(
+      LAYOUT_KEY,
+      JSON.stringify({ sidebar: 20, list: 30, reading: 50 })
+    )
+    render(<MailShell />)
+    await waitFor(() => expect(useAccountStore.getState().loaded).toBe(true))
+    const sidebar = document.getElementById("sidebar")
+    expect(sidebar).not.toBeNull()
+    expect(sidebar?.getAttribute("style")).toContain("20")
+    const list = document.getElementById("list")
+    expect(list?.getAttribute("style")).toContain("30")
   })
 })

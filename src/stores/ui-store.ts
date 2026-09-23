@@ -213,8 +213,9 @@ interface UiState {
    * the default inbox when no non-search view was visited yet. Only
    * meaningful while view.kind === "search". */
   clearSearch: () => void
-  toggleSidebar: () => void
-  /** Direct setter for pane-resize wiring (dragging the divider in/out). */
+  /** Direct setter for pane-resize wiring (dragging the divider in/out)
+   * and the explicit collapse gestures; persistence is layered on by the
+   * preferences service's setSidebarCollapsedWithPersist. */
   setSidebarCollapsed: (collapsed: boolean) => void
   setComposerOpen: (open: boolean) => void
   setComposerMode: (mode: ComposerSizeMode) => void
@@ -271,8 +272,6 @@ export const useUiStore = create<UiState>((set) => ({
     })),
   setListScope: (listScope) => set({ listScope }),
   clearSearch: () => set((state) => ({ view: state.previousView })),
-  toggleSidebar: () =>
-    set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
   setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
   setComposerOpen: (composerOpen) => set({ composerOpen }),
   setComposerMode: (composerMode) => set({ composerMode }),

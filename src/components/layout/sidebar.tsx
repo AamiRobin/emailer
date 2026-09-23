@@ -32,7 +32,10 @@ import { LabelRowMenu } from "@/components/labels/label-row-menu"
 import { getExecutor } from "@/services/db/executor"
 import { listActiveAccounts } from "@/services/db/accounts"
 import { countNudges } from "@/services/db/nudges"
-import { getNudgeDays } from "@/services/settings/preferences"
+import {
+  getNudgeDays,
+  setSidebarCollapsedWithPersist,
+} from "@/services/settings/preferences"
 import type { LabelRow } from "@/services/db/labels"
 import { useAccountStore } from "@/stores/account-store"
 import { useFolderCountsStore } from "@/stores/folder-counts-store"
@@ -172,7 +175,6 @@ function useNudgeCount(): number {
 export function Sidebar({ isCollapsed }: SidebarProps) {
   const view = useUiStore((state) => state.view)
   const setView = useUiStore((state) => state.setView)
-  const toggleSidebar = useUiStore((state) => state.toggleSidebar)
   const activeAccountId = useAccountStore((state) => state.activeAccountId)
   // Unified inbox entry (task 9.2): the entry point for the across-
   // accounts scope. It earns its place only with 2+ ACTIVE accounts —
@@ -803,7 +805,12 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
                 variant="ghost"
                 aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
                 className={cn(!isCollapsed && "ml-auto")}
-                onClick={toggleSidebar}
+                onClick={() => {
+                  setSidebarCollapsedWithPersist(
+                    getExecutor(),
+                    !useUiStore.getState().sidebarCollapsed
+                  )
+                }}
               >
                 {isCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
               </Button>

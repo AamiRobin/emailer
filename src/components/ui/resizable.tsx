@@ -21,6 +21,57 @@ function ResizablePanel({ ...props }: ResizablePrimitive.PanelProps) {
   return <ResizablePrimitive.Panel data-slot="resizable-panel" {...props} />
 }
 
+/** localStorage-backed LayoutStorage. The try/catch keeps privacy-mode and
+ * quota errors from crashing layout saves (defaults return next boot). */
+const layoutStorage: ResizablePrimitive.LayoutStorage = {
+  getItem: (key) => {
+    try {
+      const raw = localStorage.getItem(key)
+      if (raw === null) return null
+      // useDefaultLayout parses its stored value WITHOUT a guard, so a
+      // corrupt entry would throw during render and blank the whole
+      // shell. Only hand over values shaped like a Layout
+      // ({ [panelId]: number }) — anything else degrades to defaults.
+      const parsed: unknown = JSON.parse(raw)
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        Object.values(parsed).every((value) => typeof value === "number")
+      ) {
+        return raw
+      }
+      return null
+    } catch {
+      return null
+    }
+  },
+  setItem: (key, value) => {
+    try {
+      localStorage.setItem(key, value)
+    } catch {
+      // Save dropped; the in-session layout keeps working.
+    }
+  },
+}
+
+/**
+ * Saved-layout wiring for one panel group (react-resizable-panels v4):
+ * restores the group's last user-dragged sizes at mount and saves them
+ * back on user-driven layout changes only. Imperative resizes — the
+ * sidebar rail collapse, the narrow-window auto-rail — never enter the
+ * saved layout; the collapsed state has its own preference. `panelIds`
+ * must match the panels the group renders at mount.
+ */
+export function useSavedLayout(id: string, panelIds: string[]) {
+  return ResizablePrimitive.useDefaultLayout({
+    id,
+    storage: layoutStorage,
+    panelIds,
+    onlySaveAfterUserInteractions: true,
+  })
+}
+
 function ResizableHandle({
   withHandle,
   className,

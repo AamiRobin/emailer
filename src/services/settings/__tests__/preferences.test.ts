@@ -24,6 +24,8 @@ import {
   getReadingPanePreference,
   getSendDelaySeconds,
   getThemeModePreference,
+  getSidebarCollapsedPreference,
+  SIDEBAR_AUTO_RAIL_WIDTH,
   sendDelaySettingKey,
   attachmentGuardSettingKey,
   emptySubjectGuardSettingKey,
@@ -44,6 +46,7 @@ import {
   setReadingPanePreference,
   setSendDelaySecondsPreference,
   setThemeModePreference,
+  setSidebarCollapsedPreference,
   getImapDraftsFolderOverride,
   imapDraftsFolderSettingKey,
   setImapDraftsFolderPreference,
@@ -214,6 +217,77 @@ describe("reading pane position", () => {
     )
     await applyBootPreferences(executor)
     expect(useUiStore.getState().readingPane).toBe("bottom")
+  })
+})
+
+describe("sidebar rail state", () => {
+  it("defaults to expanded and round-trips into the ui-store", async () => {
+    expect(await getSidebarCollapsedPreference(executor)).toBe(false)
+    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+
+    await setSidebarCollapsedPreference(executor, true)
+    expect(await getSidebarCollapsedPreference(executor)).toBe(true)
+    expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+
+    await setSidebarCollapsedPreference(executor, false)
+    expect(await getSidebarCollapsedPreference(executor)).toBe(false)
+    expect(useUiStore.getState().sidebarCollapsed).toBe(false)
+  })
+
+  it("falls back to expanded when the stored value is not a boolean", async () => {
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["appearance.sidebarCollapsed", JSON.stringify("yes")]
+    )
+    expect(await getSidebarCollapsedPreference(executor)).toBe(false)
+  })
+
+  it("applyBootPreferences restores the stored flag on a wide window", async () => {
+    await setSidebarCollapsedPreference(executor, true)
+    useUiStore.setState({ sidebarCollapsed: false })
+    const originalWidth = window.innerWidth
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: SIDEBAR_AUTO_RAIL_WIDTH + 100,
+    })
+    try {
+      await applyBootPreferences(executor)
+      expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: originalWidth,
+      })
+    }
+  })
+
+  it("applyBootPreferences folds a narrow window to the rail without writing it back", async () => {
+    // Stored expanded, but the window is narrow: boot shows the rail and
+    // must NOT persist the fold over the user's stored choice.
+    await executor.execute(
+      "INSERT INTO settings (key, value) VALUES ($1, $2)",
+      ["appearance.sidebarCollapsed", JSON.stringify(false)]
+    )
+    useUiStore.setState({ sidebarCollapsed: false })
+    const originalWidth = window.innerWidth
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: SIDEBAR_AUTO_RAIL_WIDTH - 100,
+    })
+    try {
+      await applyBootPreferences(executor)
+      expect(useUiStore.getState().sidebarCollapsed).toBe(true)
+      expect(await getSidebarCollapsedPreference(executor)).toBe(false)
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: originalWidth,
+      })
+    }
   })
 })
 

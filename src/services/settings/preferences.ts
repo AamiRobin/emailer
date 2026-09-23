@@ -55,6 +55,11 @@ const PREFERENCE_KEYS = {
   density: "appearance.density",
   fontScale: "appearance.fontScale",
   readingPane: "mail.readingPane",
+  /** Sidebar expanded/collapsed state (the 52px icon rail). One global
+   * boolean written only by EXPLICIT gestures (rail button, Cmd/Ctrl+\,
+   * drag-to-rail adoption) — the narrow-window auto-rail collapse is
+   * transient and deliberately never writes this key. */
+  sidebarCollapsed: "appearance.sidebarCollapsed",
   /** Composer surface size (centered card vs shell-filling full overlay).
    * One global enum string, persisted by the composer header's size
    * toggle and re-applied at boot; the same single-dial shape as
@@ -319,6 +324,60 @@ export async function setReadingPanePreference(
 ): Promise<void> {
   await setSetting(executor, PREFERENCE_KEYS.readingPane, position)
   useUiStore.getState().setReadingPane(position)
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar rail state
+// ---------------------------------------------------------------------------
+
+/** Below this viewport width the shell folds the sidebar to its icon rail
+ * regardless of the stored preference (transient auto-collapse — never
+ * written back). Lives beside the preference it governs so boot apply and
+ * the shell's resize listener share one number. */
+export const SIDEBAR_AUTO_RAIL_WIDTH = 1200
+
+/** Read the persisted sidebar state (defaults to expanded). */
+export async function getSidebarCollapsedPreference(
+  executor: SqlExecutor
+): Promise<boolean> {
+  const stored = await getSetting<unknown>(
+    executor,
+    PREFERENCE_KEYS.sidebarCollapsed,
+    false
+  )
+  return stored === true
+}
+
+/**
+ * Persist the sidebar collapsed state and push it into the ui-store via
+ * its regular setSidebarCollapsed API — the same write-and-apply path the
+ * reading pane uses. Only explicit gestures may call this (the rail
+ * button, Cmd/Ctrl+\, drag-to-rail adoption); the narrow-window auto-rail
+ * keeps its own store-only path so a transient fold never overwrites the
+ * user's chosen state.
+ */
+export async function setSidebarCollapsedPreference(
+  executor: SqlExecutor,
+  collapsed: boolean
+): Promise<void> {
+  await setSetting(executor, PREFERENCE_KEYS.sidebarCollapsed, collapsed)
+  useUiStore.getState().setSidebarCollapsed(collapsed)
+}
+
+/**
+ * Flip the sidebar locally for instant feedback, then persist — the
+ * preference setter's own store push becomes a same-value no-op. One
+ * helper for all three explicit gestures (rail button, Cmd/Ctrl+\,
+ * drag-to-rail adoption) so the persistence contract lives in one place.
+ */
+export function setSidebarCollapsedWithPersist(
+  executor: SqlExecutor,
+  collapsed: boolean
+): void {
+  useUiStore.getState().setSidebarCollapsed(collapsed)
+  void setSidebarCollapsedPreference(executor, collapsed).catch((error) => {
+    console.warn("[preferences] sidebar persist failed", error)
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,7 +1242,7 @@ export async function applyBootPreferences(
   executor: SqlExecutor
 ): Promise<void> {
   try {
-    const [density, fontScale, readingPane, composerMode, closeAction, composeShortcut] =
+    const [density, fontScale, readingPane, composerMode, closeAction, composeShortcut, sidebarCollapsed] =
       await Promise.all([
         getDensity(executor),
         getFontScale(executor),
@@ -1191,6 +1250,7 @@ export async function applyBootPreferences(
         getComposerModePreference(executor),
         getCloseAction(executor),
         getComposeShortcut(executor),
+        getSidebarCollapsedPreference(executor),
       ])
     applyDensity(density)
     applyFontScale(fontScale)
@@ -1210,6 +1270,17 @@ export async function applyBootPreferences(
     }
     if (composerMode !== useUiStore.getState().composerMode) {
       useUiStore.getState().setComposerMode(composerMode)
+    }
+    // Sidebar state: restore the stored flag, EXCEPT a narrow window folds
+    // to the rail regardless — the auto-rail is transient, so this boot
+    // fold never writes the preference back; the shell's resize listener
+    // owns narrow windows from here on.
+    {
+      const collapsed =
+        window.innerWidth < SIDEBAR_AUTO_RAIL_WIDTH ? true : sidebarCollapsed
+      if (collapsed !== useUiStore.getState().sidebarCollapsed) {
+        useUiStore.getState().setSidebarCollapsed(collapsed)
+      }
     }
     // Desktop integration: the Rust close-request handler starts from its
     // in-code default ("quit"); sync the persisted choice before the user

@@ -18,6 +18,7 @@ import {
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
+  useSavedLayout,
 } from "@/components/ui/resizable"
 import { Separator } from "@/components/ui/separator"
 import { TooltipProvider } from "@/components/ui/tooltip"
@@ -44,6 +45,7 @@ import { ThreadList } from "@/components/email/thread-list"
 // the per-step digit shortcut listener — both global, like the palette.
 import { QuickStepConfirmHost } from "@/components/email/quick-step-confirm-dialog"
 import { useQuickStepShortcuts } from "@/hooks/use-quick-step-shortcuts"
+import { useNarrowViewport } from "@/hooks/use-narrow-viewport"
 import { applyDroppedLabels, labelDropDeps } from "@/components/email/label-dnd"
 import { Toaster } from "@/components/ui/sonner"
 import { initAccountStore, useAccountStore } from "@/stores/account-store"
@@ -63,7 +65,11 @@ import {
 } from "@/services/desktop/mailto"
 import { onComposeRequest } from "@/services/desktop/tray"
 import { installThreadSyncBridge } from "@/services/desktop/thread-sync-bridge"
-import { applyBootPreferences } from "@/services/settings/preferences"
+import {
+  applyBootPreferences,
+  SIDEBAR_AUTO_RAIL_WIDTH,
+  setSidebarCollapsedWithPersist,
+} from "@/services/settings/preferences"
 import { useUiStore, viewDisplayName } from "@/stores/ui-store"
 
 interface MailShellProps {
@@ -88,12 +94,16 @@ const SettingsPage = lazy(() =>
 
 /** Width of the collapsed icon rail; also the sidebar panel's floor. */
 const SIDEBAR_RAIL_SIZE = "52px"
-// Sidebar content flips to the icon rail below the first threshold and
-// back to the full sidebar above the second; between them the previous
-// state wins (a 1% deadband, so a drag resting at the boundary cannot
-// oscillate the flag). Measured as a percentage of the group width.
-const SIDEBAR_COLLAPSE_BELOW_PCT = 15
-const SIDEBAR_EXPAND_ABOVE_PCT = 16
+// The expand threshold rides PIXELS, not percentages: the sidebar panel is
+// groupResizeBehavior="preserve-pixel-size", so its rendered pixel width —
+// not its share of the group — is the invariant that stays meaningful
+// across window sizes (a fixed 288px sidebar reads as 20% at 1440px but
+// 11% at 2560px, which would mis-derive a percentage threshold and flip
+// the flag on a mere resize). The collapse end needs no threshold: the
+// library itself snaps drags to the rail, so panel.isCollapsed() is the
+// truth. A drag resting between the rail and the threshold keeps the
+// previous state (the deadband the old percentage pair provided).
+const SIDEBAR_EXPAND_ABOVE_PX = 160
 
 /**
  * Center pane: the active view's header — title and the All/Unread filter
@@ -217,11 +227,10 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
  * re-apply the collapse state.
  */
 export function MailShell({
-  defaultLayout = [20, 32, 48],
+  defaultLayout = [16, 34, 50],
   defaultCollapsed = false,
 }: Partial<MailShellProps>) {
   const sidebarCollapsed = useUiStore((state) => state.sidebarCollapsed)
-  const setSidebarCollapsed = useUiStore((state) => state.setSidebarCollapsed)
   const readingPane = useUiStore((state) => state.readingPane)
   const composerOpen = useUiStore((state) => state.composerOpen)
   const settingsOpen = useUiStore((state) => state.view.kind === "settings")
@@ -245,6 +254,22 @@ export function MailShell({
   const composerMode = useUiStore((state) => state.composerMode)
   const [addAccountOpen, setAddAccountOpen] = useState(false)
   const panelRef = usePanelRef()
+
+  // Saved per-position layouts: the user's dragged divider sizes survive
+  // restarts (localStorage, keyed per layout); with nothing saved the
+  // panels' defaultSize props stand. Imperative collapses stay out of the
+  // saved layout — onlySaveAfterUserInteractions is set in useSavedLayout.
+  const rightSaved = useSavedLayout("mail-right", [
+    "sidebar",
+    "list",
+    "reading",
+  ])
+  const bottomSaved = useSavedLayout("mail-bottom", ["sidebar", "content"])
+  const bottomSplitSaved = useSavedLayout("mail-bottom-split", [
+    "list",
+    "reading",
+  ])
+  const hiddenSaved = useSavedLayout("mail-hidden", ["sidebar", "list"])
 
   // Drag-and-drop labeling (task 10.5): one DndContext spans the sidebar
   // (label-row drop targets) and the list (thread-row drag sources) across
@@ -283,6 +308,26 @@ export function MailShell({
       console.warn("[mail-shell] preference boot-apply skipped", error)
     }
   }, [])
+
+  // Auto-rail: below SIDEBAR_AUTO_RAIL_WIDTH the shell folds the sidebar
+  // to its icon rail — at mount and on every crossing down; crossing up
+  // never auto-expands (explicit gestures persist, transient auto rules
+  // don't — the collapse deliberately bypasses
+  // setSidebarCollapsedPreference). The narrow flag comes from the shadcn
+  // use-mobile pattern (matchMedia + useSyncExternalStore), so the fold
+  // fires on threshold crossings only — not on every resize tick — and an
+  // explicitly re-expanded sidebar survives unrelated window resizes until
+  // the threshold is crossed again. The rail's pixel width needs no
+  // babysitting here: the sidebar panel is groupResizeBehavior=
+  // "preserve-pixel-size", so the library itself holds it at 52px across
+  // window resizes.
+  const narrowWindow = useNarrowViewport(SIDEBAR_AUTO_RAIL_WIDTH)
+  useEffect(() => {
+    if (!narrowWindow) return
+    if (!useUiStore.getState().sidebarCollapsed) {
+      useUiStore.getState().setSidebarCollapsed(true)
+    }
+  }, [narrowWindow])
 
   // Tray menu (1.2): the tray's Compose item emits tray-compose from Rust
   // (which first surfaces the window); mirror the sidebar Compose click.
@@ -378,7 +423,6 @@ export function MailShell({
     []
   )
 
-  const dragLayoutRef = useRef(false)
   // Last width the user had while expanded (≥ the expand threshold); the
   // toggle-expand path targets it because expand() itself restores the
   // pre-collapse size, which for a drag-caused collapse is whatever
@@ -386,74 +430,92 @@ export function MailShell({
   // drop the panel straight back into the collapse zone.
   const lastExpandedSizeRef = useRef<string | null>(null)
 
-  // Store flag → panel size (the toggle path; a no-op when the drag path
-  // already put the panel in the target state). Re-runs on pane-position
-  // or full-pane view changes because the panel group remounts. Skipped
-  // while a drag is flipping the flag (dragLayoutRef): the imperative
-  // snap would be overwritten by the next pointer move anyway and only
-  // makes the panel flicker; onSidebarLayoutChanged snaps once settled.
+  // Store flag → panel size (the toggle path). Re-runs on pane-position
+  // or full-pane view changes because the panel group remounts. Also the
+  // DESYNC repair: when the saved layout replays a railed sidebar while
+  // the stored flag says expanded (they are written by different
+  // gestures, so they can disagree across sessions), expand() alone
+  // cannot help — with no expandToSize on record it falls back to the
+  // rail-sized minimum — so the recorded expanded width, or the layout
+  // default, is resized on right after.
   useEffect(() => {
-    if (dragLayoutRef.current) return
     const panel = panelRef.current
-    if (!panel || panel.isCollapsed() === sidebarCollapsed) return
+    if (!panel) return
     if (sidebarCollapsed) {
-      panel.collapse()
-    } else {
-      const target = lastExpandedSizeRef.current
-      if (target) {
-        panel.resize(target)
-      } else {
-        panel.expand()
-      }
+      if (!panel.isCollapsed()) panel.collapse()
+      return
     }
-  }, [panelRef, sidebarCollapsed, readingPane, fullPageOpen])
+    // Flag says expanded. Repair only when the panel is actually sitting
+    // at the rail — the library reporting it collapsed, or its rendered
+    // pixel width saying so (a boot replay of a saved railed layout
+    // restores a size a rounding step away from collapsedSize, where
+    // isCollapsed() is unreliable). A genuinely expanded panel is pixel-
+    // preservation territory: its percentage shrinking on a wide window
+    // is not drift.
+    const pixels = panel.getSize().inPixels
+    if (!panel.isCollapsed() && !(pixels > 0 && pixels < SIDEBAR_EXPAND_ABOVE_PX)) {
+      return
+    }
+    panel.expand()
+    const target =
+      lastExpandedSizeRef.current ?? `${defaultLayout[0]}%`
+    panel.resize(target)
+  }, [panelRef, sidebarCollapsed, readingPane, fullPageOpen, defaultLayout])
 
-  // Layout-path sync (both directions): every layout update re-derives the
-  // sidebar flag from the panel's rendered width, so the flip point is the
-  // same whether the sidebar's own divider or the list divider is dragged,
-  // and whether the gesture lands below the threshold in one motion or in
-  // many small steps (the library recomputes each move from the gesture's
-  // start, so per-step flag flips must not fire the imperative snap —
-  // dragLayoutRef suppresses the toggle effect until the drag settles).
-  // On settle, a panel parked between the rail and the thresholds snaps to
-  // the state the thresholds picked (rail or expanded).
+  // Layout-path sync (user gestures only): settled USER-driven layout
+  // changes (divider drag, keyboard resize) re-derive the sidebar flag
+  // from the panel's rendered state, so the flip point is the same
+  // whether the sidebar's own divider or the list divider is dragged.
+  // Everything the library fires WITHOUT a user gesture — window
+  // resizes, boot replays of the saved layout — must never own the flag:
+  // pixel-preservation makes a wide-window resize read as a shrinking
+  // percentage (flipping there would collapse — and persist — the
+  // sidebar on a mere maximize), and a boot replay can contradict the
+  // stored flag (the toggle effect above repairs that by expanding).
   const adoptSidebarLayout = useCallback(
-    (settled: boolean) => {
+    (userInteraction: boolean) => {
+      if (!userInteraction) return
       const panel = panelRef.current
       if (!panel) return
-      const size = panel.getSize().asPercentage
       const current = useUiStore.getState().sidebarCollapsed
-      const collapsed =
-        size < SIDEBAR_COLLAPSE_BELOW_PCT
-          ? true
-          : size >= SIDEBAR_EXPAND_ABOVE_PCT
-            ? false
-            : current
-      if (!collapsed && size >= SIDEBAR_EXPAND_ABOVE_PCT) {
-        lastExpandedSizeRef.current = `${size}%`
+      let collapsed = current
+      if (panel.isCollapsed()) {
+        // The library snapping to the rail is drag truth: sidebar-divider
+        // drags and list-divider push-through both land here.
+        collapsed = true
+      } else {
+        const pixels = panel.getSize().inPixels
+        if (pixels >= SIDEBAR_EXPAND_ABOVE_PX) {
+          collapsed = false
+          if (pixels > 0) {
+            lastExpandedSizeRef.current = `${pixels}px`
+          }
+        }
+        // Below the threshold: keep the current state (the deadband — a
+        // drag resting between the rail and the threshold cannot
+        // oscillate the flag).
       }
       if (collapsed !== current) {
-        if (!settled) dragLayoutRef.current = true
-        setSidebarCollapsed(collapsed)
+        setSidebarCollapsedWithPersist(getExecutor(), collapsed)
       }
-      if (settled && panel.isCollapsed() !== collapsed) {
+      if (panel.isCollapsed() !== collapsed) {
         if (collapsed) {
           panel.collapse()
         } else {
           panel.expand()
+          const target = lastExpandedSizeRef.current
+          if (target) panel.resize(target)
         }
       }
     },
-    [panelRef, setSidebarCollapsed]
+    [panelRef]
   )
-  const onSidebarLayoutChange = useCallback(
-    () => adoptSidebarLayout(false),
+  const onSidebarLayoutChanged = useCallback(
+    (_layout: unknown, meta: { isUserInteraction: boolean }) => {
+      adoptSidebarLayout(meta.isUserInteraction)
+    },
     [adoptSidebarLayout]
   )
-  const onSidebarLayoutChanged = useCallback(() => {
-    dragLayoutRef.current = false
-    adoptSidebarLayout(true)
-  }, [adoptSidebarLayout])
 
   const sidebarPane = (
     <ResizablePanel
@@ -464,6 +526,14 @@ export function MailShell({
       collapsible={true}
       minSize={SIDEBAR_RAIL_SIZE}
       maxSize="20%"
+      // Pixel-preservation is what keeps the rail a constant 52px when the
+      // window resizes around a collapsed sidebar — the library's default
+      // proportional behavior would rescale the stored percentage and
+      // render the rail wider on every widen (52px@1100 → 68px@1440). No
+      // imperative re-pin can fix that: resize()/collapse() are no-ops on
+      // an already-collapsed panel. The expanded sidebar gains the same
+      // Gmail-like fixed-width feel, still capped by maxSize.
+      groupResizeBehavior="preserve-pixel-size"
     >
       {/* Height-constrained column: without it the sidebar's h-full adds to
           the switcher + separator heights and pushes the settings footer
@@ -508,8 +578,9 @@ export function MailShell({
               key="settings"
               orientation="horizontal"
               className="min-h-0 flex-1 items-stretch"
-              onLayoutChange={onSidebarLayoutChange}
-              onLayoutChanged={onSidebarLayoutChanged}
+              onLayoutChanged={(layout, meta) =>
+                onSidebarLayoutChanged(layout, meta)
+              }
             >
               {sidebarPane}
               <ResizableHandle withHandle />
@@ -528,8 +599,9 @@ export function MailShell({
               key="contacts"
               orientation="horizontal"
               className="min-h-0 flex-1 items-stretch"
-              onLayoutChange={onSidebarLayoutChange}
-              onLayoutChanged={onSidebarLayoutChanged}
+              onLayoutChanged={(layout, meta) =>
+                onSidebarLayoutChanged(layout, meta)
+              }
             >
               {sidebarPane}
               <ResizableHandle withHandle />
@@ -547,8 +619,9 @@ export function MailShell({
               key="attachments"
               orientation="horizontal"
               className="min-h-0 flex-1 items-stretch"
-              onLayoutChange={onSidebarLayoutChange}
-              onLayoutChanged={onSidebarLayoutChanged}
+              onLayoutChanged={(layout, meta) =>
+                onSidebarLayoutChanged(layout, meta)
+              }
             >
               {sidebarPane}
               <ResizableHandle withHandle />
@@ -566,8 +639,9 @@ export function MailShell({
               key="calendar"
               orientation="horizontal"
               className="min-h-0 flex-1 items-stretch"
-              onLayoutChange={onSidebarLayoutChange}
-              onLayoutChanged={onSidebarLayoutChanged}
+              onLayoutChanged={(layout, meta) =>
+                onSidebarLayoutChanged(layout, meta)
+              }
             >
               {sidebarPane}
               <ResizableHandle withHandle />
@@ -581,12 +655,16 @@ export function MailShell({
               key="right"
               orientation="horizontal"
               className="min-h-0 flex-1 items-stretch"
-              onLayoutChange={onSidebarLayoutChange}
-              onLayoutChanged={onSidebarLayoutChanged}
+              defaultLayout={rightSaved.defaultLayout}
+              onLayoutChanged={(layout, meta) => {
+                rightSaved.onLayoutChanged(layout, meta)
+                onSidebarLayoutChanged(layout, meta)
+              }}
             >
               {sidebarPane}
               <ResizableHandle withHandle />
               <ResizablePanel
+                id="list"
                 defaultSize={`${defaultLayout[1]}%`}
                 minSize="30%"
               >
@@ -594,6 +672,7 @@ export function MailShell({
               </ResizablePanel>
               <ResizableHandle withHandle />
               <ResizablePanel
+                id="reading"
                 defaultSize={`${defaultLayout[2]}%`}
                 minSize="30%"
               >
@@ -606,18 +685,28 @@ export function MailShell({
               key="bottom"
               orientation="horizontal"
               className="min-h-0 flex-1 items-stretch"
-              onLayoutChange={onSidebarLayoutChange}
-              onLayoutChanged={onSidebarLayoutChanged}
+              defaultLayout={bottomSaved.defaultLayout}
+              onLayoutChanged={(layout, meta) => {
+                bottomSaved.onLayoutChanged(layout, meta)
+                onSidebarLayoutChanged(layout, meta)
+              }}
             >
               {sidebarPane}
               <ResizableHandle withHandle />
-              <ResizablePanel defaultSize="80%" minSize="40%">
-                <ResizablePanelGroup orientation="vertical" className="h-full">
-                  <ResizablePanel defaultSize="55%" minSize="25%">
+              <ResizablePanel id="content" defaultSize="80%" minSize="40%">
+                <ResizablePanelGroup
+                  orientation="vertical"
+                  className="h-full"
+                  defaultLayout={bottomSplitSaved.defaultLayout}
+                  onLayoutChanged={(layout, meta) =>
+                    bottomSplitSaved.onLayoutChanged(layout, meta)
+                  }
+                >
+                  <ResizablePanel id="list" defaultSize="55%" minSize="25%">
                     <MailboxPane onAddAccount={openAddAccount} />
                   </ResizablePanel>
                   <ResizableHandle withHandle />
-                  <ResizablePanel minSize="25%">
+                  <ResizablePanel id="reading" minSize="25%">
                     <ReadingPane />
                   </ResizablePanel>
                 </ResizablePanelGroup>
@@ -629,12 +718,15 @@ export function MailShell({
               key="hidden"
               orientation="horizontal"
               className="min-h-0 flex-1 items-stretch"
-              onLayoutChange={onSidebarLayoutChange}
-              onLayoutChanged={onSidebarLayoutChanged}
+              defaultLayout={hiddenSaved.defaultLayout}
+              onLayoutChanged={(layout, meta) => {
+                hiddenSaved.onLayoutChanged(layout, meta)
+                onSidebarLayoutChanged(layout, meta)
+              }}
             >
               {sidebarPane}
               <ResizableHandle withHandle />
-              <ResizablePanel defaultSize="80%" minSize="40%">
+              <ResizablePanel id="list" defaultSize="80%" minSize="40%">
                 <MailboxPane onAddAccount={openAddAccount} />
               </ResizablePanel>
             </ResizablePanelGroup>
