@@ -19,6 +19,8 @@ mod oauth;
 mod smtp;
 // Storage usage + delete-all-local-data commands (tasks 1.6/1.7, D11).
 mod storage;
+// OS secret-store commands for the credential-sealing key (review L1).
+mod secrets;
 // One-Click List-Unsubscribe POSTs (RFC 8058).
 mod unsubscribe;
 mod updates;
@@ -210,6 +212,9 @@ pub fn run() {
             storage::storage_usage,
             storage::delete_all_local_data,
             storage::restrict_credentials_key_permissions,
+            secrets::credentials_key_os_store,
+            secrets::credentials_key_os_load,
+            secrets::credentials_key_os_delete,
             unsubscribe::unsubscribe_one_click_post,
         ])
         .on_page_load(|webview, payload| {

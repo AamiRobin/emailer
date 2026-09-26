@@ -61,6 +61,13 @@ lettre = { version = "0.11", default-features = false, features = [
     "tokio1-native-tls",
     "builder",
 ] }
+# OS secret stores for the credential-encryption key (roadmap item from
+# the security review: replace the plaintext credentials.key file).
+# Feature set "v1" = apple keychain (macOS), windows credential manager,
+# zbus secret service (Linux); the plaintext file remains the fallback
+# when the OS store is unavailable.
+keyring = { version = "4.2", default-features = false, features = ["v1"] }
+
 # Minimal CalDAV client (task 5.2, design D5): WebDAV/CalDAV servers answer
 # PROPFIND/REPORT with namespaced multistatus XML whose property order,
 # prefixes and entity encoding vary per server (Radicale / Nextcloud /

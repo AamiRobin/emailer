@@ -11,11 +11,13 @@ affected version/commit, and reproduction steps.
 
 - Emailer is local-first: messages, credentials and settings live in a
   local SQLite database. Account passwords and OAuth tokens are stored
-  AES-256-GCM encrypted inside that database; the sealing key lives in
-  `credentials.key` in the OS app-data directory with owner-only file
-  permissions on Unix (best-effort — OS keychain integration is a known
-  roadmap item). This protects against casual file access, not against
-  an attacker with full read access to your user profile. The malware
+  AES-256-GCM encrypted inside that database. The sealing key lives in
+  the OS secret store (macOS Keychain, Windows Credential Manager,
+  Linux Secret Service); hosts without a usable OS store fall back to
+  a `credentials.key` file in the app-data directory with owner-only
+  file permissions on Unix (best-effort). This protects against casual
+  file access; on fallback hosts a determined attacker with full read
+  access to your user profile could still recover the key. The malware
   hash-lookup feature sends only SHA-256 hashes of attachments to
   VirusTotal, and only when explicitly enabled in Settings → Attachment
   security.

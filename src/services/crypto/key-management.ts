@@ -144,29 +144,75 @@ async function importAesKey(raw: Uint8Array): Promise<CryptoKey> {
 }
 
 /**
- * KeyStore backed by the Tauri fs plugin: base64 key material at
- * `<appDataDir>/credentials.key`. Plugin imports are dynamic so this module
- * loads cleanly in non-Tauri environments (vitest). Note: writing to
- * AppData requires the `fs:allow-appdata-write-recursive` capability in
- * addition to `fs:default`.
+ * KeyStore backed by the OS secret store (review L1 roadmap item): the
+ * sealing key lives in the OS keychain (macOS Keychain, Windows Credential
+ * Manager, Linux Secret Service) via the `credentials_key_os_*` Rust
+ * commands. The plaintext `credentials.key` file is the FALLBACK for hosts
+ * without a usable OS store and the migration source for existing
+ * installs. Plugin imports are dynamic so this module loads cleanly in
+ * non-Tauri environments (vitest).
+ *
+ * Selection rule: a still-present file always WINS over the OS store —
+ * every successful os-store write removes the file, so a file existing
+ * means the last write fell back to disk, i.e. the file is newer. This
+ * keeps a locked/unavailable store from resurrecting a stale key.
  */
 export function createTauriKeyStore(): KeyStore {
   return {
     async read(): Promise<string | null> {
-      const { exists, readTextFile, BaseDirectory } =
+      const { exists, readTextFile, remove, BaseDirectory } =
         await import("@tauri-apps/plugin-fs")
       const options = { baseDir: BaseDirectory.AppData }
-      if (!(await exists(KEY_FILE_NAME, options))) {
-        return null
+
+      // 1. File wins while it exists (see selection rule above); use the
+      // read to (re-)seal into the OS store when that store accepts
+      // writes, then retire the file.
+      if (await exists(KEY_FILE_NAME, options)) {
+        const stored = await readTextFile(KEY_FILE_NAME, options)
+        // L1 hardening also covers fallback-file installs — tighten on
+        // every load, best-effort.
+        await restrictKeyFilePermissionsBestEffort()
+        try {
+          await invoke("credentials_key_os_store", { keyB64: stored })
+          // Only remove the file once the OS store verifiably accepted
+          // the key — otherwise it stays the authoritative fallback.
+          await remove(KEY_FILE_NAME, options)
+        } catch {
+          // Store locked or unavailable: the file remains authoritative
+          // and the app keeps working exactly as before this feature.
+        }
+        return stored
       }
-      const stored = await readTextFile(KEY_FILE_NAME, options)
-      // L1 hardening also covers keys persisted before the permission
-      // restriction existed — tighten on every load, best-effort.
-      await restrictKeyFilePermissionsBestEffort()
-      return stored
+
+      // 2. No file: the OS store is the only source. A rejected load is
+      // LOUD on purpose (locked or unreadable store) — silently treating
+      // it as "no key" would generate a fresh key and orphan every
+      // stored credential. Ok(null) means fresh install: the caller
+      // generates a key and write() re-attempts the OS store.
+      return invoke<string | null>("credentials_key_os_load")
     },
 
     async write(value: string): Promise<void> {
+      // OS store first; the file is only the fallback for hosts without
+      // one (or with one that refuses writes).
+      try {
+        await invoke("credentials_key_os_store", { keyB64: value })
+        // Migration: retire the legacy plaintext file so the at-rest
+        // protection is actually delivered. Best-effort — a leftover file
+        // only means read() keeps preferring it (still correct, still
+        // 0600).
+        try {
+          const { remove, BaseDirectory } = await import("@tauri-apps/plugin-fs")
+          await remove(KEY_FILE_NAME, { baseDir: BaseDirectory.AppData })
+        } catch {
+          // nothing to remove, or removal raced a crash — the read rule
+          // above handles a surviving file correctly either way
+        }
+        return
+      } catch {
+        // OS store unavailable or refusing: fall through to the file.
+      }
+
       const { appDataDir } = await import("@tauri-apps/api/path")
       const { mkdir, writeTextFile, rename, remove, BaseDirectory } =
         await import("@tauri-apps/plugin-fs")
