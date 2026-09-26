@@ -12,6 +12,7 @@ import {
   useComposerStore,
 } from "@/stores/composer-store"
 import { useUiStore } from "@/stores/ui-store"
+import { BLOCKED_IMAGE_PLACEHOLDER } from "@/services/renderer/sanitize"
 import { sendComposerDraft } from "../send"
 import {
   isThreadInSentFolder,
@@ -184,6 +185,31 @@ describe("openSendAgainForMessage", () => {
     expect(state.subject).toBe("Re: Kickoff — final agenda")
     expect(state.html).toBe("<p>Hi there — the report is attached.</p>")
     expect(useUiStore.getState().composerOpen).toBe(true)
+  })
+
+  it("sanitizes the sent body html: tracking pixels blocked, formatting kept", async () => {
+    const { messageId } = await seedSentMessage()
+    await executor.execute(
+      "UPDATE messages SET body_html = $1 WHERE id = $2",
+      [
+        '<p>Report <b>attached</b>.</p><img src="https://tracker.example/pixel.gif">',
+        messageId,
+      ]
+    )
+
+    const opened = await openSendAgainForMessage(messageId, { executor })
+
+    // The composer parses the reopened body in the host document, so it
+    // arrives pre-sanitized with the reading-pane image policy: benign
+    // formatting survives, no remote src does.
+    expect(opened).toBe(true)
+    const html = useComposerStore.getState().html
+    expect(html).toContain("<b>attached</b>")
+    expect(html).toContain(
+      'data-original-src="https://tracker.example/pixel.gif"'
+    )
+    expect(html).toContain(`src="${BLOCKED_IMAGE_PLACEHOLDER}"`)
+    expect(html).not.toMatch(/\ssrc="https?:/i)
   })
 
   it("restores attachments whose bytes are recoverable from the store", async () => {

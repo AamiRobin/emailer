@@ -10,14 +10,16 @@ import type { SqlExecutor } from "../db/executor"
 import { findLabelsBySpecialUse } from "../db/labels"
 import { getMessage } from "../db/messages"
 import { getExecutor } from "../db/executor"
-import { renderPlainTextAsHtml } from "../renderer"
+import { renderPlainTextAsHtml, sanitizeEmailHtml } from "../renderer"
 
 /**
  * Send again (batch C3): re-open a SENT message as a brand-new draft. The
  * reading pane's "Send again" action (mail-display.tsx, beside View
  * source) lands here; the composer opens prefilled with the original
  * recipients, the subject EXACTLY as sent (no Re:/Fwd: handling — the
- * subject is copied verbatim) and the original sent body HTML.
+ * subject is copied verbatim) and the original sent body HTML,
+ * sanitized with remote images blocked because TipTap parses it in the
+ * host document (see the setHtml call below).
  *
  * Everything else about the new message is deliberately fresh:
  * - From = the account that sent the original (the message's own
@@ -163,9 +165,19 @@ export async function openSendAgainForMessage(
     )
     // The subject exactly as sent — verbatim, no prefix handling.
     composer.setSubject(message.subject ?? "")
+    // The stored body is untrusted HTML and the composer parses it in
+    // the HOST document, where the sandboxed frame's image policy cannot
+    // apply — so it is sanitized with remote images blocked (placeholder
+    // 1x1, original in data-original-src), the same policy the reply/
+    // forward quote builders apply. A tracking pixel in a sent body must
+    // not auto-load on reopen. The plain-text branch needs no pass: it
+    // renders through renderPlainTextAsHtml's escaping.
     composer.setHtml(
-      message.body_html ??
-        (message.body_text ? renderPlainTextAsHtml(message.body_text) : "")
+      message.body_html
+        ? sanitizeEmailHtml(message.body_html, { blockRemoteImages: true })
+        : message.body_text
+          ? renderPlainTextAsHtml(message.body_text)
+          : ""
     )
     if (restored.length > 0) {
       for (const attachment of restored) {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import type { MessageRow } from "@/services/db/messages"
+import { BLOCKED_IMAGE_PLACEHOLDER } from "@/services/renderer/sanitize"
 import {
   buildForward,
   buildReply,
@@ -328,6 +329,27 @@ describe("buildReply", () => {
     expect(prefill.html).toBe(`<p></p><p><br></p>${quote}`)
   })
 
+  it("sanitizes quoted html: tracking pixels become placeholders, formatting survives", () => {
+    const prefill = buildReply({
+      message: makeMessage({
+        body_html:
+          '<p>Hi <b>there</b></p><img src="https://tracker.example/pixel.gif" alt="x">',
+      }),
+      thread: THREAD,
+      account: ACCOUNT,
+      replyAll: false,
+    })
+    // The composer parses the quote in the host document, so the quote
+    // arrives pre-sanitized with the reading-pane image policy: benign
+    // formatting survives, remote srcs never do.
+    expect(prefill.html).toContain("<b>there</b>")
+    expect(prefill.html).toContain(
+      'data-original-src="https://tracker.example/pixel.gif"'
+    )
+    expect(prefill.html).toContain(`src="${BLOCKED_IMAGE_PLACEHOLDER}"`)
+    expect(prefill.html).not.toMatch(/\ssrc="https?:/i)
+  })
+
   it("quotes a plain-text original escaped and pre-wrap marked", () => {
     const prefill = buildReply({
       message: makeMessage({
@@ -476,5 +498,26 @@ describe("buildForward", () => {
       "From: &lt;script&gt;alert(1)&lt;/script&gt; &lt;alice@example.com&gt;"
     )
     expect(prefill.html).toContain('Subject: Bob &lt;b@x&gt; &amp; "friends"')
+  })
+
+  it("sanitizes the forwarded body html the same way", () => {
+    const prefill = buildForward({
+      message: makeMessage({
+        body_html:
+          '<p>Report <b>enclosed</b></p><img src="http://tracker.example/pixel.gif">',
+      }),
+      thread: THREAD,
+      account: ACCOUNT,
+    })
+    expect(prefill.html).toContain("<b>enclosed</b>")
+    expect(prefill.html).toContain(
+      'data-original-src="http://tracker.example/pixel.gif"'
+    )
+    expect(prefill.html).not.toMatch(/\ssrc="https?:/i)
+    // The stored quote replayed on draft resume is the same sanitized
+    // markup the composer parses — no remote src survives there either.
+    const quoted =
+      prefill.mode.kind === "forward" ? (prefill.mode.quotedHtml ?? "") : ""
+    expect(quoted).not.toMatch(/\ssrc="https?:/i)
   })
 })

@@ -135,10 +135,22 @@ export function buildPrintHtml(
  * Render the print document in a hidden iframe and open the OS print
  * dialog on it. The iframe is removed after the dialog closes (the
  * afterprint event, with a timeout fallback for engines that skip it).
+ * The frame is sandboxed with `allow-same-origin` only — see the
+ * attribute below for why scripts are never allowed.
  */
 export function printHtml(html: string): void {
   const iframe = document.createElement("iframe")
   iframe.setAttribute("aria-hidden", "true")
+  // A srcdoc iframe without a sandbox attribute inherits the app's
+  // origin, so any script surviving into the print document would run
+  // with full access to the host DOM/storage. `allow-same-origin` ONLY:
+  // it keeps the frame same-origin so contentWindow.print() and the
+  // afterprint listener stay callable (an opaque-origin sandbox would
+  // make the frame cross-origin and block both), while allow-scripts is
+  // deliberately absent — printing never needs scripts, and it must
+  // NEVER be added: allow-same-origin + allow-scripts together would
+  // hand untrusted markup script access to the app document.
+  iframe.setAttribute("sandbox", "allow-same-origin")
   iframe.style.position = "fixed"
   iframe.style.right = "0"
   iframe.style.bottom = "0"

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   buildPrintHtml,
   formatPrintAddress,
+  printHtml,
   type PrintMessage,
 } from "@/services/renderer/print"
 import { sanitizeEmailHtml } from "@/services/renderer/sanitize"
@@ -106,5 +107,20 @@ describe("formatPrintAddress", () => {
     expect(formatPrintAddress(null, "jane@x.com")).toBe("jane@x.com")
     expect(formatPrintAddress("Jane", null)).toBe("Jane")
     expect(formatPrintAddress("  ", null)).toBe("")
+  })
+})
+
+describe("printHtml", () => {
+  it("renders the document into a sandboxed iframe — allow-same-origin, no allow-scripts", () => {
+    printHtml("<p>print me</p>")
+    const iframe = document.body.querySelector("iframe")
+    expect(iframe).not.toBeNull()
+    expect(iframe?.getAttribute("srcdoc")).toContain("print me")
+    // The frame must never run scripts: a srcdoc iframe without a
+    // sandbox attribute inherits the app origin. allow-same-origin
+    // (only) keeps contentWindow printable; jsdom cannot exercise the
+    // WKWebView print() path, so the attribute itself is the contract.
+    expect(iframe?.getAttribute("sandbox")).toBe("allow-same-origin")
+    document.body.innerHTML = ""
   })
 })

@@ -2,6 +2,7 @@ import type { ComposerMode, Recipient } from "@/stores/composer-store"
 
 import type { ContactRef, MessageRow } from "../db/messages"
 import { parseContacts } from "../db/messages"
+import { sanitizeEmailHtml } from "../renderer"
 import { parseReferences } from "../sync/threading"
 import { appendSignature, COMPOSER_BLOCK_SEPARATOR } from "./signatures"
 
@@ -55,8 +56,9 @@ import { appendSignature, COMPOSER_BLOCK_SEPARATOR } from "./signatures"
  *
  * Quoting decisions:
  * - Gmail-style quote header "On <date>, <sender> wrote:" over a semantic
- *   `<blockquote>` wrapping the original body (HTML verbatim; plain-text
- *   bodies as escaped text in a `data-emailer-plaintext` div, which the
+ *   `<blockquote>` wrapping the original body (HTML sanitized with
+ *   remote images blocked — see quotedOriginal; plain-text bodies as
+ *   escaped text in a `data-emailer-plaintext` div, which the
  *   reading-pane base stylesheet already renders pre-wrap). Dates render
  *   in UTC so the pure builders stay deterministic across machines.
  * - Markup is semantic only (p/div/blockquote/br) with no style
@@ -242,15 +244,26 @@ export function buildReferencesChain(message: MessageRow): string | undefined {
 }
 
 /**
- * The original body as quoted content: HTML verbatim when present, else
- * the plain text escaped inside the same `data-emailer-plaintext` div the
- * renderer's plain-text path uses (its base stylesheet gives it pre-wrap;
- * the attribute survives the sanitizer's ALLOW_DATA_ATTR). Nothing at all
+ * The original body as quoted content: HTML sanitized with remote images
+ * blocked (each http(s) src swapped for the 1x1 transparent placeholder,
+ * the original URL parked in `data-original-src`), else the plain text
+ * escaped inside the same `data-emailer-plaintext` div the renderer's
+ * plain-text path uses (its base stylesheet gives it pre-wrap; the
+ * attribute survives the sanitizer's ALLOW_DATA_ATTR). Nothing at all
  * quotes as an empty paragraph so the blockquote still renders.
+ *
+ * The sanitize pass matches the reading-pane policy on purpose: the
+ * composer parses this quote with TipTap in the HOST document, where the
+ * sandboxed frame's image policy cannot apply — without it, a tracking
+ * pixel in the quoted HTML would auto-load the moment the user hits
+ * Reply or Forward. This is the single choke point: both the reply
+ * history (buildQuotedHistory) and the forward quote (buildForwardQuote)
+ * embed their body through it, and the same markup is what the draft
+ * resume replays via mode.quotedHtml.
  */
 function quotedOriginal(message: MessageRow): string {
   const html = message.body_html?.trim()
-  if (html) return message.body_html as string
+  if (html) return sanitizeEmailHtml(html, { blockRemoteImages: true })
   const text = message.body_text?.trim()
   if (text) {
     return `<div data-emailer-plaintext>${escapeHtml(message.body_text ?? "")}</div>`
