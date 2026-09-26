@@ -43,7 +43,7 @@
         "style-src": "'self' 'unsafe-inline'",
         "img-src": "'self' data: blob: https:",
         "font-src": "'self' data:",
-        "connect-src": "'self' ipc: http://ipc.localhost https://accounts.google.com https://oauth2.googleapis.com https://gmail.googleapis.com https://www.googleapis.com",
+        "connect-src": "'self' ipc: http://ipc.localhost https://accounts.google.com https://oauth2.googleapis.com https://gmail.googleapis.com https://www.googleapis.com https://login.microsoftonline.com https://graph.microsoft.com https://www.virustotal.com",
         "frame-src": "'self'"
       }
     }
