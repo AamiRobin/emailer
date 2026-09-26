@@ -1,3 +1,5 @@
+import { invoke } from "@tauri-apps/api/core"
+
 import type { SqlExecutor } from "../db/executor"
 import { createRule, listRules } from "../rules/db"
 import { enqueueUnsubscribePost } from "../queue/operation"
@@ -16,11 +18,12 @@ import { isOnline } from "../online"
  *   `List-Unsubscribe=One-Click`) AND the List-Unsubscribe header carries
  *   an https URL. Clicking POSTs form-encoded `List-Unsubscribe=One-Click`
  *   to the URL — the exact request body RFC 8058 mandates. The POST goes
- *   through the plain fetch patched by tauri-plugin-http, the same way the
- *   Gmail REST client and the malware lookup call out from TS (design D2
- *   "plain HTTPS calls from TS"; the capability scope allows https
- *   targets because unsubscribe endpoints are unbounded — every list
- *   owner runs their own). Offline, the POST is enqueued as an
+ *   through the `unsubscribe_one_click_post` Rust command
+ *   (src-tauri/src/unsubscribe.rs), which validates the target (https,
+ *   no userinfo/fragment/control characters, no redirects, no
+ *   credentials) and issues it Rust-side — unsubscribe endpoints are
+ *   unbounded (every list owner runs their own), so the webview must
+ *   never fetch them directly. Offline, the POST is enqueued as an
  *   `unsubscribe_post` op and the queue processor replays it (spec:
  *   unsubscribing queues for replay).
  * - MAILTO fallback: no one-click target but a `mailto:` entry — the
@@ -191,12 +194,12 @@ function isParseableUrl(value: string): boolean {
 // The one-click POST (RFC 8058)
 // ---------------------------------------------------------------------------
 
-/** Injectable transport seam (tests); production uses the plugin-http
- * patched global fetch. */
+/** Injectable transport seam (tests); production routes through the
+ * `unsubscribe_one_click_post` Rust command. */
 export type UnsubscribePostFn = (
   url: string,
   init: { method: "POST"; headers: { "content-type": string }; body: string }
-) => Promise<Response>
+) => Promise<Pick<Response, "ok" | "status">>
 
 /** Thrown for a non-2xx one-click POST (the UI toasts the failure). */
 export class UnsubscribeError extends Error {
@@ -233,19 +236,20 @@ export async function postOneClickUnsubscribe(
   }
 }
 
-/** The plugin-http patched fetch (see the module comment for why plain
- * fetch here dodges the webview's CORS). `maxRedirections: 0` is
- * plugin-http's redirect kill-switch: the target is sender-controlled
- * header data, and a followed 301/302 chain could otherwise bounce the
- * request (post→get) anywhere on https while riding the plugin's shared
- * cookie jar. RFC 8058 endpoints answer 2xx directly. */
-const defaultPost: UnsubscribePostFn = (url, init) =>
-  fetch(url, {
-    ...init,
-    maxRedirections: 0,
-  } as RequestInit & { maxRedirections?: number })
+/** Production transport: the `unsubscribe_one_click_post` Rust command
+ * (src-tauri/src/unsubscribe.rs). The RFC 8058 target is sender-controlled
+ * header data on an unbounded host set, so the request is issued and
+ * validated Rust-side — https only, no userinfo/fragment, no redirects, no
+ * credentials, small capped response — and the webview needs no
+ * arbitrary-host fetch capability for it (the `https://*` entry was
+ * removed from the http:default capability allow list for exactly this
+ * reason). Transport/validation failures reject; any HTTP status resolves
+ * so postOneClickUnsubscribe can classify it. */
+const defaultPost: UnsubscribePostFn = async (url) => {
+  const status = await invoke<number>("unsubscribe_one_click_post", { url })
+  return { ok: status >= 200 && status < 300, status }
+}
 
-// ---------------------------------------------------------------------------
 // Orchestration (what the mail view's Unsubscribe click runs)
 // ---------------------------------------------------------------------------
 
@@ -254,7 +258,7 @@ export type UnsubscribeOutcome = { kind: "posted" } | { kind: "queued" }
 
 /** Injectable seams of performUnsubscribe (tests; production defaults). */
 export interface UnsubscribeDeps {
-  /** The one-click transport. Default: plugin-http patched fetch. */
+  /** The one-click transport. Default: the Rust command transport. */
   post?: UnsubscribePostFn
   /** Connectivity. Default: the online store (isOnline). */
   isOnline?: () => boolean

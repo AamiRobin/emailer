@@ -14,6 +14,8 @@
  * error messages.
  */
 
+import { invoke } from "@tauri-apps/api/core"
+
 import { asBufferSource, base64ToBytes, bytesToBase64 } from "./aes-gcm"
 
 /** Storage contract for the raw key material (base64 string). */
@@ -157,7 +159,11 @@ export function createTauriKeyStore(): KeyStore {
       if (!(await exists(KEY_FILE_NAME, options))) {
         return null
       }
-      return readTextFile(KEY_FILE_NAME, options)
+      const stored = await readTextFile(KEY_FILE_NAME, options)
+      // L1 hardening also covers keys persisted before the permission
+      // restriction existed — tighten on every load, best-effort.
+      await restrictKeyFilePermissionsBestEffort()
+      return stored
     },
 
     async write(value: string): Promise<void> {
@@ -185,7 +191,29 @@ export function createTauriKeyStore(): KeyStore {
           }),
         remove: (path) => remove(path, appDataOptions),
       })
+      // Hardening (security review L1): tighten credentials.key to
+      // owner-only on Unix. Best-effort by design — the key is already
+      // correctly stored at this point, and a permission failure must not
+      // fail credential storage; the Rust command takes no path argument
+      // and always targets <appData>/credentials.key.
+      await restrictKeyFilePermissionsBestEffort()
     },
+  }
+}
+
+/**
+ * Best-effort owner-only tightening of `<appData>/credentials.key` via the
+ * `restrict_credentials_key_permissions` Rust command (Unix only; a no-op
+ * elsewhere). Failures are swallowed deliberately: the key material is
+ * already correctly stored or loaded at the call sites, and a permission
+ * problem must never break credential storage or decryption. The command
+ * takes no arguments — it always targets the fixed key-file path.
+ */
+async function restrictKeyFilePermissionsBestEffort(): Promise<void> {
+  try {
+    await invoke("restrict_credentials_key_permissions")
+  } catch {
+    // Non-Tauri environments (tests) or a failed chmod — see above.
   }
 }
 

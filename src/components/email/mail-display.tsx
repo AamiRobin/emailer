@@ -228,9 +228,10 @@ export interface MailDisplayProps {
   pgpDeps?: PgpReceiveUiDeps
   /**
    * The unsubscribe seams (task 18.3): the one-click POST transport.
-   * Production resolves to the plugin-http patched fetch; tests inject a
-   * stub so the jsdom realm stays network-free. (Offline detection uses
-   * the real online store in both realms.)
+   * Production resolves to the Rust command transport
+   * (unsubscribe_one_click_post); tests inject a stub so the jsdom realm
+   * stays network-free. (Offline detection uses the real online store in
+   * both realms.)
    */
   unsubscribeDeps?: UnsubscribeDeps
   /**

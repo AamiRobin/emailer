@@ -175,8 +175,9 @@ export async function openAttachment(
   const absolute = await (deps.resolveAppPath ?? defaultResolveAppPath)(
     localPath
   )
-  // Defense in depth: the opener capability is scoped to $APPDATA/**, and
-  // a well-formed localPath is always `attachment_cache/<sha-256>.bin`.
+  // Defense in depth: the opener capability is scoped to
+  // $APPDATA/attachment_cache/**, and a well-formed localPath is always
+  // `attachment_cache/<sha-256>.bin`.
   // Reject anything else (a tampered DB row) before it reaches the OS.
   if (!isCacheRelativePath(localPath)) {
     throw new Error(`attachment path escapes the cache directory: ${localPath}`)

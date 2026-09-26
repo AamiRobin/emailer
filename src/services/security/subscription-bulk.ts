@@ -41,7 +41,7 @@ import {
  */
 
 /** Injectable seams of the underlying one-click flow (tests; production
- * defaults to the plugin-http patched fetch + the online store). */
+ * defaults to the Rust command transport + the online store). */
 export interface BulkUnsubscribeDeps {
   post?: UnsubscribePostFn
   isOnline?: () => boolean
