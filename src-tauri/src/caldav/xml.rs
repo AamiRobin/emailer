@@ -16,14 +16,24 @@
 //! [`DavResponse`] per `<response>`: the properties the client cares
 //! about, the resource's `<href>` (a direct child of the response), and
 //! the response/propstat status codes (sync-collection reports deletions
-//! as 404 statuses). Malformed XML never panics — it is a typed
-//! [`CaldavError::Parse`].
+//! as 404 statuses). Both nesting depth and the number of parsed
+//! responses are capped, so a hostile or broken server cannot blow the
+//! parser with unbounded nesting or an unbounded response; exceeding
+//! either is a typed parse error. Malformed XML never panics — it is a
+//! typed [`CaldavError::Parse`].
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use super::CaldavError;
 
+/// Maximum `<response>` items parsed from one body (the same cap the
+/// CardDAV parser enforces: a real calendar never approaches it, a
+/// hostile endpoint must not stream one forever).
+pub(crate) const MAX_ITEMS: usize = 50_000;
+/// Maximum element nesting depth accepted (the same cap the CardDAV
+/// parser enforces).
+pub(crate) const MAX_DEPTH: usize = 128;
 /// One `<response>` (a.k.a. `<D:response>`) of a multistatus body.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DavResponse {
@@ -130,8 +140,13 @@ struct Parser {
 }
 
 impl Parser {
-    fn handle_start(&mut self, name: &[u8], attributes: Attributes<'_>) -> Result<(), CaldavError> {
+    fn handle_start(&mut self, name: &str, attributes: Attributes<'_>) -> Result<(), CaldavError> {
         let local = local_name(name);
+        if self.stack.len() >= MAX_DEPTH {
+            return Err(CaldavError::Parse(
+                "XML nesting limit exceeded".to_string(),
+            ));
+        }
         let capturing = self.capture.as_ref().map(|capture| capture.prop);
         let depth_before_push = self.stack.len();
 
@@ -211,7 +226,7 @@ impl Parser {
         Ok(())
     }
 
-    fn handle_empty(&mut self, name: &[u8], attributes: Attributes<'_>) -> Result<(), CaldavError> {
+    fn handle_empty(&mut self, name: &str, attributes: Attributes<'_>) -> Result<(), CaldavError> {
         let local = local_name(name);
         // Self-closing elements emit Empty and NO End event.
         match self.capture.as_ref().map(|capture| capture.prop) {
@@ -254,7 +269,7 @@ impl Parser {
         Ok(())
     }
 
-    fn handle_end(&mut self, name: &[u8]) {
+    fn handle_end(&mut self, name: &str) {
         let local = local_name(name);
 
         if let Some(capture) = self.capture.take() {
@@ -367,11 +382,8 @@ impl Parser {
         let mut name: Option<String> = None;
         for attribute in attributes.flatten() {
             if local_name(attribute.key.as_ref()) == "name" {
-                // Decode the attribute value by hand (the decoder-based
-                // helper needs the reader's Decoder, which the streaming
-                // state does not carry): lossy UTF-8 + entity unescape.
-                let raw = String::from_utf8_lossy(&attribute.value);
-                name = quick_xml::escape::unescape(&raw)
+                // The attribute value arrives entity-escaped.
+                name = quick_xml::escape::unescape(&attribute.value)
                     .ok()
                     .map(|value| value.into_owned());
             }
@@ -403,11 +415,10 @@ fn parse_status_line(text: &str) -> Option<u16> {
 }
 
 /// Local (prefix-stripped, lowercased) element name.
-fn local_name(name: &[u8]) -> String {
-    let raw = std::str::from_utf8(name).unwrap_or("");
-    match raw.rsplit_once(':') {
+fn local_name(name: &str) -> String {
+    match name.rsplit_once(':') {
         Some((_, local)) => local.to_ascii_lowercase(),
-        None => raw.to_ascii_lowercase(),
+        None => name.to_ascii_lowercase(),
     }
 }
 
@@ -442,11 +453,32 @@ pub(crate) fn parse_multistatus(body: &str) -> Result<Multistatus, CaldavError> 
                 parser.handle_empty(start.name().as_ref(), start.attributes())?;
             }
             Event::Text(text) => {
-                let decoded = text.unescape().map_err(|error| {
+                let raw = text.into_inner();
+                let decoded = quick_xml::escape::unescape(&raw).map_err(|error| {
                     CaldavError::Parse(format!(
                         "malformed XML text from the CalDAV server ({error})"
                     ))
                 })?;
+                parser.handle_text(&decoded)?;
+            }
+            // quick-xml 0.42 splits entity references into their own
+            // events (`&#13;` in calendar-data / address-data bodies);
+            // decode them into the SAME capture the surrounding text
+            // feeds. Predefined entities and character references pass,
+            // anything else is a parse error (the whole-text unescape
+            // discipline of earlier quick-xml versions).
+            Event::GeneralRef(reference) => {
+                let name = reference.into_inner();
+                let decoded = match quick_xml::escape::resolve_predefined_entity(&name) {
+                    Some(value) => value.to_string(),
+                    None => quick_xml::escape::unescape(&format!("&{name};"))
+                        .map_err(|error| {
+                            CaldavError::Parse(format!(
+                                "malformed XML text from the CalDAV server ({error})"
+                            ))
+                        })?
+                        .into_owned(),
+                };
                 parser.handle_text(&decoded)?;
             }
             Event::End(end) => parser.handle_end(end.name().as_ref()),
@@ -455,6 +487,11 @@ pub(crate) fn parse_multistatus(body: &str) -> Result<Multistatus, CaldavError> 
             // CalDAV props we read never arrive as CDATA sections.
             _ => {}
         }
+        if parser.result.responses.len() > MAX_ITEMS {
+            return Err(CaldavError::Parse(
+                "multistatus exceeded the item limit".to_string(),
+            ));
+        }
     }
 
     if !parser.saw_multistatus {
@@ -462,7 +499,7 @@ pub(crate) fn parse_multistatus(body: &str) -> Result<Multistatus, CaldavError> 
             "the response was not a WebDAV multistatus document".to_string(),
         ));
     }
-    // quick-xml (0.36) does not report EOF with unclosed elements as an
+    // quick-xml (0.42) does not report EOF with unclosed elements as an
     // error — a TRUNCATED response must not pass as a valid (empty)
     // report.
     if !parser.stack.is_empty() {
@@ -710,4 +747,27 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn depth_and_item_caps_are_enforced() {
+        // Nesting beyond MAX_DEPTH is rejected outright.
+        let deep = format!(
+            "<D:multistatus xmlns:D=\"DAV:\">{}x{}",
+            "<D:a>".repeat(MAX_DEPTH + 2),
+            "</D:a>".repeat(MAX_DEPTH + 2)
+        );
+        let error = parse_multistatus(&deep).unwrap_err();
+        assert!(error.to_string().contains("nesting limit"), "{error}");
+        // More than MAX_ITEMS responses are rejected.
+        let mut body = String::from("<D:multistatus xmlns:D=\"DAV:\">");
+        for index in 0..=(MAX_ITEMS) {
+            body.push_str(&format!(
+                "<D:response><D:href>/r{index}</D:href><D:status>HTTP/1.1 200 OK</D:status></D:response>"
+            ));
+        }
+        body.push_str("</D:multistatus>");
+        let error = parse_multistatus(&body).unwrap_err();
+        assert!(error.to_string().contains("item limit"), "{error}");
+    }
 }
+

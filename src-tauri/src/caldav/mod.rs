@@ -30,7 +30,10 @@
 //! (`ai::http`'s transport policy, reused verbatim); redirects are NOT
 //! followed (Basic-auth credentials must never be replayed to a redirect
 //! target — a redirect surfaces as a specific `status` error telling the
-//! user to correct the URL instead).
+//! user to correct the URL instead), and every server-supplied href is
+//! resolved against the connection's origin and REFUSED when it would
+//! cross to another host/port/scheme (same rule for the stored
+//! `calendar_path`/`resource_path` arguments at the command boundary).
 //!
 //! # Sync-token with full-sync fallback (design risks note)
 //!
@@ -170,10 +173,11 @@ fn into_command_error(error: CaldavError, username: &str, app_password: &str) ->
 
 /// One discovered calendar collection (spec: "Connection SHALL discover
 /// the available calendars"): `href` is the ABSOLUTE URL of the
-/// collection (multistatus hrefs joined against the server base — it may
-/// live on a different host/port than the entered URL on servers that
-/// redirect their DAV roots). The TS layer stores it as the calendar path
-/// and hands it back to `caldav_sync`.
+/// collection (multistatus hrefs joined against the server base and
+/// origin-checked — a href that would leave the connection's
+/// host/port/scheme is refused rather than followed with credentials).
+/// The TS layer stores it as the calendar path and hands it back to
+/// [`caldav_sync`].
 #[derive(Debug, Clone, Serialize)]
 pub struct CaldavDiscoveredCalendar {
     pub href: String,
@@ -237,6 +241,29 @@ fn validate_server_url(server_url: &str) -> Result<(), CaldavError> {
     crate::ai::http::parse_request_url(server_url)
         .map(|_| ())
         .map_err(CaldavError::from)
+}
+
+/// Refuse a URL-shaped path argument (`calendar_path` / `resource_path`)
+/// that would carry the connection's Basic credentials to another
+/// origin — the command-boundary twin of the client's href guard (the
+/// CardDAV commands apply the same check to `book_url`/`href`). Absolute
+/// PATHS (no scheme — the normal stored form) pass through untouched.
+fn require_same_origin(server_url: &str, path_or_url: &str) -> Result<(), CaldavError> {
+    if !path_or_url.contains("://") {
+        return Ok(());
+    }
+    let server = crate::ai::http::parse_request_url(server_url)?;
+    let target = crate::ai::http::parse_request_url(path_or_url)?;
+    if target.host.eq_ignore_ascii_case(&server.host)
+        && target.port == server.port
+        && target.https == server.https
+    {
+        Ok(())
+    } else {
+        Err(CaldavError::Config(
+            "the path must live on the same server as the connection".to_string(),
+        ))
+    }
 }
 
 /// Connection test (spec: "A connection test SHALL report success or a
@@ -325,6 +352,9 @@ async fn run_sync(
     sync_token: Option<String>,
 ) -> Result<CaldavSyncResponse, CaldavError> {
     validate_server_url(server_url)?;
+    // An absolute-URL calendar path must stay on the connection's
+    // origin (absolute paths are the normal stored form).
+    require_same_origin(server_url, calendar_path)?;
     let credentials = credentials(username, app_password)?;
     let outcome = client::sync(
         server_url,
@@ -360,6 +390,9 @@ pub async fn caldav_put_event(
 ) -> Result<(), CaldavCommandError> {
     async {
         validate_server_url(&server_url)?;
+        // An absolute-URL resource path must stay on the connection's
+        // origin (absolute paths are the normal stored form).
+        require_same_origin(&server_url, &resource_path)?;
         let credentials = credentials(&username, &app_password)?;
         client::put_event(&server_url, &credentials, &resource_path, &ical).await
     }
@@ -380,6 +413,9 @@ pub async fn caldav_delete_event(
 ) -> Result<(), CaldavCommandError> {
     async {
         validate_server_url(&server_url)?;
+        // An absolute-URL resource path must stay on the connection's
+        // origin (absolute paths are the normal stored form).
+        require_same_origin(&server_url, &resource_path)?;
         let credentials = credentials(&username, &app_password)?;
         client::delete_event(&server_url, &credentials, &resource_path).await
     }
@@ -461,5 +497,59 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), "config");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_path_arguments_are_refused_before_any_io() {
+        // A URL-shaped calendar/resource path pointing at another origin
+        // is a config error before any request carries credentials
+        // there (dav.example.com does not resolve here — the guard fires
+        // first, so no network error can surface).
+        let error = run_sync(
+            "https://dav.example.com/",
+            "user",
+            "pass",
+            "https://evil.example/cal/home/",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), "config");
+        assert!(error.to_string().contains("same server"), "{error}");
+
+        let error = caldav_put_event(
+            "https://dav.example.com/".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
+            "https://evil.example/cal/home/x.ics".to_string(),
+            "BEGIN:VCALENDAR".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, "config");
+
+        let error = caldav_delete_event(
+            "https://dav.example.com/".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
+            "https://evil.example/cal/home/x.ics".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, "config");
+
+        // Same-origin URL paths and absolute paths pass the guard (the
+        // latter is the normal stored form).
+        assert!(require_same_origin("https://dav.example.com/dav/", "/dav/user/cal/").is_ok());
+        assert!(
+            require_same_origin("https://dav.example.com/dav/", "https://dav.example.com/dav/x/")
+                .is_ok()
+        );
+        // Host casing does not matter; port and scheme do.
+        assert!(require_same_origin("https://dav.example.com/", "https://DAV.EXAMPLE.COM/cal/")
+            .is_ok());
+        assert!(require_same_origin("https://dav.example.com/", "https://dav.example.com:8443/")
+            .is_err());
+        assert!(require_same_origin("https://dav.example.com/", "http://dav.example.com/").is_err());
     }
 }

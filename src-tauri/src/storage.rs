@@ -280,6 +280,53 @@ pub fn delete_all_local_data<R: Runtime>(app: AppHandle<R>) -> Result<(), String
     app.restart();
 }
 
+// ---------------------------------------------------------------------------
+// Credentials key file permissions
+// ---------------------------------------------------------------------------
+
+/// Restrict `credentials.key` (the AES key-sealing file the crypto layer
+/// keeps under the app data dir) to the owning user: on Unix, mode
+/// 0600 (no group/other bits). A missing file is Ok — there is nothing
+/// to restrict yet (first run); any other I/O failure surfaces with
+/// context. Pure path-based (no Tauri handle), so it is unit-testable.
+fn set_owner_only_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                fs::set_permissions(path, permissions)
+                    .map_err(|error| format!("could not restrict {}: {error}", path.display()))?;
+                Ok(())
+            }
+            // Nothing sealed yet — first run, nothing to restrict.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("could not stat {}: {error}", path.display())),
+        }
+    }
+    // Non-Unix platforms have no POSIX mode bits to clear; the file
+    // system's own defaults apply.
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Tighten `<app_data_dir>/credentials.key` to owner-only permissions.
+/// Takes NO path argument — the file is resolved from the app's own data
+/// dir, so the command can never be aimed at an arbitrary file.
+#[tauri::command]
+pub fn restrict_credentials_key_permissions(app: AppHandle) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("app data dir unavailable: {error}"))?;
+    set_owner_only_permissions(&data_dir.join("credentials.key"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +487,25 @@ mod tests {
         fn total_bytes(&self) -> u64 {
             self.bytes.iter().sum()
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_key_permissions_restrict_to_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("key-permissions");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let key = dir.join("credentials.key");
+        fs::write(&key, b"sealed-key-bytes").expect("write key file");
+        // The pre-fix state: a default-created 0644 file.
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).expect("widen mode");
+        set_owner_only_permissions(&key).expect("restriction succeeds");
+        let mode = fs::metadata(&key).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "owner read/write only");
+        // A missing file is Ok (first run — nothing sealed yet).
+        set_owner_only_permissions(&dir.join("absent.key")).expect("missing file is Ok");
+        // Idempotent: a second call keeps 0600.
+        set_owner_only_permissions(&key).expect("idempotent");
+        assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

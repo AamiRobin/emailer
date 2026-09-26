@@ -5,8 +5,13 @@
 //!
 //! All requests are Basic-authenticated (the app-password model from the
 //! spec's CalDAV connect scenario) and all failures are specific
-//! [`CaldavError`]s. Server variance beyond this flow (Fastmail/Nextcloud
-//! quirks) is deferred per design D5's risk note — see `mod.rs`.
+//! [`CaldavError`]s. Every server-supplied href (principal, home,
+//! calendar and event hrefs from multistatus, stored resource paths) is
+//! resolved against the connection's origin and REFUSED when it would
+//! cross to another host/port/scheme — credentials must never be
+//! forwarded cross-origin (the same guard the CardDAV client applies).
+//! Server variance beyond this flow (Fastmail/Nextcloud quirks) is
+//! deferred per design D5's risk note — see `mod.rs`.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -121,6 +126,24 @@ async fn report(
     parse_multistatus(&response.body)
 }
 
+/// Resolve a server-supplied href against the request base and REFUSE
+/// cross-origin results (credentials must never be forwarded to another
+/// host/port/scheme — the same guard the CardDAV client applies to every
+/// address-book href). Returns the absolute URL.
+fn resolve(base: &crate::ai::http::RequestUrl, href: &str) -> Result<String, CaldavError> {
+    let joined = join_url(base, href)?;
+    let resolved = parse_request_url(&joined)?;
+    if !resolved.host.eq_ignore_ascii_case(&base.host)
+        || resolved.port != base.port
+        || resolved.https != base.https
+    {
+        return Err(CaldavError::Config(
+            "a calendar href changed origin; refusing to forward credentials".to_string(),
+        ));
+    }
+    Ok(joined)
+}
+
 /// Connection test (spec: reports success or a specific failure): one
 /// authenticated PROPFIND Depth 0 against the given URL. Anything but a
 /// well-formed multistatus answer is a specific [`CaldavError`].
@@ -171,7 +194,7 @@ pub(crate) async fn discover(
     // 2. principal → calendar-home-set.
     if home.is_none() {
         if let Some(principal) = principal.as_deref() {
-            let principal_url = join_url(&base, principal)?;
+            let principal_url = resolve(&base, principal)?;
             let second = propfind(&principal_url, credentials, 0).await?;
             home = second
                 .responses
@@ -182,7 +205,7 @@ pub(crate) async fn discover(
 
     // 3. Depth-1 listing.
     let home_url = match home.as_deref() {
-        Some(home) => Some(join_url(&base, home)?),
+        Some(home) => Some(resolve(&base, home)?),
         None => None,
     };
     let listing = match home_url.as_deref() {
@@ -220,7 +243,7 @@ pub(crate) async fn discover(
         {
             continue;
         }
-        let href = join_url(&base, &response.href)?;
+        let href = resolve(&base, &response.href)?;
         if seen.contains(&href) {
             continue;
         }
@@ -292,9 +315,9 @@ fn split_report(
     let mut removed = Vec::new();
     for response in multistatus.responses {
         if response.is_removed() {
-            removed.push(join_url(base, &response.href)?);
+            removed.push(resolve(base, &response.href)?);
         } else if let Some(ical) = response.calendar_data {
-            changed.push((join_url(base, &response.href)?, ical));
+            changed.push((resolve(base, &response.href)?, ical));
         }
         // A non-removed response without calendar-data (etag-only) has
         // nothing to store.
@@ -332,10 +355,11 @@ pub(crate) async fn sync(
     let base = parse_request_url(server_url)?;
     // The path comes from a discovery href: an absolute URL (discovery
     // joins multistatus hrefs against the base) or an absolute path.
-    let calendar_url = if calendar_path.contains("://") {
-        calendar_path.to_string()
-    } else if calendar_path.starts_with('/') {
-        join_url(&base, calendar_path)?
+    // Both resolve against the connection origin — a URL pointing at
+    // another host/port/scheme is refused before any request carries
+    // the Basic credentials there.
+    let calendar_url = if calendar_path.contains("://") || calendar_path.starts_with('/') {
+        resolve(&base, calendar_path)?
     } else {
         return Err(CaldavError::Config(
             "the calendar path must be an absolute path or URL from the discovery result"
@@ -393,18 +417,17 @@ pub(crate) async fn sync(
 /// Resolve the absolute URL of one event resource from the server base and
 /// the resource path the TS layer derives (`{calendar href}{uid}.ics`).
 /// Same path forms as [`sync`]'s calendar path: an absolute URL, or an
-/// absolute path joined against the base; anything else is a config error
-/// before any I/O.
+/// absolute path joined against the base — both origin-checked, so a
+/// stored resource path pointing at another host never carries the
+/// credentials anywhere but the connection's server; anything else is a
+/// config error before any I/O.
 fn resolve_resource_url(
     server_url: &str,
     resource_path: &str,
 ) -> Result<String, CaldavError> {
     let base = parse_request_url(server_url)?;
-    if resource_path.contains("://") {
-        return Ok(resource_path.to_string());
-    }
-    if let Some(path) = resource_path.strip_prefix('/') {
-        return join_url(&base, path);
+    if resource_path.contains("://") || resource_path.starts_with('/') {
+        return resolve(&base, resource_path);
     }
     Err(CaldavError::Config(
         "the event resource path must be an absolute path or URL".to_string(),
@@ -949,6 +972,110 @@ mod tests {
         let error = sync(&server.base_url(), &creds(), "cal/home/", None)
             .await
             .expect_err("relative path is a config error");
+        assert_eq!(error.kind(), "config");
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_refuses_cross_origin_hrefs() {
+        // The home set points at another host: discovery must refuse
+        // instead of following it with credentials.
+        let evil_home = mock::xml_response(
+            207,
+            "Multi-Status",
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/dav/user/</D:href>
+    <D:propstat>
+      <D:prop>
+        <cal:calendar-home-set><D:href>https://evil.example/dav/</D:href></cal:calendar-home-set>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#,
+        );
+        let server = mock::spawn_routes(vec![
+            Route::new("PROPFIND", "/", principal_response()),
+            Route::new("PROPFIND", "/dav/user/", evil_home),
+        ])
+        .await;
+
+        let error = discover(&server.base_url(), &creds())
+            .await
+            .map(|_| ())
+            .expect_err("cross-origin href is refused");
+        assert_eq!(error.kind(), "config");
+        assert!(error.to_string().contains("origin"), "{error}");
+        // The listing request never happened.
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_cross_origin_calendar_paths() {
+        let server = mock::spawn_routes(vec![]).await;
+        let error = sync(
+            &server.base_url(),
+            &creds(),
+            "https://evil.example/cal/home/",
+            None,
+        )
+        .await
+        .expect_err("cross-origin calendar path is refused");
+        assert_eq!(error.kind(), "config");
+        assert!(error.to_string().contains("origin"), "{error}");
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn report_hrefs_are_origin_checked() {
+        // A multistatus whose event href points at another host must not
+        // surface as a changed/removed URL.
+        let evil_sync = mock::xml_response(
+            207,
+            "Multi-Status",
+            &format!(
+                r#"<D:multistatus xmlns:D="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>https://evil.example/cal/home/a.ics</D:href>
+    <D:propstat>
+      <D:prop>
+        <cal:calendar-data>{}</cal:calendar-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#,
+                event_ical("uid-a", "Evil").replace('\r', "&#13;").replace('\n', "&#10;")
+            ),
+        );
+        let server = mock::spawn_routes(vec![Route::new("REPORT", "/cal/home/", evil_sync)]).await;
+        let error = sync(&server.base_url(), &creds(), "/cal/home/", None)
+            .await
+            .expect_err("cross-origin report href is refused");
+        assert_eq!(error.kind(), "config");
+        assert!(error.to_string().contains("origin"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn write_cross_origin_hrefs_are_refused() {
+        // A stored resource path pointing at another origin never
+        // reaches the transport.
+        let server = mock::spawn_routes(vec![]).await;
+        let error = put_event(
+            &server.base_url(),
+            &creds(),
+            "https://evil.example/cal/home/x.ics",
+            "BEGIN:VCALENDAR",
+        )
+        .await
+        .expect_err("cross-origin href refused");
+        assert_eq!(error.kind(), "config");
+        assert!(error.to_string().contains("origin"), "{error}");
+
+        let error = delete_event(&server.base_url(), &creds(), "https://evil.example/cal/home/x.ics")
+            .await
+            .expect_err("cross-origin href refused");
         assert_eq!(error.kind(), "config");
         assert!(server.requests().is_empty());
     }

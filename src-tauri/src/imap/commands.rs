@@ -3,58 +3,12 @@
 //! All commands are stateless: each call connects, performs its work, and
 //! logs out. Connection parameters are passed explicitly per call.
 
-use crate::imap::client;
+use crate::imap::client::{
+    self, require_flag_keywords, require_folder_name, require_uid_set,
+};
 use crate::imap::types::{
     FetchResult, FlagsChangedResult, ImapFolder, ImapParams, TestResult, UidFlags,
 };
-
-/// Validate a UID set at the trust boundary: async-imap interpolates the
-/// value verbatim into `UID FETCH/STORE/MOVE/COPY/EXPUNGE` command lines
-/// (no quoting, no CR/LF check), so only the IMAP sequence-set charset may
-/// pass. Leading/trailing/duplicate commas are harmless and allowed.
-fn require_uid_set(uid_set: &str) -> Result<(), String> {
-    let valid = !uid_set.is_empty()
-        && uid_set
-            .chars()
-            .all(|c| c.is_ascii_digit() || matches!(c, '*' | ':' | ','));
-    if valid {
-        Ok(())
-    } else {
-        Err(
-            "uid set must only contain digits, '*', ':' and ',' (e.g. \"1,5,9\" or \"104:*\")"
-                .to_string(),
-        )
-    }
-}
-
-/// True when `s` is a non-empty IMAP atom: the RFC 3501 ATOM-CHAR set minus
-/// the response-specials, i.e. anything but spaces, controls, parens,
-/// brackets, `{` `%` `*` `"` `\` and CR/LF. Enough for flag keywords, which
-/// must never be able to alter the surrounding STORE/APPEND command line.
-fn is_imap_atom(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
-}
-
-/// Validate STORE/APPEND flag keywords at the trust boundary: the flag list
-/// is interpolated verbatim into the command. A flag is either a system flag
-/// (leading `\` + atom, e.g. `\Seen`) or a keyword atom (e.g. `$Label1`,
-/// `NonJunk`); anything else (spaces, parens, brackets, CR/LF) is rejected.
-/// Only spaces/tabs are trimmed first — a padded keyword (" $Label1 ") keeps
-/// working, while anything containing CR/LF or other controls is rejected.
-fn require_flag_keywords(flags: &[String]) -> Result<(), String> {
-    for flag in flags {
-        let trimmed = flag.trim_matches([' ', '\t']);
-        let atom = trimmed.strip_prefix('\\').unwrap_or(trimmed);
-        if !is_imap_atom(atom) {
-            return Err(format!(
-                "invalid flag {flag:?}: must be a system flag (e.g. \"\\\\Seen\") or a keyword without spaces or special characters"
-            ));
-        }
-    }
-    Ok(())
-}
 
 /// The fetch commands accept either an explicit `uidSet` (e.g. "104:*",
 /// "1:100", "1,5,9") or `last = n` to fetch the n most recent messages.
@@ -220,6 +174,7 @@ pub async fn imap_move_message(
     uid_set: String,
     destination: String,
 ) -> Result<(), String> {
+    require_folder_name(&destination)?;
     require_uid_set(&uid_set)?;
     let mut session = client::connect(&params).await?;
     let result = client::move_message(&mut session, &folder, &uid_set, &destination).await;
@@ -261,77 +216,35 @@ pub async fn imap_append(
     result
 }
 
-// ---------- Tests ----------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn flags(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    // ----- UID set validation -----
-
-    #[test]
-    fn uid_set_accepts_sequence_sets() {
-        assert!(require_uid_set("1").is_ok());
-        assert!(require_uid_set("1:*").is_ok());
-        assert!(require_uid_set("1,5,9").is_ok());
-        assert!(require_uid_set("104:*").is_ok());
-        assert!(require_uid_set("1:100,200:300").is_ok());
-        // Stray commas are harmless — allowed.
-        assert!(require_uid_set("1,,").is_ok());
-        assert!(require_uid_set(",1,").is_ok());
-    }
-
-    #[test]
-    fn uid_set_rejects_empty_and_foreign_characters() {
-        assert!(require_uid_set("").is_err());
-        // CR/LF injection must not reach the command line.
-        assert!(require_uid_set("1:2\r\n").is_err());
-        assert!(require_uid_set("1\n").is_err());
-        assert!(require_uid_set("a b").is_err());
-        assert!(require_uid_set("[x]").is_err());
-        assert!(require_uid_set("(1:2)").is_err());
-        assert!(require_uid_set("1;2").is_err());
-        assert!(require_uid_set("\"1\"").is_err());
-        assert!(require_uid_set("1 2").is_err());
-        assert!(require_uid_set("-1").is_err());
-        assert!(require_uid_set("+1").is_err());
-    }
-
-    // ----- Flag keyword validation -----
-
-    #[test]
-    fn flag_keywords_accept_system_flags_and_atoms() {
-        assert!(require_flag_keywords(&flags(&["\\Seen"])).is_ok());
-        assert!(require_flag_keywords(&flags(&["\\Seen", "\\Answered"])).is_ok());
-        assert!(require_flag_keywords(&flags(&["$Label1"])).is_ok());
-        assert!(require_flag_keywords(&flags(&["NonJunk"])).is_ok());
-        assert!(require_flag_keywords(&flags(&["custom-keyword_2"])).is_ok());
-        // Whitespace-padded keywords keep working (normalized downstream).
-        assert!(require_flag_keywords(&flags(&[" $Label1 "])).is_ok());
-    }
-
-    #[test]
-    fn flag_keywords_reject_command_shaping() {
-        // Spaces would smuggle extra command tokens.
-        assert!(require_flag_keywords(&flags(&["Seen ok"])).is_err());
-        // `;` is outside the IMAP atom charset.
-        assert!(require_flag_keywords(&flags(&["In;ject"])).is_err());
-        // CR/LF injection.
-        assert!(require_flag_keywords(&flags(&["Seen\r\n"])).is_err());
-        assert!(require_flag_keywords(&flags(&["a\r\nb"])).is_err());
-        // Brackets and parens are response-specials, not atoms.
-        assert!(require_flag_keywords(&flags(&["[x]"])).is_err());
-        assert!(require_flag_keywords(&flags(&["(x)"])).is_err());
-        // Quotes break out of unquoted contexts.
-        assert!(require_flag_keywords(&flags(&["\"x\""])).is_err());
-        // A bare backslash is not a flag.
-        assert!(require_flag_keywords(&flags(&["\\"])).is_err());
-        // Empty string.
-        assert!(require_flag_keywords(&flags(&[""])).is_err());
-        assert!(require_flag_keywords(&flags(&["   "])).is_err());
+    /// Boundary wiring (review L9): a folder argument with command-shaping
+    /// bytes must be rejected at the command layer BEFORE any connection is
+    /// attempted — the params below point at an unroutable host, so a test
+    /// that attempted I/O would time out, not error fast.
+    #[tokio::test]
+    async fn move_message_rejects_control_characters_in_destination() {
+        let params = ImapParams {
+            host: "192.0.2.1".into(), // TEST-NET-1: never connects fast
+            port: 1,
+            security: crate::imap::types::Security::None,
+            username: "u".into(),
+            password: "p".into(),
+            accept_invalid_certs: false,
+        };
+        let error = imap_move_message(
+            params,
+            "INBOX".into(),
+            "1".into(),
+            "INBOX\r\nA001 NOOP".into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("control characters"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -217,10 +217,31 @@ fn split_https_url(url: &str) -> Option<(String, String)> {
     })
 }
 
+/// True only for the hosts a redirect hop may go to: gravatar.com
+/// itself or a regional `*.gravatar.com` mirror. Anything else — however
+/// valid an HTTPS URL it is — must end the fetch, not carry the request
+/// (and the address hash in the path) to a third party.
+fn is_gravatar_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == GRAVATAR_HOST || host.ends_with(&format!(".{GRAVATAR_HOST}"))
+}
+
+/// Resolve a redirect `Location` into the next (host, path) hop, only
+/// when it is HTTPS AND confined to gravatar.com / *.gravatar.com.
+fn redirect_target(location: &str) -> Result<(String, String), String> {
+    let (host, path) =
+        split_https_url(location).ok_or_else(|| format!("refusing non-HTTPS gravatar redirect: {location}"))?;
+    if !is_gravatar_host(&host) {
+        return Err(format!("refusing gravatar redirect to a non-gravatar host: {host}"));
+    }
+    Ok((host, path))
+}
+
 /// Fetch the avatar bytes for a hash from the network: 200 → bytes,
-/// 404 (`d=404` "no gravatar") → `None`, redirects followed (HTTPS only),
-/// anything else is an error. Network failures surface as `Err` — the
-/// TS layer treats those the same as "no avatar" and keeps the initials.
+/// 404 (`d=404` "no gravatar") → `None`, redirects followed only to
+/// HTTPS gravatar.com hosts (see [`redirect_target`]), anything else is
+/// an error. Network failures surface as `Err` — the TS layer treats
+/// those the same as "no avatar" and keeps the initials.
 async fn fetch_gravatar_bytes(hash: &str) -> Result<Option<Vec<u8>>, String> {
     let mut host = GRAVATAR_HOST.to_string();
     let mut path = format!("/avatar/{hash}?d=404&s=128");
@@ -236,9 +257,7 @@ async fn fetch_gravatar_bytes(hash: &str) -> Result<Option<Vec<u8>>, String> {
                 let Some(location) = response.location else {
                     return Err(format!("gravatar redirect without Location header ({host}{path})"));
                 };
-                let Some((next_host, next_path)) = split_https_url(&location) else {
-                    return Err(format!("refusing non-HTTPS gravatar redirect: {location}"));
-                };
+                let (next_host, next_path) = redirect_target(&location)?;
                 host = next_host;
                 path = next_path;
             }
@@ -305,7 +324,9 @@ fn encode_base64(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_chunked, gravatar_hash, parse_response, split_https_url};
+    use super::{
+        decode_chunked, gravatar_hash, parse_response, redirect_target, split_https_url,
+    };
 
     #[test]
     fn hash_matches_known_sha256_vectors() {
@@ -402,5 +423,24 @@ mod tests {
         assert_eq!(split_https_url("http://gravatar.com/avatar/x"), None);
         assert_eq!(split_https_url("/avatar/abc"), None);
         assert_eq!(split_https_url(""), None);
+    }
+
+    #[test]
+    fn redirect_targets_are_confined_to_gravatar_hosts() {
+        // gravatar.com and its regional mirrors are the only hosts a
+        // redirect hop may reach.
+        assert!(redirect_target("https://gravatar.com/avatar/abc").is_ok());
+        assert!(redirect_target("https://0.gravatar.com/avatar/abc").is_ok());
+        assert!(redirect_target("https://i2.wp.com.gravatar.com/avatar/abc").is_ok());
+        // HTTPS but a third-party host: refused, not followed.
+        let error = redirect_target("https://evil.example.com/avatar/abc").unwrap_err();
+        assert!(error.contains("non-gravatar"), "{error}");
+        // Look-alike hosts do not count as *.gravatar.com.
+        assert!(redirect_target("https://gravatar.com.evil.example/avatar/abc").is_err());
+        assert!(redirect_target("https://evilgravatar.com/avatar/abc").is_err());
+        assert!(redirect_target("https://gravatar.co/avatar/abc").is_err());
+        // Non-HTTPS is still refused outright.
+        let error = redirect_target("http://0.gravatar.com/avatar/abc").unwrap_err();
+        assert!(error.contains("non-HTTPS"), "{error}");
     }
 }

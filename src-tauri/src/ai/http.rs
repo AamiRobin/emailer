@@ -53,6 +53,23 @@ impl RequestUrl {
     }
 }
 
+/// True when `s` is safe to interpolate into the raw request bytes this
+/// module writes (request line, header block): no control characters
+/// (CR/LF, NUL, tab, …) and no whitespace anywhere. The request is
+/// assembled by string concatenation, so a `\r\n` in the URL is a
+/// request-splitting primitive and a space breaks the request line —
+/// both must fail validation, never reach the wire.
+fn is_request_safe(s: &str) -> bool {
+    !s.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// True when `s` is safe as a header NAME or VALUE: header values may
+/// legitimately contain spaces ("application/json; charset=utf-8"), so
+/// only control characters (CR/LF above all) are refused there.
+fn is_header_safe(s: &str) -> bool {
+    !s.chars().any(|c| c.is_control())
+}
+
 /// Parse an absolute `http(s)://…` URL, enforcing the transport policy:
 /// `https` always; `http` only when the host is loopback (Ollama-style
 /// local endpoints). Any other scheme, or plaintext to a remote host, is
@@ -60,6 +77,15 @@ impl RequestUrl {
 /// Gemini it contains the API key.
 pub(crate) fn parse_request_url(url: &str) -> Result<RequestUrl, AiError> {
     let invalid = || AiError::Config("AI provider URL must be absolute http(s)".to_string());
+
+    // The URL is interpolated verbatim into the request line; anything
+    // with control characters or whitespace (padded or CRLF-laced base
+    // URLs) is refused before parsing.
+    if !is_request_safe(url) {
+        return Err(AiError::Config(
+            "AI provider URL must not contain control characters or whitespace".to_string(),
+        ));
+    }
 
     let (scheme, rest) = url.split_once("://").ok_or_else(invalid)?;
     let https = match scheme.to_ascii_lowercase().as_str() {
@@ -182,13 +208,26 @@ impl Conn {
 }
 
 /// Issue one `POST {url}` with a JSON body and the given extra headers
-/// (auth headers differ per provider). Reads the whole response with a
+/// (auth headers differ per provider). Control characters or whitespace
+/// in the URL, and control characters in a header name/value, are
+/// refused before anything is sent. Reads the whole response with a
 /// cap of 8 MiB. Never logs, never embeds request bytes in errors.
 pub(crate) async fn post_json(
     url: &str,
     extra_headers: &[(&str, &str)],
     body: &str,
 ) -> Result<HttpResponse, AiError> {
+    // Header names and values are interpolated verbatim into the header
+    // block this fn assembles — a CR/LF (or any control character) in
+    // either is a request-splitting primitive and is refused before any
+    // bytes are built or a socket opened.
+    for (name, value) in extra_headers {
+        if !is_header_safe(name) || !is_header_safe(value) {
+            return Err(AiError::Config(
+                "AI provider request headers must not contain control characters".to_string(),
+            ));
+        }
+    }
     let parsed = parse_request_url(url)?;
     let payload = body.as_bytes();
 
@@ -357,7 +396,7 @@ fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_chunked, parse_request_url, parse_response, RequestUrl};
+    use super::{decode_chunked, parse_request_url, parse_response, post_json, RequestUrl};
 
     #[test]
     fn parses_https_urls_with_default_port_and_target() {
@@ -411,6 +450,40 @@ mod tests {
         assert!(parse_request_url("https:///path-only").is_err());
         assert!(parse_request_url("https://host:notaport/x").is_err());
         assert!(parse_request_url("https://[::1/x").is_err());
+    }
+
+    #[test]
+    fn rejects_control_characters_and_whitespace_in_urls() {
+        // The URL is interpolated verbatim into the request line: CR/LF
+        // (request splitting), NUL, tab and spaces are all refused
+        // before parsing — wherever they sit.
+        assert!(parse_request_url("https://api.example.com/\r\nX-Inject: 1").is_err());
+        assert!(parse_request_url("https://api.example.com/a\nb").is_err());
+        assert!(parse_request_url("https://api.example.com/a\tb").is_err());
+        assert!(parse_request_url("https://api.example.com/a\u{0}b").is_err());
+        // Whitespace anywhere: padded host, space in the path.
+        assert!(parse_request_url(" https://api.example.com/").is_err());
+        assert!(parse_request_url("https://api.example.com/ ").is_err());
+        assert!(parse_request_url("https://api.example.com/a b").is_err());
+        assert!(parse_request_url("https://my host.example.com/").is_err());
+    }
+
+    #[tokio::test]
+    async fn post_json_refuses_control_characters_in_headers() {
+        // A CR/LF in a header name or value is a request-splitting
+        // primitive; both must be refused BEFORE any socket is opened
+        // (example.test never resolves — the assertions see the config
+        // error, not a network one).
+        for headers in [
+            vec![("x-inject\r\nGET /evil HTTP/1.1", "v")],
+            vec![("authorization", "Bearer k\r\nX-Evil: 1")],
+            vec![("x-nul", "v\u{0}")],
+        ] {
+            let error = post_json("https://example.test/v1", &headers, "{}")
+                .await
+                .expect_err("control characters in headers are refused");
+            assert!(error.to_string().contains("control"), "{error}");
+        }
     }
 
     fn raw_response(head: &str, body: &[u8]) -> Vec<u8> {

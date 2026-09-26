@@ -473,71 +473,174 @@ const REASONING_TAGS: [&str; 4] = ["think", "thinking", "reason", "reasoning"];
 /// blocks, a lone leading `</think>` (reasoning streamed before any open
 /// tag), and an unterminated `<think>` (reasoning that runs to the end).
 /// Case-insensitive; otherwise the answer text is kept byte-identical.
+///
+/// ONE left-to-right pass over the bytes, building the output as it goes
+/// (the previous remove-and-rescan loop lowercased the WHOLE remaining
+/// string and shifted it once per removed block — quadratic on
+/// adversarial many-block input up to the 8 MiB content cap). The pass
+/// reproduces the rescan semantics exactly, including tag literals a
+/// removal can create ACROSS its seam (`"x<thi" + "<think>b</think>" +
+/// "nk>"` joins to `x<think>b…`): at every block close the kept output's
+/// tail is re-checked against the input that follows, so a straddling
+/// tag is consumed exactly as if it had matched in place.
 fn strip_reasoning(text: &str) -> String {
-    let mut answer = text.to_string();
+    // The 8 literals recognized, in tag order (kept lowercase; input
+    // bytes are compared with eq_ignore_ascii_case, never rewritten).
+    let tags: Vec<(String, String)> = REASONING_TAGS
+        .iter()
+        .map(|tag| (format!("<{tag}>"), format!("</{tag}>")))
+        .collect();
 
-    // 1) Well-formed <tag>…</tag> blocks, earliest first, repeatedly.
-    loop {
-        let lower = answer.to_ascii_lowercase();
-        let mut earliest: Option<(usize, usize)> = None; // (open_start, block_end)
-        for tag in REASONING_TAGS {
-            let open = format!("<{tag}>");
-            let close = format!("</{tag}>");
-            if let Some(open_start) = lower.find(&open) {
-                let inner = open_start + open.len();
-                if let Some(rel) = lower[inner..].find(&close) {
-                    let end = inner + rel + close.len();
-                    if earliest.map_or(true, |(o, _)| open_start < o) {
-                        earliest = Some((open_start, end));
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    // A block is open: the index of its tag. Everything until that
+    // tag's OWN closer is reasoning (nested opens and foreign closers
+    // inside the block are content, not structure — same as the rescan,
+    // where the earliest open spanned to its first own closer).
+    let mut inside: Option<usize> = None;
+    // Per tag, whether its closer already appeared OUTSIDE any block.
+    // The FIRST lone closer of a tag cut everything before it (reasoning
+    // streamed ahead of the answer); a REPEATED lone closer is answer
+    // text (only what PRECEDES a closer was reasoning).
+    let mut closer_seen = [false; REASONING_TAGS.len()];
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if bytes.get(i + 1) == Some(&b'/') {
+                if let Some(index) = tags
+                    .iter()
+                    .position(|(_, close)| matches_at(bytes, i, close))
+                {
+                    let close_len = tags[index].1.len();
+                    i += close_len;
+                    match inside {
+                        // The block's own closer ends it; the removal
+                        // seam may complete a tag (see the comment on
+                        // the fn).
+                        Some(current) if current == index => {
+                            inside = None;
+                            i = close_seam(
+                                text, bytes, i, &mut out, &mut closer_seen, &mut inside, &tags,
+                            );
+                        }
+                        // A foreign closer inside a block: reasoning.
+                        Some(_) => {}
+                        None => {
+                            if !closer_seen[index] {
+                                closer_seen[index] = true;
+                                out.clear();
+                            } else {
+                                out.push_str(&text[i - close_len..i]);
+                            }
+                        }
                     }
+                    continue;
+                }
+            } else if let Some(index) = tags
+                .iter()
+                .position(|(open, _)| matches_at(bytes, i, open))
+            {
+                i += tags[index].0.len();
+                // A nested open inside a block is reasoning; outside,
+                // it opens one (an open still unterminated at EOF just
+                // discards to the end — phase 2 of the rescan).
+                if inside.is_none() {
+                    inside = Some(index);
+                }
+                continue;
+            }
+        }
+        // Plain answer text up to the next '<' ('<' is ASCII, so these
+        // slices always land on char boundaries).
+        let search = if bytes[i] == b'<' { i + 1 } else { i };
+        let next = bytes[search..]
+            .iter()
+            .position(|&byte| byte == b'<')
+            .map(|offset| search + offset)
+            .unwrap_or(bytes.len());
+        if inside.is_none() {
+            out.push_str(&text[i..next]);
+        }
+        i = next;
+    }
+
+    out.trim().to_string()
+}
+
+/// Case-insensitive literal match of `literal` at `pos`.
+fn matches_at(bytes: &[u8], pos: usize, literal: &str) -> bool {
+    let pattern = literal.as_bytes();
+    bytes.len() >= pos + pattern.len()
+        && bytes[pos..pos + pattern.len()]
+            .iter()
+            .zip(pattern)
+            .all(|(byte, want)| byte.eq_ignore_ascii_case(want))
+}
+
+/// Case-insensitive `haystack.starts_with(needle)` over bytes.
+fn starts_with_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .iter()
+            .zip(needle)
+            .all(|(byte, want)| byte.eq_ignore_ascii_case(want))
+}
+
+/// After a block close consumed input up to `i`, a tag literal may
+/// STRADDLE the removal seam: the kept output ends with a proper prefix
+/// of a literal (case-insensitively) and the input continues with the
+/// rest. Resolve it — rewind the prefix, consume the completion and
+/// process the completed tag exactly as if it had matched in place —
+/// and return the new input position. At most one literal can complete
+/// across a given seam (the literals are mutually exclusive at one
+/// position).
+#[allow(clippy::too_many_arguments)]
+fn close_seam(
+    text: &str,
+    bytes: &[u8],
+    mut i: usize,
+    out: &mut String,
+    closer_seen: &mut [bool; REASONING_TAGS.len()],
+    inside: &mut Option<usize>,
+    tags: &[(String, String)],
+) -> usize {
+    let tail = out.as_bytes();
+    for (index, (open, close)) in tags.iter().enumerate() {
+        for literal in [open.as_str(), close.as_str()] {
+            for prefix_len in 1..literal.len() {
+                let pattern = literal.as_bytes();
+                if tail.len() >= prefix_len
+                    && tail[tail.len() - prefix_len..]
+                        .iter()
+                        .zip(&pattern[..prefix_len])
+                        .all(|(byte, want)| byte.eq_ignore_ascii_case(want))
+                    && starts_with_ignore_case(&bytes[i..], &pattern[prefix_len..])
+                {
+                    let completion = literal.len() - prefix_len;
+                    i += completion;
+                    if pattern[1] == b'/' {
+                        // A completed closer, outside any block: the
+                        // same first/repeated rule as a direct match.
+                        if !closer_seen[index] {
+                            closer_seen[index] = true;
+                            out.clear();
+                        } else {
+                            // The completed closer is answer text; the
+                            // partial prefix already in `out` stays.
+                            out.push_str(&text[i - completion..i]);
+                        }
+                    } else {
+                        // A completed opener: the prefix was part of it.
+                        out.truncate(out.len() - prefix_len);
+                        *inside = Some(index);
+                    }
+                    return i;
                 }
             }
         }
-        match earliest {
-            Some((open_start, end)) => answer.replace_range(open_start..end, ""),
-            None => break,
-        }
     }
-
-    // 2) An unterminated open tag: everything from it to the end is
-    // reasoning (a block whose close has not arrived — or never will).
-    {
-        let lower = answer.to_ascii_lowercase();
-        let mut cut: Option<usize> = None; // open_start
-        for tag in REASONING_TAGS {
-            let open = format!("<{tag}>");
-            if let Some(open_start) = lower.find(&open) {
-                if cut.map_or(true, |o| open_start < o) {
-                    cut = Some(open_start);
-                }
-            }
-        }
-        if let Some(open_start) = cut {
-            answer.truncate(open_start);
-        }
-    }
-
-    // 3) A lone closer with no opener left before it: some models emit
-    // only `</think>` ahead of the answer, so everything before the LAST
-    // lone closer was reasoning.
-    {
-        let lower = answer.to_ascii_lowercase();
-        let mut cut: Option<usize> = None; // end of the last lone closer
-        for tag in REASONING_TAGS {
-            let close = format!("</{tag}>");
-            if let Some(close_start) = lower.find(&close) {
-                let end = close_start + close.len();
-                if cut.map_or(true, |e| end > e) {
-                    cut = Some(end);
-                }
-            }
-        }
-        if let Some(end) = cut {
-            answer.replace_range(0..end, "");
-        }
-    }
-
-    answer.trim().to_string()
+    i
 }
 
 /// Route one call: rate-limit the surface, build the right provider
@@ -1112,6 +1215,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn strip_reasoning_handles_many_blocks_in_one_pass() {
+        // 20_000 small blocks: the previous remove-and-rescan loop
+        // lowercased and shifted the whole remaining string once per
+        // block (quadratic); the single pass stays linear — and exact.
+        let mut text = String::new();
+        for index in 0..20_000 {
+            text.push_str(&format!("<think>reasoning {index}</think>Answer {index}. "));
+        }
+        let answer = strip_reasoning(&text);
+        let expected: String = (0..20_000).map(|index| format!("Answer {index}. ")).collect();
+        assert_eq!(answer, expected.trim());
+    }
+
+    /// The previous implementation, verbatim, as the behavioral
+    /// reference for the single-pass rewrite.
+    fn strip_reasoning_reference(text: &str) -> String {
+        let mut answer = text.to_string();
+        loop {
+            let lower = answer.to_ascii_lowercase();
+            let mut earliest: Option<(usize, usize)> = None;
+            for tag in REASONING_TAGS {
+                let open = format!("<{tag}>");
+                let close = format!("</{tag}>");
+                if let Some(open_start) = lower.find(&open) {
+                    let inner = open_start + open.len();
+                    if let Some(rel) = lower[inner..].find(&close) {
+                        let end = inner + rel + close.len();
+                        if earliest.map_or(true, |(o, _)| open_start < o) {
+                            earliest = Some((open_start, end));
+                        }
+                    }
+                }
+            }
+            match earliest {
+                Some((open_start, end)) => answer.replace_range(open_start..end, ""),
+                None => break,
+            }
+        }
+        {
+            let lower = answer.to_ascii_lowercase();
+            let mut cut: Option<usize> = None;
+            for tag in REASONING_TAGS {
+                let open = format!("<{tag}>");
+                if let Some(open_start) = lower.find(&open) {
+                    if cut.map_or(true, |o| open_start < o) {
+                        cut = Some(open_start);
+                    }
+                }
+            }
+            if let Some(open_start) = cut {
+                answer.truncate(open_start);
+            }
+        }
+        {
+            let lower = answer.to_ascii_lowercase();
+            let mut cut: Option<usize> = None;
+            for tag in REASONING_TAGS {
+                let close = format!("</{tag}>");
+                if let Some(close_start) = lower.find(&close) {
+                    let end = close_start + close.len();
+                    if cut.map_or(true, |e| end > e) {
+                        cut = Some(end);
+                    }
+                }
+            }
+            if let Some(end) = cut {
+                answer.replace_range(0..end, "");
+            }
+        }
+        answer.trim().to_string()
+    }
+
+    #[test]
+    fn strip_reasoning_matches_the_remove_and_rescan_reference() {
+        // Differential fuzz: random strings over a tag-fragment
+        // alphabet plus directed seam cases (a removal whose boundary
+        // completes a tag literal across the seam) — the single pass
+        // must be observably identical to the reference everywhere.
+        let alphabet: Vec<char> = "<>/thinkngresoabAB".chars().collect();
+        let mut state = 0x2026_0925u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        for length in [0, 1, 2, 3, 5, 8, 13, 40, 120] {
+            for _ in 0..2_000 {
+                let input: String = (0..length)
+                    .map(|_| alphabet[next() % alphabet.len()])
+                    .collect();
+                assert_eq!(
+                    strip_reasoning(&input),
+                    strip_reasoning_reference(&input),
+                    "{input:?}"
+                );
+            }
+        }
+        // Directed seam cases: a block removal whose kept left side
+        // ends mid-literal and whose right side completes it.
+        for left in ["x", "x<", "x<t", "x<th", "x<thi", "x<thin", "x<think", "x</", "x</t", "x</th"] {
+            for right in ["", ">", "k>", "nk>", "ink>", "hink>", "think>", "/think>", "g>"] {
+                for block in ["<think>b</think>", "<reason>b</reason>", "<think>b"] {
+                    let input = format!("{left}{block}{right}");
+                    assert_eq!(
+                        strip_reasoning(&input),
+                        strip_reasoning_reference(&input),
+                        "{input:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn reasoning_is_stripped_from_the_command_response_but_usage_rides_verbatim() {
         // The raw provider body carries reasoning inline in the content
@@ -1140,3 +1358,4 @@ mod tests {
         );
     }
 }
+

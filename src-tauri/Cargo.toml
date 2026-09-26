@@ -70,7 +70,7 @@ lettre = { version = "0.11", default-features = false, features = [
 # iCalendar text, so hand-rolled string walking would have to re-implement
 # entity decoding to stay correct; the audited-dependencies posture is kept
 # by pinning this single, tiny, no-dep crate.
-quick-xml = "0.36"
+quick-xml = "0.42"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -95,3 +95,9 @@ strip = false
 # linked directly — see desktop.rs default_handler).
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+
+[dev-dependencies]
+# tauri's mock runtime + mock app builder: powers the fs-scope unit tests
+# in mail_import.rs without a real window (test-only feature, never
+# compiled into shipped builds).
+tauri = { version = "2", features = ["test"] }

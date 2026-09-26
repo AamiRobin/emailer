@@ -6,10 +6,13 @@
 //! optional server upload can transmit the original bytes verbatim.
 //!
 //! File access deliberately uses `std::fs` instead of the plugin-fs
-//! commands: the paths arrive from the native open dialog (user consent,
-//! already widened into the fs runtime scope by the dialog plugin), and
-//! reading here avoids shipping potentially-huge mbox bytes through the
-//! JSON bridge just to hand them back for parsing.
+//! commands: the paths arrive from the native open dialog (user consent),
+//! and reading here avoids shipping potentially-huge mbox bytes through
+//! the JSON bridge just to hand them back for parsing. Because the
+//! commands read with full process privileges, every path is gated on
+//! the app's fs runtime scope (`fs_scope().is_allowed`) — the dialog
+//! plugin registers its picks there, so user-chosen files import while
+//! an arbitrary absolute path handed over the bridge is denied.
 //!
 //! Single EML: one file, one message — a parse failure is the file's
 //! error. mbox: framed entries are split by mail-parser's own
@@ -235,22 +238,54 @@ fn validate_import_path(path: &str, expected_ext: &str) -> Result<std::path::Pat
     Ok(path)
 }
 
+/// The fs-scope gate: only paths the app's fs runtime scope knows about
+/// (the open dialog registers its picks there — user consent) may be
+/// read. A compromised webview passing an arbitrary absolute path is
+/// denied BEFORE any disk access, extension and size checks aside.
+fn ensure_fs_allowed<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use tauri_plugin_fs::FsExt;
+    if app.fs_scope().is_allowed(path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "path is outside the app's file access scope: {}",
+            path.display()
+        ))
+    }
+}
+
 /// Parse one `.eml` file. The whole file is the message; any parse failure
-/// is the file's error (the TS importer reports it per file).
+/// is the file's error (the TS importer reports it per file). `app` is
+/// injected by Tauri (never crosses the bridge) and carries the fs scope
+/// the path is gated on.
 #[tauri::command]
-pub async fn parse_eml_file(path: String) -> Result<ParsedEml, String> {
+pub async fn parse_eml_file<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    path: String,
+) -> Result<ParsedEml, String> {
     // Blocking read + parse run on the async runtime's worker pool (async
     // command) — the main thread and the UI stay free.
-    let path = validate_import_path(&path, "eml")?;
+    let raw_path = std::path::PathBuf::from(&path);
+    ensure_fs_allowed(&app, &raw_path)?;
+    let path = validate_import_path(&raw_path.to_string_lossy(), "eml")?;
     let raw = std::fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
     parse_eml_bytes(&raw, None)
 }
 
 /// Parse one mbox file into per-entry outcomes. Only an unreadable FILE is
 /// a command error; unreadable ENTRIES are reported inside the result.
+/// The fs-scope gate matches [`parse_eml_file`].
 #[tauri::command]
-pub async fn parse_mbox_file(path: String) -> Result<Vec<MboxEntryResult>, String> {
-    let path = validate_import_path(&path, "mbox")?;
+pub async fn parse_mbox_file<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    path: String,
+) -> Result<Vec<MboxEntryResult>, String> {
+    let raw_path = std::path::PathBuf::from(&path);
+    ensure_fs_allowed(&app, &raw_path)?;
+    let path = validate_import_path(&raw_path.to_string_lossy(), "mbox")?;
     let raw = std::fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
     Ok(parse_mbox_bytes(&raw))
 }
@@ -421,6 +456,43 @@ Body two\n\
         // The eml command's extension gate accepts .mbox paths only for
         // the mbox command.
         assert!(validate_import_path(file.to_str().unwrap(), "mbox").is_err());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A mock app WITH the fs plugin, so its runtime scope exists.
+    fn scoped_app() -> tauri::App<tauri::test::MockRuntime> {
+        tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app with the fs plugin builds")
+    }
+
+    #[tokio::test]
+    async fn import_reads_are_gated_on_the_fs_scope() {
+        use tauri_plugin_fs::FsExt;
+        let app = scoped_app();
+        let file = std::env::temp_dir().join("emailer-import-scope.eml");
+        std::fs::write(&file, EML_WITH_ATTACHMENT).expect("write temp file");
+        let path = file.to_str().unwrap().to_string();
+
+        // A path that is merely ARGUED over the bridge (right extension,
+        // real file) is not in the scope: denied before any read.
+        let error = parse_eml_file(app.handle().clone(), path.clone())
+            .await
+            .expect_err("out-of-scope path is denied");
+        assert!(error.contains("scope"), "{error}");
+
+        // The dialog registers its picks into exactly this scope; once
+        // registered, the import parses.
+        app.handle()
+            .fs_scope()
+            .allow_file(&file)
+            .expect("register the dialog pick");
+        let parsed = parse_eml_file(app.handle().clone(), path)
+            .await
+            .expect("in-scope path parses");
+        assert_eq!(parsed.message_id.as_deref(), Some("<report-1@example.com>"));
+
         let _ = std::fs::remove_file(&file);
     }
 }

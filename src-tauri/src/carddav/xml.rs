@@ -165,7 +165,7 @@ impl Parser {
 
     fn handle_start(
         &mut self,
-        name: &[u8],
+        name: &str,
         _attributes: Attributes<'_>,
     ) -> Result<(), CarddavError> {
         let local = local_name(name);
@@ -260,7 +260,7 @@ impl Parser {
         Ok(())
     }
 
-    fn handle_empty(&mut self, name: &[u8], _attributes: Attributes<'_>) -> Result<(), CarddavError> {
+    fn handle_empty(&mut self, name: &str, _attributes: Attributes<'_>) -> Result<(), CarddavError> {
         let local = local_name(name);
         // Self-closing elements emit Empty and NO End event.
         match self.capture.as_ref().map(|capture| capture.prop) {
@@ -306,7 +306,7 @@ impl Parser {
         // Inter-element whitespace outside captures: skipped.
     }
 
-    fn handle_end(&mut self, name: &[u8]) {
+    fn handle_end(&mut self, name: &str) {
         let local = local_name(name);
 
         if let Some(capture) = self.capture.take() {
@@ -430,11 +430,10 @@ fn parse_status_line(text: &str) -> Option<u16> {
 }
 
 /// Local (prefix-stripped, lowercased) element name.
-fn local_name(name: &[u8]) -> String {
-    let raw = std::str::from_utf8(name).unwrap_or("");
-    match raw.rsplit_once(':') {
+fn local_name(name: &str) -> String {
+    match name.rsplit_once(':') {
         Some((_, local)) => local.to_ascii_lowercase(),
-        None => raw.to_ascii_lowercase(),
+        None => name.to_ascii_lowercase(),
     }
 }
 
@@ -468,11 +467,32 @@ pub(crate) fn parse_multistatus(body: &str) -> Result<Multistatus, CarddavError>
                 parser.handle_empty(start.name().as_ref(), start.attributes())?;
             }
             Event::Text(text) => {
-                let decoded = text.unescape().map_err(|error| {
+                let raw = text.into_inner();
+                let decoded = quick_xml::escape::unescape(&raw).map_err(|error| {
                     CarddavError::Parse(format!(
                         "malformed XML text from the CardDAV server ({error})"
                     ))
                 })?;
+                parser.handle_text(&decoded);
+            }
+            // quick-xml 0.42 splits entity references into their own
+            // events (`&#13;` in address-data bodies); decode them into
+            // the SAME capture the surrounding text feeds. Predefined
+            // entities and character references pass, anything else is
+            // a parse error (the whole-text unescape discipline of
+            // earlier quick-xml versions).
+            Event::GeneralRef(reference) => {
+                let name = reference.into_inner();
+                let decoded = match quick_xml::escape::resolve_predefined_entity(&name) {
+                    Some(value) => value.to_string(),
+                    None => quick_xml::escape::unescape(&format!("&{name};"))
+                        .map_err(|error| {
+                            CarddavError::Parse(format!(
+                                "malformed XML text from the CardDAV server ({error})"
+                            ))
+                        })?
+                        .into_owned(),
+                };
                 parser.handle_text(&decoded);
             }
             Event::End(end) => parser.handle_end(end.name().as_ref()),
@@ -493,7 +513,7 @@ pub(crate) fn parse_multistatus(body: &str) -> Result<Multistatus, CarddavError>
             "the response was not a WebDAV multistatus document".to_string(),
         ));
     }
-    // quick-xml (0.36) does not report EOF with unclosed elements as an
+    // quick-xml (0.42) does not report EOF with unclosed elements as an
     // error — a TRUNCATED response must not pass as a valid (empty)
     // report.
     if !parser.stack.is_empty() {

@@ -19,6 +19,8 @@ mod oauth;
 mod smtp;
 // Storage usage + delete-all-local-data commands (tasks 1.6/1.7, D11).
 mod storage;
+// One-Click List-Unsubscribe POSTs (RFC 8058).
+mod unsubscribe;
 mod updates;
 
 // CSP note (tauri.conf.json is plain JSON, so this lives here):
@@ -42,13 +44,20 @@ mod updates;
 fn external_navigation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::<R>::new("external-navigation")
         .on_navigation(|webview, url| {
+            // App content: the tauri:// custom protocol (prod) and
+            // tauri.localhost. Debug builds additionally treat the dev
+            // server / loopback hosts (any port) as internal; release
+            // builds compile that alternative OUT — a shipped app must
+            // never mistake an arbitrary localhost server on some port
+            // for its own content.
+            #[cfg(debug_assertions)]
             let is_internal_host = matches!(
                 url.host_str(),
                 Some("localhost") | Some("127.0.0.1") | Some("tauri.localhost") | Some("::1")
             );
+            #[cfg(not(debug_assertions))]
+            let is_internal_host = matches!(url.host_str(), Some("tauri.localhost"));
 
-            // App content: the tauri:// custom protocol (prod) and the dev
-            // server / loopback hosts (dev).
             let is_internal = url.scheme() == "tauri" || is_internal_host;
 
             if is_internal {
@@ -200,6 +209,8 @@ pub fn run() {
             mail_import::parse_mbox_file,
             storage::storage_usage,
             storage::delete_all_local_data,
+            storage::restrict_credentials_key_permissions,
+            unsubscribe::unsubscribe_one_click_post,
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {

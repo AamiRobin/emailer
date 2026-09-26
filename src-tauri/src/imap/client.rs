@@ -471,8 +471,79 @@ fn flags_to_strings<'a>(flags: impl Iterator<Item = Flag<'a>>) -> Vec<String> {
     flags.map(|f| flag_to_string(&f)).collect()
 }
 
+// ---------- Trust-boundary validators (shared with the command layer) ----------
+//
+// async-imap interpolates folders, UID sets and flags VERBATIM into its
+// command lines (no quoting, no CR/LF checks), so every value that can
+// reach a command line is validated here at the CLIENT layer too — the
+// commands validate first for a clean webview-facing error, these gates
+// are the defense-in-depth that holds for every caller.
+
+/// Validate a UID set: only the IMAP sequence-set charset may pass
+/// (digits, `*`, `:`, `,`). Leading/trailing/duplicate commas are
+/// harmless and allowed. CR/LF or any other byte is a command-shaping
+/// primitive and is rejected.
+pub(crate) fn require_uid_set(uid_set: &str) -> Result<(), String> {
+    let valid = !uid_set.is_empty()
+        && uid_set
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '*' | ':' | ','));
+    if valid {
+        Ok(())
+    } else {
+        Err(
+            "uid set must only contain digits, '*', ':' and ',' (e.g. \"1,5,9\" or \"104:*\")"
+                .to_string(),
+        )
+    }
+}
+
+/// True when `s` is a non-empty IMAP atom: the RFC 3501 ATOM-CHAR set minus
+/// the response-specials, i.e. anything but spaces, controls, parens,
+/// brackets, `{` `%` `*` `"` `\` and CR/LF. Enough for flag keywords, which
+/// must never be able to alter the surrounding STORE/APPEND command line.
+fn is_imap_atom(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+}
+
+/// Validate STORE/APPEND flag keywords: a flag is either a system flag
+/// (leading `\` + atom, e.g. `\Seen`) or a keyword atom (e.g. `$Label1`,
+/// `NonJunk`); anything else (spaces, parens, brackets, CR/LF) is rejected.
+/// Only spaces/tabs are trimmed first — a padded keyword (" $Label1 ")
+/// keeps working, while anything containing CR/LF or other controls is
+/// rejected.
+pub(crate) fn require_flag_keywords(flags: &[String]) -> Result<(), String> {
+    for flag in flags {
+        let trimmed = flag.trim_matches([' ', '\t']);
+        let atom = trimmed.strip_prefix('\\').unwrap_or(trimmed);
+        if !is_imap_atom(atom) {
+            return Err(format!(
+                "invalid flag {flag:?}: must be a system flag (e.g. \"\\\\Seen\") or a keyword without spaces or special characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a mailbox name before it is interpolated into SELECT/APPEND:
+/// mailbox names may legitimately contain spaces and quotes (async-imap
+/// quotes them), but a control character (CR/LF above all) is a
+/// command-splitting primitive and is rejected.
+pub(crate) fn require_folder_name(folder: &str) -> Result<(), String> {
+    if !folder.is_empty() && !folder.chars().any(|c| c.is_control()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid folder name {folder:?}: must be non-empty and free of control characters"
+        ))
+    }
+}
+
 /// SELECT a mailbox and return its status snapshot.
 async fn select_folder(session: &mut ImapSession, folder: &str) -> Result<FolderStatus, String> {
+    require_folder_name(folder)?;
     let mailbox = with_timeout(
         async {
             session
@@ -494,6 +565,7 @@ async fn select_folder_condstore(
     session: &mut ImapSession,
     folder: &str,
 ) -> Result<FolderStatus, String> {
+    require_folder_name(folder)?;
     let mailbox = with_timeout(
         async {
             session
@@ -555,6 +627,7 @@ fn resolve_uid_set(
 ) -> Result<String, String> {
     let trimmed = uid_set.trim();
     if !trimmed.is_empty() {
+        require_uid_set(trimmed)?;
         return Ok(trimmed.to_string());
     }
     last.and_then(|n| last_n_uid_set(status.uid_next, n))
@@ -745,15 +818,19 @@ pub(crate) fn normalize_flag(flag: &str) -> String {
 }
 
 /// Format flags as a parenthesized STORE list, e.g. "(\Seen \Flagged)".
-pub(crate) fn format_flags_for_store(flags: &[String]) -> String {
-    format!(
+/// Every flag is validated first: the list is interpolated verbatim into
+/// the STORE/APPEND command line, so CR/LF (or any non-atom byte) is a
+/// command-shaping primitive and is refused here for EVERY caller.
+pub(crate) fn format_flags_for_store(flags: &[String]) -> Result<String, String> {
+    require_flag_keywords(flags)?;
+    Ok(format!(
         "({})",
         flags
             .iter()
             .map(|f| normalize_flag(f))
             .collect::<Vec<_>>()
             .join(" ")
-    )
+    ))
 }
 
 /// Add (`add`) or remove flags on a UID set.
@@ -768,7 +845,8 @@ pub async fn store_flags(
         return Err("no flags provided".to_string());
     }
     let op = if add { "+FLAGS" } else { "-FLAGS" };
-    let query = format!("{op} {}", format_flags_for_store(flags));
+    require_uid_set(uid_set)?;
+    let query = format!("{op} {}", format_flags_for_store(flags)?);
 
     select_folder(session, folder).await?;
 
@@ -795,6 +873,11 @@ pub async fn move_message(
     uid_set: &str,
     dest_folder: &str,
 ) -> Result<(), String> {
+    require_uid_set(uid_set)?;
+    // The destination is the one folder argument SELECT does not cover —
+    // gate it here too so every mailbox name that reaches a command line
+    // is validated at this layer (L9 contract above).
+    require_folder_name(dest_folder)?;
     select_folder(session, source_folder).await?;
 
     let uid_move = with_timeout(
@@ -882,6 +965,7 @@ pub async fn delete_message(
     folder: &str,
     uid_set: &str,
 ) -> Result<(), String> {
+    require_uid_set(uid_set)?;
     select_folder(session, folder).await?;
 
     with_timeout(
@@ -909,7 +993,8 @@ pub async fn append_message(
     raw_message: &[u8],
     flags: Option<&[String]>,
 ) -> Result<(), String> {
-    let flags_str = flags.map(format_flags_for_store);
+    require_folder_name(folder)?;
+    let flags_str = flags.map(format_flags_for_store).transpose()?;
 
     with_timeout(
         async {
@@ -1666,10 +1751,10 @@ mod tests {
     #[test]
     fn store_flag_formatting() {
         assert_eq!(
-            format_flags_for_store(&["seen".to_string(), "NonJunk".to_string()]),
+            format_flags_for_store(&["seen".to_string(), "NonJunk".to_string()]).unwrap(),
             "(\\Seen NonJunk)"
         );
-        assert_eq!(format_flags_for_store(&[]), "()");
+        assert_eq!(format_flags_for_store(&[]).unwrap(), "()");
     }
 
     // ----- Folder management helpers -----
@@ -1919,5 +2004,102 @@ mod tests {
         assert_eq!(encode_base64(b"foo"), "Zm9v");
         let raw: Vec<u8> = (0..=255u8).collect();
         assert_eq!(encode_base64(&raw).len() % 4, 0);
+    }
+
+    // ----- Trust-boundary validators (shared with the command layer) -----
+
+    fn flags(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn uid_set_accepts_sequence_sets() {
+        assert!(require_uid_set("1").is_ok());
+        assert!(require_uid_set("1:*").is_ok());
+        assert!(require_uid_set("1,5,9").is_ok());
+        assert!(require_uid_set("104:*").is_ok());
+        assert!(require_uid_set("1:100,200:300").is_ok());
+        // Stray commas are harmless — allowed.
+        assert!(require_uid_set("1,,").is_ok());
+        assert!(require_uid_set(",1,").is_ok());
+    }
+
+    #[test]
+    fn uid_set_rejects_empty_and_foreign_characters() {
+        assert!(require_uid_set("").is_err());
+        // CR/LF injection must not reach the command line.
+        assert!(require_uid_set("1:2\r\n").is_err());
+        assert!(require_uid_set("1\n").is_err());
+        assert!(require_uid_set("a b").is_err());
+        assert!(require_uid_set("[x]").is_err());
+        assert!(require_uid_set("(1:2)").is_err());
+        assert!(require_uid_set("1;2").is_err());
+        assert!(require_uid_set("\"1\"").is_err());
+        assert!(require_uid_set("1 2").is_err());
+        assert!(require_uid_set("-1").is_err());
+        assert!(require_uid_set("+1").is_err());
+    }
+
+    #[test]
+    fn flag_keywords_accept_system_flags_and_atoms() {
+        assert!(require_flag_keywords(&flags(&["\\Seen"])).is_ok());
+        assert!(require_flag_keywords(&flags(&["\\Seen", "\\Answered"])).is_ok());
+        assert!(require_flag_keywords(&flags(&["$Label1"])).is_ok());
+        assert!(require_flag_keywords(&flags(&["NonJunk"])).is_ok());
+        assert!(require_flag_keywords(&flags(&["custom-keyword_2"])).is_ok());
+        // Whitespace-padded keywords keep working (normalized downstream).
+        assert!(require_flag_keywords(&flags(&[" $Label1 "])).is_ok());
+    }
+
+    #[test]
+    fn flag_keywords_reject_command_shaping() {
+        // Spaces would smuggle extra command tokens.
+        assert!(require_flag_keywords(&flags(&["Seen ok"])).is_err());
+        // `;` is outside the IMAP atom charset.
+        assert!(require_flag_keywords(&flags(&["In;ject"])).is_err());
+        // CR/LF injection.
+        assert!(require_flag_keywords(&flags(&["Seen\r\n"])).is_err());
+        assert!(require_flag_keywords(&flags(&["a\r\nb"])).is_err());
+        // Brackets and parens are response-specials, not atoms.
+        assert!(require_flag_keywords(&flags(&["[x]"])).is_err());
+        assert!(require_flag_keywords(&flags(&["(x)"])).is_err());
+        // Quotes break out of unquoted contexts.
+        assert!(require_flag_keywords(&flags(&["\"x\""])).is_err());
+        // A bare backslash is not a flag.
+        assert!(require_flag_keywords(&flags(&["\\"])).is_err());
+        // Empty string.
+        assert!(require_flag_keywords(&flags(&[""])).is_err());
+        assert!(require_flag_keywords(&flags(&["   "])).is_err());
+    }
+
+    #[test]
+    fn folder_names_reject_control_characters() {
+        // Spaces and quotes are legitimate mailbox-name characters
+        // (async-imap quotes them) and keep working.
+        assert!(require_folder_name("INBOX").is_ok());
+        assert!(require_folder_name("Sent Messages").is_ok());
+        assert!(require_folder_name("[Gmail]/Sent Mail").is_ok());
+        // CR/LF (or any control byte) is a command-splitting primitive.
+        let error = require_folder_name("INBOX\r\nEXPUNGE").unwrap_err();
+        assert!(error.contains("control"), "{error}");
+        assert!(require_folder_name("a\nb").is_err());
+        assert!(require_folder_name("a\tb").is_err());
+        assert!(require_folder_name("a\u{0}b").is_err());
+        assert!(require_folder_name("").is_err());
+    }
+
+    #[test]
+    fn store_list_building_validates_every_flag() {
+        // The STORE/APPEND list is interpolated verbatim — a quote or
+        // CR/LF in ANY flag is refused before a session ever sees it.
+        assert_eq!(
+            // An already-prefixed flag passes through; a bare name is
+            // canonicalized (normalize_flag semantics).
+            format_flags_for_store(&flags(&["\\seen", "flagged"])).unwrap(),
+            "(\\seen \\Flagged)"
+        );
+        assert!(format_flags_for_store(&flags(&["Seen ok"])).is_err());
+        assert!(format_flags_for_store(&flags(&["a\"b", "\\Seen"])).is_err());
+        assert!(format_flags_for_store(&flags(&["\\Seen", "x\r\ny"])).is_err());
     }
 }
