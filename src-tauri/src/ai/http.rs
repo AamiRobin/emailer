@@ -40,15 +40,23 @@ pub(crate) struct RequestUrl {
 }
 
 impl RequestUrl {
-    /// Value for the `Host` header (default ports omitted, per custom).
+    /// Value for the `Host` header (default ports omitted, per custom;
+    /// IPv6 literals bracketed per RFC 9110 §7.2).
     // pub(crate) so the CalDAV transport (task 5.2) can reuse it when it
     // rebuilds absolute URLs from multistatus hrefs — no logic change.
     pub(crate) fn host_header(&self) -> String {
         let default_port = (self.https && self.port == 443) || (!self.https && self.port == 80);
-        if default_port {
-            self.host.clone()
+        // An IPv6 literal contains ':' itself, so the port suffix would be
+        // ambiguous without brackets.
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
         } else {
-            format!("{}:{}", self.host, self.port)
+            self.host.clone()
+        };
+        if default_port {
+            host
+        } else {
+            format!("{}:{}", host, self.port)
         }
     }
 }
@@ -427,6 +435,13 @@ mod tests {
             parse_request_url("https://x.com/a").unwrap().host_header(),
             "x.com"
         );
+        // IPv6 literals are bracketed in the Host field (RFC 9110 §7.2);
+        // the connect target itself keeps the unbracketed literal.
+        let url = parse_request_url("https://[2001:db8::1]/v1/chat").unwrap();
+        assert_eq!(url.host, "2001:db8::1");
+        assert_eq!(url.host_header(), "[2001:db8::1]");
+        let url = parse_request_url("https://[2001:db8::1]:8443/v1/chat").unwrap();
+        assert_eq!(url.host_header(), "[2001:db8::1]:8443");
     }
 
     #[test]
