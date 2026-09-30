@@ -32,6 +32,9 @@ import { getCalendarViewExecutor } from "./use-calendar-view"
  * "Event creation and editing"). Create is opened from the calendar
  * view's double-clicked slot (pre-filled start/end); edit from the
  * details card (pre-filled from the stored row, with a Delete action).
+ * The add-ai-surfaces event-extraction flow also opens create mode,
+ * passing `prefill` fields detected in a thread — the form is the final
+ * validator: nothing is saved until the user confirms it.
  *
  * ONLINE-WRITE SURFACING (the spec's explicit-failure requirement): the
  * form never pretends — the write service refuses offline writes and any
@@ -52,8 +55,21 @@ import { getCalendarViewExecutor } from "./use-calendar-view"
  *   CalDAV destinations hide it with a note.
  */
 
+/** Optional create-mode prefill (add-ai-surfaces task 3.1): fields
+ * detected outside the calendar (AI event extraction) fill the form for
+ * the user to review and edit — the dialog's write path is untouched. */
+export interface EventDialogPrefill {
+  title?: string
+  location?: string
+  description?: string
+  /** All-day prefill: the form switches to all-day mode and treats the
+   * passed `end` Date as the INCLUSIVE last day (matching the form's
+   * own all-day semantics, not the cache's exclusive end). */
+  allDay?: boolean
+}
+
 export type EventDialogRequest =
-  | { mode: "create"; start: Date; end: Date }
+  | { mode: "create"; start: Date; end: Date; prefill?: EventDialogPrefill }
   | { mode: "edit"; event: CalendarEvent }
 
 export interface EventDialogProps {
@@ -114,15 +130,20 @@ function parseGuests(value: string): string[] {
 
 function stateForRequest(request: EventDialogRequest): FormState {
   if (request.mode === "create") {
+    const allDay = request.prefill?.allDay === true
     return {
-      title: "",
-      allDay: false,
+      title: request.prefill?.title ?? "",
+      allDay,
       startDate: format(request.start, "yyyy-MM-dd"),
-      endDate: format(request.start, "yyyy-MM-dd"),
+      // All-day shows an INCLUSIVE end: the passed `end` Date is already
+      // the inclusive last day in that mode (see EventDialogPrefill).
+      endDate: allDay
+        ? format(request.end, "yyyy-MM-dd")
+        : format(request.start, "yyyy-MM-dd"),
       startTime: format(request.start, "HH:mm"),
       endTime: format(request.end, "HH:mm"),
-      location: "",
-      description: "",
+      location: request.prefill?.location ?? "",
+      description: request.prefill?.description ?? "",
       guests: "",
       reminder: "",
     }

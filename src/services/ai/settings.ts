@@ -89,6 +89,9 @@ export type AiSurfaceId =
   | "categorizationAssist"
   | "quickReplies"
   | "ruleAssist"
+  | "eventExtraction"
+  | "translation"
+  | "folderDigest"
 
 export const AI_SURFACE_IDS: readonly AiSurfaceId[] = [
   "summaries",
@@ -99,6 +102,9 @@ export const AI_SURFACE_IDS: readonly AiSurfaceId[] = [
   "categorizationAssist",
   "quickReplies",
   "ruleAssist",
+  "eventExtraction",
+  "translation",
+  "folderDigest",
 ]
 
 export function isAiSurfaceId(value: unknown): value is AiSurfaceId {
@@ -122,6 +128,9 @@ export const DEFAULT_SURFACES: AiSurfacesConfig = {
   categorizationAssist: false,
   quickReplies: true,
   ruleAssist: true,
+  eventExtraction: true,
+  translation: true,
+  folderDigest: true,
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +187,9 @@ export type AiSurfaceTiersConfig = Partial<Record<AiSurfaceId, AiTier>>
  * - `ruleAssist` → cheap (task 2.5): on-demand translation of one typed
  *   description into the rule schema; routine generation, no latency
  *   pressure.
+ * - `eventExtraction`, `translation`, `folderDigest` → cheap (add-ai-
+ *   surfaces): all three are explicitly user-initiated with short outputs
+ *   — routine generation, no latency pressure beyond the click.
  *
  * A plain Record over AiSurfaceId: adding a surface later is one entry
  * here (plus one in AI_SURFACE_IDS) and everything else keeps working.
@@ -191,6 +203,9 @@ export const DEFAULT_SURFACE_TIERS: Record<AiSurfaceId, AiTier> = {
   categorizationAssist: "instant",
   quickReplies: "instant",
   ruleAssist: "cheap",
+  eventExtraction: "cheap",
+  translation: "cheap",
+  folderDigest: "cheap",
 }
 
 /** One stored provider. `apiKeySealed` is the credentials envelope of

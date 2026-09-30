@@ -8,6 +8,38 @@ import {
   within,
 } from "@testing-library/react"
 
+const executorHolder = vi.hoisted(() => ({
+  current: null as unknown,
+}))
+
+// The catch-me-up affordance's dialog (task 7.1) reads through the shared
+// executor seam; its digest build is mocked here — the dialog's own suite
+// owns its behavior, these tests target the affordance's gates. All other
+// stores/services run REAL against the seeded node:sqlite database.
+vi.mock("@/services/db/executor", () => ({
+  getExecutor: () => {
+    const executor = executorHolder.current
+    if (!executor) throw new Error("test executor not set")
+    return executor
+  },
+  placeholders: (count: number, firstIndex = 1): string =>
+    Array.from({ length: count }, (_, index) => `$${index + firstIndex}`).join(
+      ", "
+    ),
+}))
+
+const buildFolderDigestMock = vi.hoisted(() => vi.fn())
+
+vi.mock("@/services/ai/folder-digest", () => ({
+  buildFolderDigest: buildFolderDigestMock,
+}))
+
+import {
+  addProvider,
+  setActiveProvider,
+  setAiEnabled,
+  setSurfaceEnabled,
+} from "@/services/ai/settings"
 import {
   createAccount,
   createGmailLabel,
@@ -97,6 +129,7 @@ beforeEach(() => {
   installResizeObserverMock()
   setMockViewportHeight(10_000)
   executor = createTestExecutor()
+  executorHolder.current = executor
   setThreadListStoreExecutor(executor)
   setAccountStoreExecutor(executor)
   setFolderCountsStoreExecutor(executor)
@@ -108,6 +141,7 @@ afterEach(() => {
   setThreadListStoreExecutor(null)
   setAccountStoreExecutor(null)
   setFolderCountsStoreExecutor(null)
+  executorHolder.current = null
   executor.close()
 })
 
@@ -1375,5 +1409,136 @@ describe("split scope presentation (title, empty state, badges)", () => {
     })
     render(<ThreadList />)
     expect(await screen.findByText('No threads in "Receipts"')).not.toBeNull()
+  })
+})
+
+describe("thread list catch-me-up affordance (task 7.1)", () => {
+  /**
+   * Enable AI through the REAL settings service against the test executor
+   * (the thread-view-summaries pattern): the affordance's gate then reads
+   * true from the exact code path production uses. Optional per-surface
+   * overrides for the disabled-surface case.
+   */
+  async function enableAi(
+    surfaces: { folderDigest?: boolean } = {}
+  ): Promise<void> {
+    await setAiEnabled(executor, true)
+    const created = await addProvider(executor, {
+      kind: "anthropic",
+      label: "Test",
+      model: "claude-sonnet-4-5",
+    })
+    await setActiveProvider(executor, created.id)
+    if (surfaces.folderDigest === false) {
+      await setSurfaceEnabled(executor, "folderDigest", false)
+    }
+  }
+
+  it("is hidden while AI is unconfigured, even with unread threads", async () => {
+    await setupAccount()
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelector("[data-thread-row]")).not.toBeNull()
+    )
+    // Let the best-effort gate read settle (it failed toward hidden).
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByTestId("catch-me-up-button")).toBeNull()
+  })
+
+  it("is hidden when the folderDigest surface is disabled", async () => {
+    await setupAccount()
+    await enableAi({ folderDigest: false })
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(container.querySelector("[data-thread-row]")).not.toBeNull()
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByTestId("catch-me-up-button")).toBeNull()
+  })
+
+  it("is hidden on an unsupported scope (unified) with unread rows shown", async () => {
+    // Spec scope boundary: the digest is defined over ONE folder or
+    // category — the aggregated unified inbox keeps the affordance hidden
+    // even though rows (with unread) render and the header is up.
+    const accountId = await setupAccount()
+    useAccountStore.setState({
+      accounts: [
+        {
+          id: accountId,
+          type: "gmail",
+          email: `${accountId}@example.com`,
+          displayName: null,
+          status: "active",
+          unreadCount: 1,
+        },
+      ],
+      activeAccountId: accountId,
+      loaded: true,
+    })
+    await enableAi()
+    useUiStore.getState().setListScope({ kind: "unified" })
+    const { container } = render(<ThreadList />)
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-thread-row][data-unread="true"]')
+      ).not.toBeNull()
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByTestId("catch-me-up-button")).toBeNull()
+  })
+
+  it("is hidden when the view has no unread threads (not offered)", async () => {
+    const accountId = await createAccount(executor, "gmail")
+    const inbox = await createGmailLabel(
+      executor,
+      accountId,
+      "INBOX",
+      "INBOX",
+      "inbox"
+    )
+    await seedThread(accountId, [inbox], {
+      subject: "All caught up",
+      seconds: 60,
+    })
+    useAccountStore.setState({ activeAccountId: accountId, loaded: true })
+    await enableAi()
+    const { container } = render(<ThreadList />)
+    // The header IS rendered (rows exist) — the affordance alone hides.
+    await waitFor(() =>
+      expect(container.querySelector("[data-thread-row]")).not.toBeNull()
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.queryByTestId("catch-me-up-button")).toBeNull()
+  })
+
+  it("appears for an inbox view with unread threads and opens the dialog on the view's scope", async () => {
+    const accountId = await setupAccount()
+    await enableAi()
+    buildFolderDigestMock.mockResolvedValue({
+      digest:
+        "- Newest unread — Alice asks about the contract.\nOverview: One thread needs you.",
+      threadCount: 1,
+      omittedCount: 0,
+    })
+    render(<ThreadList />)
+    fireEvent.click(await screen.findByTestId("catch-me-up-button"))
+
+    // The dialog builds the digest with the CURRENT scope, snapshotted at
+    // open: the account-inbox view maps to accountFolder + specialUse.
+    await screen.findByTestId("folder-digest-dialog")
+    expect(buildFolderDigestMock).toHaveBeenCalledTimes(1)
+    expect(buildFolderDigestMock).toHaveBeenCalledWith(
+      executorHolder.current,
+      {
+        scope: {
+          kind: "accountFolder",
+          accountId,
+          folder: { kind: "specialUse", specialUse: "inbox" },
+        },
+      }
+    )
+    expect(screen.getByTestId("folder-digest-meta").textContent).toBe(
+      "1 unread thread covered"
+    )
   })
 })

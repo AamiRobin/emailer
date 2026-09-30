@@ -149,10 +149,11 @@ describe("AiSection (task 4.2)", () => {
       expect((await getAiSettings(executor)).enabled).toBe(true)
     })
 
-    // All eight surface toggles render; the seven default ON,
-    // categorization assist is the opt-in one (off). The parity-round-2
-    // additions (quick replies, natural-language rules) register like the
-    // originals: default ON, individually toggleable.
+    // All eleven surface toggles render; all default ON except
+    // categorization assist, the opt-in one (off). The parity-round-2
+    // additions (quick replies, natural-language rules) and the
+    // add-ai-surfaces additions (event extraction, translate, digest)
+    // register like the originals: default ON, individually toggleable.
     for (const [name, checked] of [
       ["Thread summaries", "true"],
       ["Smart replies", "true"],
@@ -162,6 +163,9 @@ describe("AiSection (task 4.2)", () => {
       ["Categorization assist (opt-in)", "false"],
       ["Quick replies", "true"],
       ["Natural-language rules", "true"],
+      ["Event extraction", "true"],
+      ["Translate", "true"],
+      ["Catch-me-up digest", "true"],
     ] as const) {
       const toggle = screen.getByRole("switch", { name })
       expect(toggle.getAttribute("aria-checked")).toBe(checked)
@@ -496,6 +500,19 @@ describe("AiSection model tiers + output language (parity-round-2 task 2.1)", ()
       screen.getByRole("combobox", {
         name: "Tier for Natural-language rules",
       }).textContent
+    ).toContain("Cheap")
+    // The add-ai-surfaces surfaces' defaults: click-initiated, short
+    // outputs — all ride cheap.
+    expect(
+      screen.getByRole("combobox", { name: "Tier for Event extraction" })
+        .textContent
+    ).toContain("Cheap")
+    expect(
+      screen.getByRole("combobox", { name: "Tier for Translate" }).textContent
+    ).toContain("Cheap")
+    expect(
+      screen.getByRole("combobox", { name: "Tier for Catch-me-up digest" })
+        .textContent
     ).toContain("Cheap")
   })
 

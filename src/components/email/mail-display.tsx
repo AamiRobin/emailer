@@ -103,6 +103,7 @@ import { SafeEmailFrame } from "@/components/email/safe-email-frame"
 import { AuthBadge } from "./auth-badge"
 import { PgpPassphraseDialog } from "./pgp-passphrase-dialog"
 import { SourceViewDialog } from "./source-view-dialog"
+import { TranslateControl } from "./translate-control"
 import {
   avatarTokenClass,
   formatFullTimestamp,
@@ -413,6 +414,16 @@ export function MailDisplay({
           </Button>
         </div>
       </div>
+      {/* Per-message translate control (task 5.1, ai-assistance spec
+          "Per-message translation"): mounted directly under the header so
+          the translation panel appears beside the original (the body
+          below stays fully visible). The control is SELF-gating — AI not
+          configured or the translation surface off renders nothing, the
+          same QuickReplyChips posture — so this mount carries no gating
+          knowledge. (MailDisplay has no thread-level disabled state to
+          forward; TranslateControl's disabled prop stays for the thread
+          chrome to wire when one lands.) */}
+      <TranslateControl message={message} />
       <MessageBody
         message={message}
         imagesAllowed={imagesAllowed}

@@ -159,6 +159,21 @@ const SURFACE_COPY: Record<AiSurfaceId, { label: string; description: string }> 
       description:
         "Translate a typed rule description into a rule preview. Only your description is sent.",
     },
+    eventExtraction: {
+      label: "Event extraction",
+      description:
+        "Suggest calendar events from open threads. Accepting one opens the event form prefilled — nothing is saved until you do.",
+    },
+    translation: {
+      label: "Translate",
+      description:
+        "Translate a message into your output language on request. Only that message's text is sent.",
+    },
+    folderDigest: {
+      label: "Catch-me-up digest",
+      description:
+        "Summarize the unread threads of the folder you invoke it in. Only threads from that folder are sent.",
+    },
   }
 
 /** Tier display names (parity-round-2 task 2.1). */

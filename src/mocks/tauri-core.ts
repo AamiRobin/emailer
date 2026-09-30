@@ -35,6 +35,11 @@ function warnOnce(command: string, error: Error): void {
   console.warn(`[mock invoke] ${command} rejected: ${error.message}`)
 }
 
+/** The in-memory credential-sealing key slot backing the
+ * `credentials_key_os_*` stubs (lives for the tab's lifetime — mock mode
+ * seeds a fresh :memory: database every load anyway). */
+let mockOsKeyStore: string | null = null
+
 /**
  * The subset of `args` values the stubs read, loosely typed — the real
  * wire args are validated Rust-side; the mock only needs folder names.
@@ -92,9 +97,43 @@ export async function invoke<T = unknown>(
   // AI chat (task 4.2, design D1): mock mode has no provider network —
   // every call succeeds with a canned reply so the AI surfaces can be
   // exercised against a configured provider without hitting the real
-  // command (the wire shape mirrors ai/mod.rs's ChatResponse).
+  // command (the wire shape mirrors ai/mod.rs's ChatResponse). The
+  // event-extraction surface gets a shape-valid reply so its review →
+  // accept → prefilled-form flow is smokeable end to end (the thread's
+  // own messages are not read — the suggestion is fixed demo data).
   if (command === "ai_chat") {
+    const system = String(readArg(args, "system") ?? "")
+    if (system.includes('"events"')) {
+      return {
+        content:
+          '{"events": [{"title": "Design review", "start": "2026-10-05 14:00", ' +
+          '"end": "2026-10-05 15:00", "allDay": false, "location": "Room 4", ' +
+          '"notes": "From the mock provider", "messageIndex": 0}]}',
+        model: "mock-model",
+      } as T
+    }
     return { content: "Mock AI reply.", model: "mock-model" } as T
+  }
+
+  // Credential-sealing key OS store (secrets.rs): browser mock mode has
+  // no OS keychain, so the per-install key round-trips through an
+  // in-memory slot. Same contract as the Rust commands: store persists
+  // base64, load returns it or null for a fresh install.
+  if (command === "credentials_key_os_store") {
+    mockOsKeyStore = String(readArg(args, "keyB64") ?? "")
+    return null as T
+  }
+  if (command === "credentials_key_os_load") {
+    return (mockOsKeyStore ?? null) as T
+  }
+  if (command === "credentials_key_os_delete") {
+    mockOsKeyStore = null
+    return null as T
+  }
+  // Best-effort chmod on the fallback key file — nothing to restrict in
+  // the browser; succeed so the caller's warn-once stays quiet.
+  if (command === "restrict_credentials_key_permissions") {
+    return null as T
   }
 
   // IMAP commands: healthy empty folder state. The fixture folders'

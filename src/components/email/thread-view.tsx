@@ -12,6 +12,7 @@ import {
   Archive,
   Ban,
   BellOff,
+  CalendarPlus,
   Check,
   ChevronDown,
   Clock,
@@ -93,6 +94,7 @@ import {
   type ThreadStateKind,
 } from "./thread-state-flow"
 import { TaskExtractionDialog } from "./task-extraction-dialog"
+import { EventExtractionDialog } from "./event-extraction-dialog"
 import { FindBar } from "./find-bar"
 import { FindSession, FindSessionContext } from "./find-session"
 
@@ -150,6 +152,15 @@ import { FindSession, FindSessionContext } from "./find-session"
  * the review dialog (task-extraction-dialog.tsx). Suggestions are created
  * exclusively through the accepted-suggestion seam
  * (services/tasks/create.ts); rejecting or closing creates nothing.
+ *
+ * AI event suggestions (task 3.3, add-ai-surfaces spec "Event extraction
+ * to calendar"): a "Suggest events" toolbar button beside the tasks one —
+ * the same hide-when-unavailable posture (isAiConfigured + the
+ * eventExtraction surface toggle) — opens the review dialog
+ * (event-extraction-dialog.tsx). Accepting a suggestion opens the
+ * calendar event form prefilled (event-dialog create mode, task 3.1);
+ * that form's own save is the only write path, so nothing reaches a
+ * calendar through review alone.
  *
  * Thread summary (task 4.4, ai-assistance spec "Thread summaries"): a
  * "Summarize thread" toolbar button beside it — same hide-when-
@@ -297,6 +308,11 @@ function ThreadViewContent({
    * and the review dialog's open state. */
   const [aiTasksAvailable, setAiTasksAvailable] = useState(false)
   const [extractOpen, setExtractOpen] = useState(false)
+  /** Event extraction (task 3.3): the same best-effort availability flag
+   * for the eventExtraction surface, plus the review dialog's open
+   * state. */
+  const [aiEventsAvailable, setAiEventsAvailable] = useState(false)
+  const [eventsOpen, setEventsOpen] = useState(false)
   /** Thread summary (task 4.4): the same best-effort availability flag
    * for the summaries surface, plus the panel's open state (the panel
    * exists only after the user asks for it; its content state lives in
@@ -610,6 +626,34 @@ function ThreadViewContent({
           if (!cancelled) setAiRepliesAvailable(configured && surface)
         } catch {
           if (!cancelled) setAiRepliesAvailable(false)
+        }
+      })()
+    } catch {
+      // No executor (plain vite, tests without a db override) — hidden.
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [threadId])
+
+  // Task 3.3 (add-ai-surfaces spec "No provider configured" + "Disable a
+  // single surface"): the "Suggest events" affordance renders ONLY when
+  // AI is configured AND the eventExtraction surface is enabled — the
+  // same best-effort flag load and fail-toward-hidden posture as the
+  // task extraction, summaries and smart replies flags above.
+  useEffect(() => {
+    let cancelled = false
+    try {
+      const executor = getExecutor()
+      void (async () => {
+        try {
+          const [configured, surface] = await Promise.all([
+            isAiConfigured(executor),
+            isSurfaceEnabled(executor, "eventExtraction"),
+          ])
+          if (!cancelled) setAiEventsAvailable(configured && surface)
+        } catch {
+          if (!cancelled) setAiEventsAvailable(false)
         }
       })()
     } catch {
@@ -1149,6 +1193,26 @@ function ThreadViewContent({
               <span className="sr-only">Suggest tasks</span>
             </Button>
           )}
+          {/* Task 3.3: AI event suggestions (add-ai-surfaces spec "Event
+              extraction to calendar"). Rendered ONLY when AI is configured
+              and the eventExtraction surface is enabled (see the
+              availability effect — absent otherwise, never a disabled
+              error state); opens the review dialog where accepting a
+              suggestion opens the prefilled event form — nothing is
+              written to a calendar until that form is saved. */}
+          {aiEventsAvailable && (
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="toolbar-extract-events"
+              disabled={disabled}
+              title="Suggest events"
+              onClick={() => setEventsOpen(true)}
+            >
+              <CalendarPlus className="size-4" />
+              <span className="sr-only">Suggest events</span>
+            </Button>
+          )}
           {/* Task 4.4: AI thread summary (ai-assistance spec "Thread
               summaries"). Rendered ONLY when AI is configured and the
               summaries surface is enabled (see the availability effect —
@@ -1329,6 +1393,17 @@ function ThreadViewContent({
           threadId={threadId}
           open
           onOpenChange={setExtractOpen}
+        />
+      )}
+      {/* Task 3.3: the review dialog behind "Suggest events". Mounted only
+          while open so every open re-runs the (cached) extraction fresh;
+          its accepts open the prefilled event form from inside the dialog
+          — the form's save is the only calendar write path. */}
+      {eventsOpen && (
+        <EventExtractionDialog
+          threadId={threadId}
+          open
+          onOpenChange={setEventsOpen}
         />
       )}
       {/* Task 4.5: the smart-reply dialog behind the wand button. Mounted

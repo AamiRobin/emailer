@@ -1449,3 +1449,56 @@ describe("smart reply toolbar affordance (task 4.5)", () => {
     expect(consent.textContent).toMatch(/Nothing is sent automatically/)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Event suggestion toolbar affordance (add-ai-surfaces task 3.3)
+// ---------------------------------------------------------------------------
+
+describe("event suggestion toolbar affordance (add-ai-surfaces task 3.3)", () => {
+  it("is hidden when AI is not configured", async () => {
+    const { threadId } = await seedMixedThread()
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    expect(screen.queryByTestId("toolbar-extract-events")).toBeNull()
+  })
+
+  it("is hidden when the eventExtraction surface is disabled", async () => {
+    const { threadId } = await seedMixedThread()
+    await setAiEnabled(executor, true)
+    const created = await addProvider(executor, {
+      kind: "anthropic",
+      label: "Work",
+      model: "claude-sonnet-4-5",
+    })
+    await setActiveProvider(executor, created.id)
+    await setSurfaceEnabled(executor, "eventExtraction", false)
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    expect(screen.queryByTestId("toolbar-extract-events")).toBeNull()
+  })
+
+  it("renders next to the extract-tasks button when AI is configured and the surface is on", async () => {
+    const { threadId } = await seedMixedThread()
+    await setAiEnabled(executor, true)
+    const created = await addProvider(executor, {
+      kind: "anthropic",
+      label: "Work",
+      model: "claude-sonnet-4-5",
+    })
+    await setActiveProvider(executor, created.id)
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    // Gated render: absent until the (async, best-effort) flag load lands,
+    // present once AI is configured and the surface is on — a sibling of
+    // the "Suggest tasks" affordance with the same posture.
+    const button = await screen.findByTestId("toolbar-extract-events")
+    expect(button.getAttribute("title")).toBe("Suggest events")
+    expect(screen.getByTestId("toolbar-extract-tasks")).not.toBeNull()
+  })
+})

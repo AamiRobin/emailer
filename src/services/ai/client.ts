@@ -64,6 +64,9 @@ const SURFACE_WIRE_NAMES: Record<AiSurface, string> = {
   categorizationAssist: "categorization-assist",
   quickReplies: "quick-replies",
   ruleAssist: "rule-assist",
+  eventExtraction: "event-extraction",
+  translation: "translation",
+  folderDigest: "folder-digest",
 }
 
 /** One conversation turn (plain text; prompt shaping is the caller's). */

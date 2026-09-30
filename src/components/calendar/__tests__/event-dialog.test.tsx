@@ -156,6 +156,62 @@ describe("EventDialog create", () => {
     expect(input.startAt).toBe(Date.parse("2026-03-17T00:00:00Z") / 1000)
     expect(input.endAt).toBe(Date.parse("2026-03-18T00:00:00Z") / 1000)
   })
+
+  // add-ai-surfaces task 3.1: the event-extraction accept path opens
+  // create mode with `prefill` fields — the form carries them, the write
+  // path is untouched, and the all-day prefill treats `end` as the
+  // INCLUSIVE last day (converted to the exclusive cache end on save).
+  it("pre-fills text fields from an event-extraction prefill (all-day)", async () => {
+    renderDialog({
+      mode: "create",
+      start: new Date(2026, 2, 17, 0, 0),
+      end: new Date(2026, 2, 18, 0, 0),
+      prefill: {
+        title: "Project kickoff",
+        location: "Room 4",
+        description: "From the thread",
+        allDay: true,
+      },
+    })
+    await screen.findByTestId("event-dialog-destination")
+
+    expect(inputOf("event-dialog-title").value).toBe("Project kickoff")
+    expect(inputOf("event-dialog-location").value).toBe("Room 4")
+    expect(inputOf("event-dialog-description").value).toBe("From the thread")
+    expect(inputOf("event-dialog-date").value).toBe("2026-03-17")
+    expect(inputOf("event-dialog-end-date").value).toBe("2026-03-18")
+
+    fireEvent.click(screen.getByTestId("event-dialog-save"))
+    await waitFor(() => expect(createEventMock).toHaveBeenCalledTimes(1))
+    const input = createEventMock.mock.calls[0][1] as Record<string, unknown>
+    expect(input).toMatchObject({
+      title: "Project kickoff",
+      location: "Room 4",
+      description: "From the thread",
+      allDay: true,
+    })
+    // Inclusive 2026-03-18 last day → exclusive end 2026-03-19 UTC.
+    expect(input.startAt).toBe(Date.parse("2026-03-17T00:00:00Z") / 1000)
+    expect(input.endAt).toBe(Date.parse("2026-03-19T00:00:00Z") / 1000)
+  })
+
+  it("pre-fills text fields without touching the slot times when not all-day", async () => {
+    const start = new Date(2026, 2, 17, 14, 0)
+    const end = new Date(2026, 2, 17, 15, 30)
+    renderDialog({
+      mode: "create",
+      start,
+      end,
+      prefill: { title: "Dentist", location: "Elm st. 12" },
+    })
+    await screen.findByTestId("event-dialog-destination")
+
+    expect(inputOf("event-dialog-title").value).toBe("Dentist")
+    expect(inputOf("event-dialog-location").value).toBe("Elm st. 12")
+    expect(inputOf("event-dialog-date").value).toBe("2026-03-17")
+    expect(inputOf("event-dialog-start-time").value).toBe("14:00")
+    expect(inputOf("event-dialog-end-time").value).toBe("15:30")
+  })
 })
 
 describe("EventDialog edit", () => {

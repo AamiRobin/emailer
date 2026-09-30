@@ -19,6 +19,7 @@ import {
   Paperclip,
   Pin,
   SearchXIcon,
+  Sparkles,
   Star,
   StickyNote,
   TagIcon,
@@ -49,6 +50,11 @@ import {
 import type { ThreadActionKind } from "@/services/email-actions/thread-actions"
 import type { BlockedSenderAction } from "@/services/db/blocked-senders"
 import type { SqlExecutor } from "@/services/db/executor"
+import type { DigestScope } from "@/services/ai/folder-digest"
+import {
+  isAiConfigured,
+  isSurfaceEnabled,
+} from "@/services/ai/settings"
 import {
   getThreadListExecutor,
   refreshThreadList,
@@ -57,6 +63,7 @@ import {
   useThreadListStore,
   formatThreadParticipants,
   parseThreadParticipants,
+  type ThreadListScope,
 } from "@/stores/thread-list-store"
 import { useAccountStore } from "@/stores/account-store"
 import type { AccountInfo } from "@/stores/account-store"
@@ -83,6 +90,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { AccountBadge } from "./account-badge"
 import { EmptyState } from "./empty-state"
+import { FolderDigestDialog } from "./folder-digest-dialog"
 import { ProfileColorMarker } from "./profile-marker"
 import { ThreadContextMenu } from "./thread-context-menu"
 import type { ThreadMenuHandlers } from "./thread-context-menu"
@@ -191,6 +199,16 @@ import {
  * `mail.profileColorMarkers` (default shown) gates the rendering; the
  * marker is purely decorative — no selection, keyboard or screen-reader
  * impact, and being absolutely positioned it never reflows the rows.
+ *
+ * "Catch me up" digest affordance (task 7.1, ai-assistance spec "Folder
+ * unread digest"): a ghost button leading the list header's right cluster
+ * opens the folder-digest dialog over the ACTIVE view. It renders only
+ * when all three of its gates hold — AI configured with the folderDigest
+ * surface on, the view's scope being one the digest is defined for (a
+ * per-account folder/label view or a category tab — the spec's scope
+ * boundary excludes the aggregated/query-shaped listings), and the loaded
+ * rows actually having unread threads (spec "No unread threads": the
+ * affordance is not offered).
  */
 
 interface FlatRow {
@@ -582,6 +600,116 @@ function GroupBySenderToggle({
   )
 }
 
+/**
+ * The active view's digest scope (task 7.1, ai-assistance spec "Folder
+ * unread digest"). Only the mailbox views the digest is DEFINED for map:
+ * an account folder view pins its account and folder, an account label
+ * view is the same query as folder.labelId, and a category tab is
+ * inherently cross-account. Every other scope — unified, priority,
+ * nudges, split, saved-search, search, settings, null — maps to null and
+ * keeps the affordance hidden: the spec's scope boundary ("only threads
+ * in that scope") defines the digest over ONE folder or one category,
+ * never an aggregated or query-shaped listing.
+ */
+function digestScopeFor(scope: ThreadListScope): DigestScope | null {
+  switch (scope.kind) {
+    case "account":
+      return {
+        kind: "accountFolder",
+        accountId: scope.accountId,
+        folder: scope.folder,
+      }
+    case "label":
+      return {
+        kind: "accountFolder",
+        accountId: scope.accountId,
+        folder: { kind: "labelId", labelId: scope.labelId },
+      }
+    case "category":
+      return { kind: "category", category: scope.category }
+    default:
+      return null
+  }
+}
+
+/**
+ * The "Catch me up" header affordance (task 7.1, ai-assistance spec
+ * "Folder unread digest"): a ghost button in the list header's right
+ * cluster opening the folder-digest dialog for the active view. Visibility
+ * is the AND of three independent gates, each failing toward hidden:
+ * - AI gate — a provider configured AND the folderDigest surface enabled,
+ *   read once per mount through the list's executor seam (the same
+ *   best-effort, fail-toward-hidden flag load as thread-view's AI
+ *   affordances; settings edits remount the list anyway);
+ * - scope support — digestScopeFor above (null ⇒ unsupported);
+ * - unread presence — the `hasUnread` prop from the SAME loaded rows the
+ *   list renders (spec "No unread threads": not offered).
+ */
+function CatchMeUpButton({
+  scope,
+  hasUnread,
+}: {
+  scope: ThreadListScope | null
+  hasUnread: boolean
+}) {
+  const digestScope = useMemo(
+    () => (scope === null ? null : digestScopeFor(scope)),
+    [scope]
+  )
+  const [aiAvailable, setAiAvailable] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    try {
+      const executor = getThreadListExecutor()
+      void (async () => {
+        try {
+          const [configured, surface] = await Promise.all([
+            isAiConfigured(executor),
+            isSurfaceEnabled(executor, "folderDigest"),
+          ])
+          if (!cancelled) setAiAvailable(configured && surface)
+        } catch {
+          if (!cancelled) setAiAvailable(false)
+        }
+      })()
+    } catch {
+      // No executor (plain vite) — hidden.
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [])
+  // The snapshot the dialog runs on, taken at CLICK time from the store's
+  // resolved scope: a view switch while the dialog is open can never move
+  // the briefing's scope mid-flight.
+  const [openScope, setOpenScope] = useState<DigestScope | null>(null)
+  if (!aiAvailable || digestScope === null || !hasUnread) return null
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-label="Catch me up"
+        data-testid="catch-me-up-button"
+        title="Summarize this view's unread threads with AI"
+        className="gap-1 text-xs font-normal text-muted-foreground"
+        onClick={() => setOpenScope(digestScope)}
+      >
+        <Sparkles className="size-3.5" />
+        Catch me up
+      </Button>
+      {openScope !== null && (
+        <FolderDigestDialog
+          scope={openScope}
+          onOpenChange={(open) => {
+            if (!open) setOpenScope(null)
+          }}
+        />
+      )}
+    </>
+  )
+}
+
 export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
   const activeAccountId = useAccountStore((state) => state.activeAccountId)
   const view = useUiStore((state) => state.view)
@@ -660,6 +788,13 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
         ? threads.filter((thread) => thread.unread_count > 0)
         : threads,
     [threads, unreadOnly]
+  )
+  // Catch-me-up visibility (task 7.1): the affordance offers itself only
+  // while the view actually HAS unread threads — derived from the SAME
+  // loaded rows the list renders (no extra query).
+  const hasUnread = useMemo(
+    () => threads.some((thread) => thread.unread_count > 0),
+    [threads]
   )
   // Bulk targets in the order the rows render (bulkApply applies in order)
   // — the VISIBLE rows only: under the unread-only filter a hidden row is
@@ -1155,7 +1290,9 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
           then the group-by-sender toggle + the sort selector, right-aligned
           like the pane header's controls above it. The pinned-first lead is
           part of every store query, so the picker only changes the trailing
-          sort. */}
+          sort. The catch-me-up affordance (task 7.1) leads the right
+          cluster — it acts on the whole view, like the toggles beside it,
+          and self-hides when its gates don't hold. */}
       <div className="flex shrink-0 items-center gap-1 border-b px-2 py-1">
         {searchRelaxed && (
           <Badge
@@ -1168,6 +1305,7 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
           </Badge>
         )}
         <span className="ms-auto flex items-center gap-1">
+          <CatchMeUpButton scope={scope} hasUnread={hasUnread} />
           <GroupBySenderToggle
             enabled={groupBySender}
             onToggle={toggleGroupBySender}
