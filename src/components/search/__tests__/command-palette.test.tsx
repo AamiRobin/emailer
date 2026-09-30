@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   act,
   cleanup,
@@ -8,6 +8,25 @@ import {
   waitFor,
 } from "@testing-library/react"
 
+// The assistant command's gate seam (task 3.3, design D6): the palette
+// resolves configured+enabled through the AI settings service off the
+// shared executor. Mocked here like the ask-inbox suite so the gating is
+// deterministic; the rest of the suite is unaffected (the beforeEach
+// pins the gate open).
+vi.mock("@/services/db/executor", () => ({
+  getExecutor: () => ({}),
+  placeholders: (count: number, firstIndex = 1): string =>
+    Array.from({ length: count }, (_, index) => `$${index + firstIndex}`).join(
+      ", "
+    ),
+}))
+
+vi.mock("@/services/ai/settings", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/services/ai/settings")>()),
+  isAiConfigured: vi.fn(async () => true),
+  isSurfaceEnabled: vi.fn(async () => true),
+}))
+
 import {
   createAccount,
   createGmailLabel,
@@ -16,6 +35,7 @@ import {
   createTestExecutor,
   type TestExecutor,
 } from "@/services/db/__tests__/test-executor"
+import { isAiConfigured, isSurfaceEnabled } from "@/services/ai/settings"
 import {
   initAccountStore,
   setAccountStoreExecutor,
@@ -45,6 +65,9 @@ Element.prototype.scrollIntoView = () => {}
 
 let executor: TestExecutor
 
+const isAiConfiguredMock = vi.mocked(isAiConfigured)
+const isSurfaceEnabledMock = vi.mocked(isSurfaceEnabled)
+
 function resetStores(): void {
   useAccountStore.setState({
     accounts: [],
@@ -57,6 +80,7 @@ function resetStores(): void {
     composerOpen: false,
     activeThread: null,
     readingPane: "right",
+    assistantOpen: false,
   })
   usePaletteStore.setState({ open: false })
 }
@@ -127,6 +151,10 @@ beforeEach(() => {
   setAccountStoreExecutor(executor)
   setPaletteLabelsExecutor(executor)
   resetStores()
+  // Pin the assistant gate open; the gating tests below override with
+  // mockResolvedValue, so each states its own expectation.
+  isAiConfiguredMock.mockResolvedValue(true)
+  isSurfaceEnabledMock.mockResolvedValue(true)
 })
 
 afterEach(() => {
@@ -262,5 +290,41 @@ describe("command palette", () => {
 
     expect(useUiStore.getState().view).toEqual({ kind: "search", query: "" })
     expect(usePaletteStore.getState().open).toBe(false)
+  })
+})
+
+/**
+ * The assistant command (task 3.3, design D6): the third self-gating
+ * entry — offered only while a provider is configured AND the assistant
+ * surface is enabled, and its run only flips ui-store.assistantOpen.
+ */
+describe("command palette — AI assistant command (task 3.3)", () => {
+  it("offers the command when configured and enabled; run sets the flag and closes", async () => {
+    await seedAndOpen()
+
+    fireEvent.click(screen.getByRole("option", { name: "Open AI assistant" }))
+
+    expect(useUiStore.getState().assistantOpen).toBe(true)
+    expect(usePaletteStore.getState().open).toBe(false)
+  })
+
+  it("hides the command while the assistant surface is disabled", async () => {
+    isSurfaceEnabledMock.mockResolvedValue(false)
+    await seedAndOpen()
+    // The gate resolved before the assertion — absence is the decision,
+    // not a race.
+    await waitFor(() => expect(isSurfaceEnabledMock).toHaveBeenCalled())
+    expect(
+      screen.queryByRole("option", { name: "Open AI assistant" })
+    ).toBeNull()
+  })
+
+  it("hides the command while no provider is configured", async () => {
+    isAiConfiguredMock.mockResolvedValue(false)
+    await seedAndOpen()
+    await waitFor(() => expect(isAiConfiguredMock).toHaveBeenCalled())
+    expect(
+      screen.queryByRole("option", { name: "Open AI assistant" })
+    ).toBeNull()
   })
 })

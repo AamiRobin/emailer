@@ -42,6 +42,7 @@ export type ShortcutId =
   | "focus-search"
   | "find-in-message"
   | "palette"
+  | "assistant"
   | "help"
   | "dismiss"
   | "toggle-sidebar"
@@ -175,6 +176,15 @@ export const SHORTCUTS: ReadonlyArray<ShortcutBinding> = [
     id: "palette",
     keys: "Cmd/Ctrl+K",
     description: "Toggle the command palette",
+    group: "search",
+  },
+  {
+    // The AI-assistant toggle (task 3.3, design D6): the palette-toggle's
+    // sibling combo — app-global in the shortcuts hook, self-gating entry
+    // points decide whether anything is there to open.
+    id: "assistant",
+    keys: "Cmd/Ctrl+J",
+    description: "Open the AI assistant",
     group: "search",
   },
   {

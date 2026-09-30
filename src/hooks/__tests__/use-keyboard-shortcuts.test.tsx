@@ -65,6 +65,7 @@ import {
 // snoozeThread is the mocked binding; getSnoozePresets stays real.
 import { getSnoozePresets, snoozeThread } from "@/services/email-actions/snooze"
 import { triggerRefresh } from "@/services/sync/scheduler"
+import { matchShortcutEvent, SHORTCUTS } from "@/constants/shortcuts"
 import type { ThreadRow } from "@/services/db/threads"
 import { useAccountStore } from "@/stores/account-store"
 import { useComposerStore } from "@/stores/composer-store"
@@ -186,6 +187,7 @@ beforeEach(() => {
     readingPaneFindOpen: false,
     activeThread: null,
     readingPane: "right",
+    assistantOpen: false,
   })
   useAccountStore.setState({
     accounts: [],
@@ -560,6 +562,49 @@ describe("useKeyboardShortcuts — palette, help, refresh", () => {
     expect(usePaletteStore.getState().open).toBe(false)
     press("k", { metaKey: true })
     expect(usePaletteStore.getState().open).toBe(true)
+  })
+
+  // Task 3.3 (design D6): the assistant binding is the palette-toggle's
+  // sibling — same matcher shape and the same app-global handling.
+  it("matchShortcutEvent maps Cmd/Ctrl+J to the assistant binding", () => {
+    expect(
+      matchShortcutEvent(
+        new KeyboardEvent("keydown", { key: "j", ctrlKey: true }),
+        SHORTCUTS
+      )
+    ).toBe("assistant")
+    expect(
+      matchShortcutEvent(
+        new KeyboardEvent("keydown", { key: "j", metaKey: true }),
+        SHORTCUTS
+      )
+    ).toBe("assistant")
+    // Plain j stays list navigation — the combo shape is required.
+    expect(
+      matchShortcutEvent(new KeyboardEvent("keydown", { key: "j" }), SHORTCUTS)
+    ).toBe("next-thread")
+  })
+
+  it("Cmd/Ctrl+J toggles the assistant flag", () => {
+    renderHarness()
+    press("j", { ctrlKey: true })
+    expect(useUiStore.getState().assistantOpen).toBe(true)
+    press("j", { ctrlKey: true })
+    expect(useUiStore.getState().assistantOpen).toBe(false)
+    press("j", { metaKey: true })
+    expect(useUiStore.getState().assistantOpen).toBe(true)
+  })
+
+  it("Cmd/Ctrl+J fires even while a modal dialog is open (palette parity)", () => {
+    renderHarness({
+      children: (
+        <div role="dialog" aria-label="Assistant fixture dialog">
+          <button type="button">Confirm</button>
+        </div>
+      ),
+    })
+    press("j", { ctrlKey: true })
+    expect(useUiStore.getState().assistantOpen).toBe(true)
   })
 
   it("plain keys are ignored while the palette is open", () => {

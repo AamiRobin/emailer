@@ -353,12 +353,18 @@ pub(crate) const CATEGORIZATION_LIMIT: u32 = 30;
 /// tiny prompts and a 3-line output, so they get the loosest budget —
 /// 40/min, fast enough to feel ambient across a mailbox session.
 pub(crate) const QUICK_REPLIES_LIMIT: u32 = 40;
+/// The assistant (ai-assistant-panel) spends several calls per
+/// conversation turn — its tool loop runs up to six model calls plus the
+/// answer — so one turn must never trip the default 20/min budget.
+pub(crate) const ASSISTANT_LIMIT: u32 = 60;
 /// Every other (and any future) surface: 20/min.
 pub(crate) const DEFAULT_LIMIT: u32 = 20;
 
 /// The per-surface request budget per [`RATE_WINDOW`]. Surface names come
 /// from the TS layer; matching is by distinctive prefix so "summary" and
-/// "summaries" share a budget and new surfaces get the default.
+/// "summaries" share a budget and new surfaces get the default. No other
+/// wire name may ever contain "assistant" — it would silently share this
+/// bucket (the same discipline as the "summar"/"categor" prefixes).
 pub(crate) fn limit_for_surface(surface: &str) -> u32 {
     let lowered = surface.to_ascii_lowercase();
     if lowered.contains("summar") {
@@ -367,6 +373,8 @@ pub(crate) fn limit_for_surface(surface: &str) -> u32 {
         CATEGORIZATION_LIMIT
     } else if lowered.contains("quick-repl") {
         QUICK_REPLIES_LIMIT
+    } else if lowered.contains("assistant") {
+        ASSISTANT_LIMIT
     } else {
         DEFAULT_LIMIT
     }
@@ -883,12 +891,21 @@ mod tests {
         // exact wire name and a prefix variant both land in it.
         assert_eq!(limit_for_surface("quick-replies"), QUICK_REPLIES_LIMIT);
         assert_eq!(limit_for_surface("quick-reply"), QUICK_REPLIES_LIMIT);
+        // The assistant (ai-assistant-panel) gets its own bucket — one
+        // turn is several calls, so it must not trip the default budget.
+        assert_eq!(limit_for_surface("assistant"), ASSISTANT_LIMIT);
         // Natural-language rule assist (task 2.5) is on-demand and cheap:
         // no special bucket — the default budget serves it.
         assert_eq!(limit_for_surface("rule-assist"), DEFAULT_LIMIT);
         // Unknown and future surfaces share the default budget.
         assert_eq!(limit_for_surface("smart-replies"), DEFAULT_LIMIT);
         assert_eq!(limit_for_surface("ask-inbox"), DEFAULT_LIMIT);
+        // The "assistant" match is a contains() — pin that no other
+        // surface's wire name collides into its bucket.
+        assert_eq!(limit_for_surface("smart-replies-assistant-x"), ASSISTANT_LIMIT);
+        assert_eq!(limit_for_surface("event-extraction"), DEFAULT_LIMIT);
+        assert_eq!(limit_for_surface("folder-digest"), DEFAULT_LIMIT);
+        assert_eq!(limit_for_surface("translation"), DEFAULT_LIMIT);
         assert_eq!(limit_for_surface(""), DEFAULT_LIMIT);
     }
 

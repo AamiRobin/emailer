@@ -5,6 +5,7 @@ import {
   CircleHelp,
   Search,
   Settings,
+  Sparkles,
   SquarePen,
   Tag,
   UserRound,
@@ -23,11 +24,13 @@ import {
 import { FOLDER_ITEMS } from "@/components/layout/folders"
 import { ProviderIcon } from "@/components/providers/provider-icon"
 import { filterByFuzzy } from "@/lib/fuzzy-match"
+import { isAiConfigured, isSurfaceEnabled } from "@/services/ai/settings"
 import { brandForAccount } from "@/services/account-flows"
 import {
   currentQuickStepTargets,
   runQuickStepWithConfirm,
 } from "@/services/quick-steps/run-with-confirm"
+import { getExecutor } from "@/services/db/executor"
 import { useAccountStore } from "@/stores/account-store"
 import { usePaletteStore } from "@/stores/palette-store"
 import { useUiStore } from "@/stores/ui-store"
@@ -100,6 +103,30 @@ export function CommandPalette() {
   // shows up on the next Cmd/Ctrl+K.
   const quickSteps = usePaletteQuickSteps(open)
 
+  // The assistant command (task 3.3, design D6) self-gates like the
+  // search-field button (AskInboxButton pattern): configured AND the
+  // assistant surface enabled, resolved once per mount, best-effort and
+  // failing toward hidden. Every other palette item is unconditional, so
+  // the item is built only while this flag is true.
+  const [assistantAvailable, setAssistantAvailable] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const executor = getExecutor()
+        const ok =
+          (await isAiConfigured(executor)) &&
+          (await isSurfaceEnabled(executor, "assistant"))
+        if (!cancelled) setAssistantAvailable(ok)
+      } catch {
+        // Fail toward hidden — the palette must not break without a DB.
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   // Autofocus: the cmdk input is portaled by the dialog, and Base UI
   // moves focus to the popup after mount, so focus the input one frame
   // later (no-op if the dialog was already closed again). The same frame
@@ -157,6 +184,20 @@ export function CommandPalette() {
         run: () => useUiStore.getState().setHelpCenterOpen(true),
       },
     ]
+    // Gated on the same configured + enabled check as the search-field
+    // button (task 3.3, design D6 — three self-gating entries): built
+    // only while the gate holds, so the command never shows for a
+    // disabled surface.
+    if (assistantAvailable) {
+      actionItems.push({
+        id: "open-assistant",
+        group: "actions",
+        label: "Open AI assistant",
+        keywords: ["ai", "assistant", "chat", "ask"],
+        icon: Sparkles,
+        run: () => useUiStore.getState().setAssistantOpen(true),
+      })
+    }
     const quickStepItems: PaletteItem[] = quickSteps.map((step) => ({
       id: `quick-step-${step.id}`,
       group: "quick-steps",
@@ -218,7 +259,7 @@ export function CommandPalette() {
       ...labelItems,
       ...accountItems,
     ]
-  }, [accounts, labels, quickSteps, query])
+  }, [accounts, assistantAvailable, labels, quickSteps, query])
 
   const visibleItems = useMemo(
     () => filterByFuzzy(items, query, (item) => [item.label, ...item.keywords]),

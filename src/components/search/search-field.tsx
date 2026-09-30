@@ -1,8 +1,11 @@
-import { useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { FormEvent } from "react"
-import { SearchIcon, XIcon } from "lucide-react"
+import { SearchIcon, SparklesIcon, XIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { isAiConfigured, isSurfaceEnabled } from "@/services/ai/settings"
+import { getExecutor } from "@/services/db/executor"
+import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { useUiStore } from "@/stores/ui-store"
@@ -10,6 +13,60 @@ import { AskInboxButton } from "./ask-inbox-dialog"
 import { CreateFilterButton } from "./create-filter-button"
 import { SaveAsSplitButton } from "./save-as-split-button"
 import { SaveSearchButton } from "./save-search-button"
+
+/**
+ * Whether the AI-assistant entry point may appear (task 3.2, design D6):
+ * a provider configured AND the assistant surface enabled — the exact
+ * gate shape of useAskInboxAvailable, best-effort and failing toward
+ * hidden (outside Tauri / before the DB is up, the button stays
+ * invisible rather than erroring).
+ */
+function useAssistantAvailable(): boolean {
+  const [available, setAvailable] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const executor = getExecutor()
+        const ok =
+          (await isAiConfigured(executor)) &&
+          (await isSurfaceEnabled(executor, "assistant"))
+        if (!cancelled) setAvailable(ok)
+      } catch {
+        // Fail toward hidden — the affordance must not break the search row.
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+  return available
+}
+
+/**
+ * The AI-assistant entry point (task 3.2, design D6): a Sparkles button
+ * next to Ask My Inbox, self-gating the same way (renders null until a
+ * provider is configured and the assistant surface is on). It only
+ * flips ui-store.assistantOpen — the dialog is mounted at the mail-shell
+ * level (design D1).
+ */
+export function AssistantButton() {
+  const available = useAssistantAvailable()
+  if (!available) return null
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      aria-label="AI assistant"
+      title="AI assistant"
+      data-testid="assistant-button"
+      onClick={() => useUiStore.getState().setAssistantOpen(true)}
+    >
+      <SparklesIcon />
+    </Button>
+  )
+}
 
 /**
  * The list-header search field (task 9.2, mail-search spec "Search
@@ -97,6 +154,10 @@ export function SearchField({ className }: { className?: string }) {
           the end of the search row, self-gating (renders null until a
           provider is configured and the askInbox surface is on). */}
       <AskInboxButton />
+      {/* AI assistant (task 3.2, design D6): the second self-gating
+          entry point beside Ask My Inbox; the click only sets
+          ui-store.assistantOpen (the dialog mounts at the shell). */}
+      <AssistantButton />
       {activeQuery !== null && (
         <>
           <SaveSearchButton query={activeQuery} />

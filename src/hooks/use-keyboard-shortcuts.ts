@@ -46,10 +46,12 @@ import { snoozeThreadsWithRefresh } from "@/components/email/snooze-flow"
  * to the shortcuts help overlay it toggles.
  *
  * Context gating (D13 — contexts decide which bindings fire), in order:
- * 1. Cmd/Ctrl+K always toggles the palette (app-global; also works while
- *    a dialog or an input has focus — the palette owns no keybinding of
- *    its own, per palette-store's contract; a palette rebound to a plain
- *    key keeps inputs safe and does not fire while typing).
+ * 1. Cmd/Ctrl+K always toggles the palette, and Cmd/Ctrl+J the AI
+ *    assistant (task 3.3, design D6 — same app-global shape): both work
+ *    while a dialog or an input has focus — the palette owns no
+ *    keybinding of its own, per palette-store's contract, and the
+ *    assistant's entry points self-gate; a binding rebound to a plain
+ *    key keeps inputs safe and does not fire while typing.
  * 2. While the settings editor is capturing a new key, nothing fires —
  *    the capture cannot outrun this earlier window listener, so the hook
  *    steps aside (shortcut-bindings store's captureActive).
@@ -318,6 +320,19 @@ export function useKeyboardShortcuts({
         event.preventDefault()
         const palette = usePaletteStore.getState()
         palette.setOpen(!palette.open)
+        return
+      }
+
+      // 1b. Assistant toggle (task 3.3, design D6): the palette-toggle's
+      // exact shape — app-global (fires before the modal/palette gates),
+      // and a binding rebound to a PLAIN key must not fire while typing.
+      if (id === "assistant") {
+        if (!(event.metaKey || event.ctrlKey) && isEditableTarget(event.target))
+          return
+        event.preventDefault()
+        useUiStore
+          .getState()
+          .setAssistantOpen(!useUiStore.getState().assistantOpen)
         return
       }
 

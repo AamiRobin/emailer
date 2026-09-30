@@ -28,6 +28,8 @@ import { StatusBar } from "@/components/layout/status-bar"
 import { OfflineBanner } from "@/components/layout/offline-banner"
 import { SearchField } from "@/components/search/search-field"
 import { CommandPalette } from "@/components/search/command-palette"
+import { AssistantPanel } from "@/components/assistant/assistant-panel"
+import { useAssistantAvailable } from "@/components/assistant/use-assistant-available"
 import { HelpCenterDialog } from "@/components/help/help-center"
 import { SplitsTabBar } from "@/components/layout/splits-tab-bar"
 import { CATEGORY_LABELS } from "@/components/layout/use-categories"
@@ -206,6 +208,9 @@ function MailboxPane({ onAddAccount }: { onAddAccount: () => void }) {
  * - bottom: sidebar | list-over-display (vertical split)
  * - hidden: sidebar | list; selecting a thread swaps the list for the
  *   full-width reading view with a back control
+ * Every mailbox variant additionally carries the docked AI-assistant
+ * panel as its trailing panel while it is open (ai-assistant-panel
+ * task 7.3, design D1 revised) — never on the full-page views.
  * - settings view (11.1): sidebar | settings page — the settings page
  *   replaces the mailbox panes until the user navigates back
  * - contacts view (20.2): sidebar | Contacts browser — the same pane
@@ -252,6 +257,12 @@ export function MailShell({
   const composerMinimized = useComposerStore((state) => state.minimized)
   // Surface size (batch C2): full-surface overlay or the centered card.
   const composerMode = useUiStore((state) => state.composerMode)
+  // AI assistant panel visibility (ai-assistant-panel task 7.3, design D1
+  // revised): the three self-gating entries (search-field button, palette
+  // command, Cmd/Ctrl+J) flip this flag; the mailbox panel groups render
+  // the docked panel only while it is set.
+  const assistantOpen = useUiStore((state) => state.assistantOpen)
+  const activeView = useUiStore((state) => state.view)
   const [addAccountOpen, setAddAccountOpen] = useState(false)
   const panelRef = usePanelRef()
 
@@ -326,6 +337,18 @@ export function MailShell({
     if (!narrowWindow) return
     if (!useUiStore.getState().sidebarCollapsed) {
       useUiStore.getState().setSidebarCollapsed(true)
+    }
+  }, [narrowWindow])
+
+  // Assistant auto-collapse (ai-assistant-panel task 7.3, design D1): on
+  // narrow viewports the docked panel folds with the rest of the shell's
+  // chrome — crossing down closes it (the conversation persists in the
+  // assistant-store, so nothing is lost); crossing up never auto-reopens,
+  // the sidebar auto-rail's explicit-gestures-persist rule.
+  useEffect(() => {
+    if (!narrowWindow) return
+    if (useUiStore.getState().assistantOpen) {
+      useUiStore.getState().setAssistantOpen(false)
     }
   }, [narrowWindow])
 
@@ -517,6 +540,39 @@ export function MailShell({
     [adoptSidebarLayout]
   )
 
+  // The assistant panel pair (ai-assistant-panel task 7.3, design D1
+  // revised): handle + panel appended as the TRAILING child of each
+  // mailbox panel group (reading-pane right/bottom/hidden) so all three
+  // variants share one code path, while the settings/contacts/attachments/
+  // calendar groups stay untouched (mailbox-scoped). Rendered only while
+  // assistantOpen AND the surface gate passes (task 7.5: the gate hook is
+  // shared with the panel body so a surface disabled mid-session takes
+  // the whole docked pair with it — an empty docked column would be dead
+  // chrome); closing unmounts the pair, and the CONVERSATION survives in
+  // the assistant-store (task 7.1), which is the persistence D1 wants;
+  // collapse = close. Pixel sizes per D1 (~360px default, 280px floor,
+  // 560px ceiling — the reading pane's group already mixes px and %
+  // sizes), and the id keys the panel inside the group's saved-layout
+  // writes whenever a user drag happens while it is mounted.
+  // view as the recheck key: returning from settings re-gates the panel
+  // even though assistantOpen never flipped (task 7.5 smoke — a surface
+  // disabled mid-session must take the docked pair with it).
+  const assistantAvailable = useAssistantAvailable(assistantOpen, activeView)
+  const assistantTrail =
+    assistantOpen && assistantAvailable ? (
+      <>
+        <ResizableHandle withHandle />
+        <ResizablePanel
+          id="assistant-panel"
+          defaultSize="360px"
+          minSize="280px"
+          maxSize="560px"
+        >
+          <AssistantPanel />
+        </ResizablePanel>
+      </>
+    ) : null
+
   const sidebarPane = (
     <ResizablePanel
       panelRef={panelRef}
@@ -678,6 +734,7 @@ export function MailShell({
               >
                 <ReadingPane />
               </ResizablePanel>
+              {assistantTrail}
             </ResizablePanelGroup>
           )}
           {!fullPageOpen && readingPane === "bottom" && (
@@ -711,6 +768,7 @@ export function MailShell({
                   </ResizablePanel>
                 </ResizablePanelGroup>
               </ResizablePanel>
+              {assistantTrail}
             </ResizablePanelGroup>
           )}
           {!fullPageOpen && readingPane === "hidden" && (
@@ -729,6 +787,7 @@ export function MailShell({
               <ResizablePanel id="list" defaultSize="80%" minSize="40%">
                 <MailboxPane onAddAccount={openAddAccount} />
               </ResizablePanel>
+              {assistantTrail}
             </ResizablePanelGroup>
           )}
           <StatusBar />

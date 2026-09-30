@@ -174,6 +174,11 @@ const SURFACE_COPY: Record<AiSurfaceId, { label: string; description: string }> 
       description:
         "Summarize the unread threads of the folder you invoke it in. Only threads from that folder are sent.",
     },
+    assistant: {
+      label: "AI assistant",
+      description:
+        "Chat with your mailbox: ask questions and the assistant looks threads up read-only to answer. Nothing is changed by it.",
+    },
   }
 
 /** Tier display names (parity-round-2 task 2.1). */

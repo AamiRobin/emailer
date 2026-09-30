@@ -67,6 +67,7 @@ const SURFACE_WIRE_NAMES: Record<AiSurface, string> = {
   eventExtraction: "event-extraction",
   translation: "translation",
   folderDigest: "folder-digest",
+  assistant: "assistant",
 }
 
 /** One conversation turn (plain text; prompt shaping is the caller's). */

@@ -181,6 +181,15 @@ interface UiState {
    * mail-shell level. The Settings → Help section mounts the center
    * inline and does not consult this flag. */
   helpCenterOpen: boolean
+  /** AI-assistant panel visibility (task 3.1, design D1/D6): flipped by
+   * the three self-gating entry points (the search-field Sparkles
+   * button, the palette's "Open AI assistant" command and the app-global
+   * Cmd/Ctrl+J binding); since the panel rework (task 7.3, design D1
+   * revised) the docked panel is mounted inside mail-shell's mailbox
+   * panel groups while this flag is set, and the conversation itself
+   * persists in the assistant-store across open/close. Pure in-memory
+   * view state. */
+  assistantOpen: boolean
   /** Thread shown in the reading pane; null = no selection. */
   activeThread: string | null
   /** Bumped whenever the open thread changes in another window (task 1.9
@@ -221,6 +230,7 @@ interface UiState {
   setComposerMode: (mode: ComposerSizeMode) => void
   setReadingPaneFindOpen: (open: boolean) => void
   setHelpCenterOpen: (open: boolean) => void
+  setAssistantOpen: (open: boolean) => void
   setActiveThread: (threadId: string | null) => void
   /** Remote thread-change signal (task 1.9): forces the reading pane to
    * re-read the currently open thread. */
@@ -242,6 +252,7 @@ export const useUiStore = create<UiState>((set) => ({
   composerMode: "centered",
   readingPaneFindOpen: false,
   helpCenterOpen: false,
+  assistantOpen: false,
   activeThread: null,
   activeThreadRevision: 0,
   readingPane: "right",
@@ -277,6 +288,7 @@ export const useUiStore = create<UiState>((set) => ({
   setComposerMode: (composerMode) => set({ composerMode }),
   setReadingPaneFindOpen: (readingPaneFindOpen) => set({ readingPaneFindOpen }),
   setHelpCenterOpen: (helpCenterOpen) => set({ helpCenterOpen }),
+  setAssistantOpen: (assistantOpen) => set({ assistantOpen }),
   setActiveThread: (activeThread) => set({ activeThread }),
   bumpActiveThreadRevision: () =>
     set((state) => ({

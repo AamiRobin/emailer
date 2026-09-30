@@ -92,6 +92,7 @@ export type AiSurfaceId =
   | "eventExtraction"
   | "translation"
   | "folderDigest"
+  | "assistant"
 
 export const AI_SURFACE_IDS: readonly AiSurfaceId[] = [
   "summaries",
@@ -105,6 +106,7 @@ export const AI_SURFACE_IDS: readonly AiSurfaceId[] = [
   "eventExtraction",
   "translation",
   "folderDigest",
+  "assistant",
 ]
 
 export function isAiSurfaceId(value: unknown): value is AiSurfaceId {
@@ -131,6 +133,7 @@ export const DEFAULT_SURFACES: AiSurfacesConfig = {
   eventExtraction: true,
   translation: true,
   folderDigest: true,
+  assistant: true,
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +193,9 @@ export type AiSurfaceTiersConfig = Partial<Record<AiSurfaceId, AiTier>>
  * - `eventExtraction`, `translation`, `folderDigest` → cheap (add-ai-
  *   surfaces): all three are explicitly user-initiated with short outputs
  *   — routine generation, no latency pressure beyond the click.
+ * - `assistant` → intelligent (ai-assistant-panel): multi-turn mailbox
+ *   synthesis is quality-critical reasoning, like askInbox — a wrong
+ *   answer is the failure mode, not a slow one.
  *
  * A plain Record over AiSurfaceId: adding a surface later is one entry
  * here (plus one in AI_SURFACE_IDS) and everything else keeps working.
@@ -206,6 +212,7 @@ export const DEFAULT_SURFACE_TIERS: Record<AiSurfaceId, AiTier> = {
   eventExtraction: "cheap",
   translation: "cheap",
   folderDigest: "cheap",
+  assistant: "intelligent",
 }
 
 /** One stored provider. `apiKeySealed` is the credentials envelope of

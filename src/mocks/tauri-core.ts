@@ -112,6 +112,27 @@ export async function invoke<T = unknown>(
         model: "mock-model",
       } as T
     }
+    // Assistant surface (ai-assistant-panel task 5.1): the tool loop is
+    // driveable end to end without a stateful mock — inspect the LAST
+    // message. No tool result yet → emit one search tool call; a tool
+    // result in hand → emit the plain-text answer citing it.
+    if (String(readArg(args, "surface") ?? "") === "assistant") {
+      const messages = Array.isArray(readArg(args, "messages"))
+        ? (readArg(args, "messages") as Array<{ role: string; content: string }>)
+        : []
+      const last = messages[messages.length - 1]
+      if (last && last.content.includes("[TOOL_RESULT")) {
+        return {
+          content:
+            "Here is what I found in your mailbox. The mock assistant is read-only and this reply is canned demo data — check the sources under the conversation.",
+          model: "mock-model",
+        } as T
+      }
+      return {
+        content: '{"tool": "search", "args": {"query": "is:unread"}}',
+        model: "mock-model",
+      } as T
+    }
     return { content: "Mock AI reply.", model: "mock-model" } as T
   }
 

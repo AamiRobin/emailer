@@ -13,6 +13,7 @@ function resetStore(): void {
     readingPane: "right",
     previousView: DEFAULT_VIEW,
     listScope: null,
+    assistantOpen: false,
   })
 }
 
@@ -69,6 +70,17 @@ describe("ui store", () => {
     expect(useUiStore.getState().activeThread).toBe("thread-7")
     useUiStore.getState().setActiveThread(null)
     expect(useUiStore.getState().activeThread).toBeNull()
+  })
+
+  // Task 3.1 (design D1/D6): the assistant dialog flag mirrors the
+  // helpCenterOpen pattern — entry points set it, the shell mounts the
+  // dialog off it.
+  it("setAssistantOpen tracks the requested state", () => {
+    expect(useUiStore.getState().assistantOpen).toBe(false)
+    useUiStore.getState().setAssistantOpen(true)
+    expect(useUiStore.getState().assistantOpen).toBe(true)
+    useUiStore.getState().setAssistantOpen(false)
+    expect(useUiStore.getState().assistantOpen).toBe(false)
   })
 
   it("setReadingPane switches positions in memory (persistence is the preferences service)", () => {

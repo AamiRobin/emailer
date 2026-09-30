@@ -149,11 +149,12 @@ describe("AiSection (task 4.2)", () => {
       expect((await getAiSettings(executor)).enabled).toBe(true)
     })
 
-    // All eleven surface toggles render; all default ON except
+    // All twelve surface toggles render; all default ON except
     // categorization assist, the opt-in one (off). The parity-round-2
-    // additions (quick replies, natural-language rules) and the
+    // additions (quick replies, natural-language rules), the
     // add-ai-surfaces additions (event extraction, translate, digest)
-    // register like the originals: default ON, individually toggleable.
+    // and the ai-assistant-panel addition (AI assistant) register like
+    // the originals: default ON, individually toggleable.
     for (const [name, checked] of [
       ["Thread summaries", "true"],
       ["Smart replies", "true"],
@@ -166,6 +167,7 @@ describe("AiSection (task 4.2)", () => {
       ["Event extraction", "true"],
       ["Translate", "true"],
       ["Catch-me-up digest", "true"],
+      ["AI assistant", "true"],
     ] as const) {
       const toggle = screen.getByRole("switch", { name })
       expect(toggle.getAttribute("aria-checked")).toBe(checked)
@@ -514,6 +516,12 @@ describe("AiSection model tiers + output language (parity-round-2 task 2.1)", ()
       screen.getByRole("combobox", { name: "Tier for Catch-me-up digest" })
         .textContent
     ).toContain("Cheap")
+    // The ai-assistant-panel surface's default: multi-turn mailbox
+    // synthesis is quality-critical — intelligent, like Ask My Inbox.
+    expect(
+      screen.getByRole("combobox", { name: "Tier for AI assistant" })
+        .textContent
+    ).toContain("Intelligent")
   })
 
   it("changing a surface tier persists it", async () => {
