@@ -29,7 +29,7 @@ interface EventDialogPropsStub {
 }
 
 const eventDialogMock = vi.hoisted(() =>
-  vi.fn((_props: EventDialogPropsStub) => null)
+  vi.fn<(props: EventDialogPropsStub) => null>()
 )
 
 vi.mock("@/components/calendar/event-dialog", () => ({
