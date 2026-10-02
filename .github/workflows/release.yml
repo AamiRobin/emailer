@@ -169,6 +169,9 @@ jobs:
       - name: Upload channel manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job — gh resolves the repo from GH_REPO
+          # instead of a git remote.
+          GH_REPO: ${{ github.repository }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then

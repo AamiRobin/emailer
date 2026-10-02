@@ -51,8 +51,10 @@ describe("status bar", () => {
     // The sync text renders for the active account (idle, never synced).
     expect(screen.getByText("Not synced yet")).not.toBeNull()
     // Version comes from the build-time __APP_VERSION__ define
-    // (src-tauri/tauri.conf.json); assert the v-prefixed semver shape.
-    expect(screen.getByText(/^v\d+\.\d+\.\d+$/)).not.toBeNull()
+    // (src-tauri/tauri.conf.json); assert the v-prefixed semver shape —
+    // with an optional prerelease suffix on beta-channel versions
+    // (v0.1.0-beta.1).
+    expect(screen.getByText(/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/)).not.toBeNull()
   })
 
   it("hides the sync indicator without an active account", async () => {

@@ -658,7 +658,9 @@ describe("Composer attachments (task 8.5)", () => {
       asFile("b.bin"),
       asFile("c.bin"), // would push the total past 25 MB
     ])
-    const alert = await screen.findByRole("alert")
+    // 12.5 MB x3 through the attachment pipeline can exceed the 1s default
+    // under full-suite parallel load (CI runners especially).
+    const alert = await screen.findByRole("alert", {}, { timeout: 5000 })
     expect(alert.textContent).toMatch(/c\.bin/)
     expect(useComposerStore.getState().attachments.map((a) => a.name)).toEqual([
       "a.bin",
