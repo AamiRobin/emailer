@@ -21,7 +21,16 @@ vi.mock("@/services/ai/event-extraction", () => ({
   extractEvents: extractEventsMock,
 }))
 
-const eventDialogMock = vi.hoisted(() => vi.fn(() => null))
+/** The props contract the tests read off the (mocked) event form. */
+interface EventDialogPropsStub {
+  open: boolean
+  request: unknown
+  onOpenChange: (next: boolean) => void
+}
+
+const eventDialogMock = vi.hoisted(() =>
+  vi.fn((_props: EventDialogPropsStub) => null)
+)
 
 vi.mock("@/components/calendar/event-dialog", () => ({
   EventDialog: eventDialogMock,

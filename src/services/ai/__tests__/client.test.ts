@@ -374,6 +374,10 @@ describe("tier routing (parity-round-2 task 2.2)", () => {
       categorizationAssist: "instant",
       quickReplies: "instant",
       ruleAssist: "cheap",
+      eventExtraction: "cheap",
+      translation: "cheap",
+      folderDigest: "cheap",
+      assistant: "intelligent",
     },
   }
 
