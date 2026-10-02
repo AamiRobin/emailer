@@ -311,6 +311,78 @@ describe("task 7.1: ordered collapsible messages", () => {
     expect(screen.queryByText("earlier read message body")).toBeNull()
   })
 
+  it("always expands a single-message thread, even when read", async () => {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    const threadId = await createThread(executor, accountId, {
+      subject: "Receipt",
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: 1_700_000_000,
+      subject: "Receipt",
+      snippet: "already-read receipt preview",
+      fromName: "Ada Lovelace",
+      fromAddress: "ada@example.com",
+      isRead: true,
+    })
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    // A lone message is never hidden behind a click (the Gmail/Outlook
+    // convention) — read or unread, it renders expanded.
+    expect(screen.getByTestId("message-expanded").textContent).toContain(
+      "Ada Lovelace"
+    )
+    expect(screen.queryByTestId("message-collapsed")).toBeNull()
+  })
+
+  it("expands only the newest message of a fully-read conversation", async () => {
+    accountId = "acc-1"
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email) VALUES ($1, $2, $3)",
+      [accountId, "gmail", "me@example.com"]
+    )
+    const threadId = await createThread(executor, accountId, {
+      subject: "Long thread",
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: 1_700_000_000,
+      subject: "Long thread",
+      snippet: "older read message preview",
+      fromName: "Ada Lovelace",
+      fromAddress: "ada@example.com",
+      isRead: true,
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: 1_700_000_000 + HOUR,
+      subject: "Re: Long thread",
+      snippet: "newest read message preview",
+      fromName: "Grace Hopper",
+      fromAddress: "grace@example.com",
+      isRead: true,
+    })
+    render(<ThreadView />)
+    useAccountStore.setState({ activeAccountId: accountId })
+    await openThread(threadId)
+
+    // Re-opening a read conversation expands the newest message only —
+    // re-reading it costs no click, the older one stays collapsed.
+    const expanded = screen.getByTestId("message-expanded")
+    expect(within(expanded).getByText("Grace Hopper")).not.toBeNull()
+    const collapsed = screen.getByTestId("message-collapsed")
+    expect(within(collapsed).getByText("Ada Lovelace")).not.toBeNull()
+  })
+
   it("shows To/Cc recipients and the sender address in the expanded header", async () => {
     const { threadId } = await seedMixedThread({
       to: [{ name: "Bob Sample", email: "bob@example.com" }],

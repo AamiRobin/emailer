@@ -487,8 +487,18 @@ function ThreadViewContent({
           account: accountRow ? toEmailAccount(accountRow) : null,
         })
         setInitiallyUnreadIds(unreadIds)
-        // Unread messages start expanded; read ones start collapsed.
-        setExpandedIds(new Set(unreadIds))
+        // Expansion policy on open (the Gmail/Outlook conventions): unread
+        // messages start expanded; a lone message ALWAYS renders expanded —
+        // collapsing a single-message thread hides the mail behind a click —
+        // and a fully-read conversation expands its newest message so
+        // re-reading it costs no click. Everything else starts collapsed.
+        const expanded = new Set(unreadIds)
+        if (loaded.messages.length === 1) {
+          expanded.add(loaded.messages[0].id)
+        } else if (unreadIds.size === 0) {
+          expanded.add(loaded.messages[loaded.messages.length - 1].id)
+        }
+        setExpandedIds(expanded)
         setIsStarred(loaded.thread.is_starred === 1)
         setHasUnread(unreadIds.size > 0)
         setIsMuted(loaded.thread.muted_at != null)
