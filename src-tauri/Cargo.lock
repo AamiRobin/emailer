@@ -5580,7 +5580,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-native"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-imap",
  "base64 0.22.1",
