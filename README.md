@@ -5,7 +5,7 @@
 <h1 align="center">Emailer</h1>
 
 <p align="center">
-  A local-first desktop email client for Gmail and IMAP.<br/>
+  A local-first desktop email client for Gmail, Microsoft 365 and IMAP.<br/>
   Built with Tauri 2 — fast, native, and your mail stays on your machine.
 </p>
 
@@ -26,17 +26,30 @@ work offline, and sync runs quietly in the background when you're online.
 
 ## Screenshots
 
-**Inbox — light**
+Captured from the app running in browser mock mode (`bun run dev:mock`) —
+the amber pill in some shots marks demo data.
 
-<img src="docs/screenshots/inbox-light.png" alt="Emailer inbox, light theme" width="900" />
+<p align="center">
+  <img src="docs/screenshots/inbox-light.png" alt="Unified inbox, light theme" width="49%" />
+  <img src="docs/screenshots/inbox-dark.png" alt="Unified inbox with an open thread, dark theme" width="49%" />
+</p>
 
-**Inbox — dark**
+<p align="center">
+  <strong>Composer</strong> &nbsp;·&nbsp; <strong>Docked AI assistant with cited sources</strong>
+</p>
 
-<img src="docs/screenshots/inbox-dark.png" alt="Emailer inbox, dark theme" width="900" />
+<p align="center">
+  <img src="docs/screenshots/composer-dark.png" alt="Composer with formatting toolbar, signature picker and schedule send" width="49%" />
+  <img src="docs/screenshots/ai-assistant-dark.png" alt="Docked AI assistant panel answering a question with thread sources" width="49%" />
+</p>
 
-**Composer** · **Adding an account with provider detection**
+<p align="center">
+  <strong>Adding an account — provider detected from the address</strong>
+</p>
 
-<img src="docs/screenshots/composer-dark.png" alt="composer" width="49%" /> <img src="docs/screenshots/add-imap-detect-dark.png" alt="add IMAP account with provider detection" width="49%" />
+<p align="center">
+  <img src="docs/screenshots/add-imap-detect-dark.png" alt="Add IMAP account dialog with Fastmail provider detection" width="49%" />
+</p>
 
 ## Features
 
@@ -63,15 +76,24 @@ work offline, and sync runs quietly in the background when you're online.
   original, read-only with exact copy
 - **Reply tracking** — nudges resurface threads you haven't answered;
   follow-up reminders resurface threads that weren't answered *to you*
+- **Todos & tasks** — pull any thread into the sidebar task list (or let
+  AI suggest tasks from an open message) with due dates, recurrence and
+  a one-click jump back to the thread
+- **Calendar** — a month/week/day view fed by connected Microsoft 365
+  calendars; AI event extraction turns an open thread into a prefilled
+  event, and `.ics` attachments get an *Add to calendar* shortcut
 - **Local automation** — rules (built by hand or from a plain-language
   description), junk filter, blocked senders and auto-archive run
   locally on every sync
 - **A composer that gets out of the way** — rich text, snippets,
   attachments, per-account signatures, and an undo-send window
-- **Optional AI on your terms** — summaries, smart replies and Ask My
-  Inbox through the provider you configure, including a fully local
-  Ollama; per-surface model tiers, quick replies that never send by
-  themselves, and a token usage meter kept on this machine
+- **Optional AI on your terms** — off until you enable it, then
+  summaries, smart replies, Ask My Inbox, task/event extraction,
+  translation and a catch-me-up folder digest — through the provider
+  you configure, including a fully local Ollama. A docked assistant
+  panel answers questions about your mailbox with read-only lookups and
+  inline sources. Per-surface model tiers, quick replies that never send
+  by themselves, and a token usage meter kept on this machine
 - **CardDAV contacts** — connect a Nextcloud, Radicale or provider
   address book; synced contacts autocomplete just like local ones, and
   the app password is sealed on the device
@@ -99,8 +121,8 @@ engineering details live in [docs/releases.md](docs/releases.md).
 
 ## Stack
 
-- **Frontend:** React 19 + TypeScript + Vite, Tailwind CSS 4, shadcn/ui,
-  Zustand, Tiptap (composer)
+- **Frontend:** React 19 + TypeScript + Vite, Tailwind CSS 4,
+  shadcn-style components on Base UI, Zustand, Tiptap (composer)
 - **Backend (Rust):** `async-imap`, `lettre`, `tokio` — connections are
   stateless: each command connects, works, and logs out
 - **Storage:** SQLite (tauri-plugin-sql), OS keychain-backed credential
