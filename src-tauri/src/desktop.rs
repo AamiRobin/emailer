@@ -250,6 +250,7 @@ pub fn mailto_default_state(app: AppHandle) -> Result<MailtoDefaultState, String
 
     #[cfg(not(target_os = "macos"))]
     {
+        use tauri_plugin_deep_link::DeepLinkExt;
         let is_default = app
             .deep_link()
             .is_registered("mailto")
@@ -297,6 +298,7 @@ pub fn mailto_set_default(
 
     #[cfg(not(target_os = "macos"))]
     {
+        use tauri_plugin_deep_link::DeepLinkExt;
         let _ = restore_to;
         if enabled {
             app.deep_link()

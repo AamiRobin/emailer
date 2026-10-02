@@ -9,45 +9,30 @@ id = "RUSTSEC-2024-0429"
 # (tray-icon → libappindicator → gtk 0.18) pins the gtk-rs 0.18 line,
 # so 0.20 is semver-unreachable from Cargo.toml. Revisit at the next
 # tauri upgrade that moves the Linux stack.
-package = "glib"
-
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0370"
 # proc-macro-error 1.0.4 — unmaintained-crate advisory, no fixed
 # release; transitive via glib-macros on the same tauri Linux stack.
-package = "proc-macro-error"
-
 [[IgnoredVulns]]
 id = "RUSTSEC-2023-0071"
 # rsa 0.9.10 — Marvin Attack (timing side channel), no fixed release;
 # resolved only for sqlx's mysql feature, which this app does not use
 # (tauri-plugin-sql runs sqlite only), so the code is never built or
 # linked. Revisit if a MySQL/Postgres backend is ever enabled.
-package = "rsa"
-
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0075"
 # unic-char-range 0.9.0 — unmaintained-crate advisory, no fixed
 # release; transitive via urlpattern under tauri-plugin-http /
 # tauri-utils.
-package = "unic-char-range"
-
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0080"
 # unic-common 0.9.0 — same unmaintained unic family as above.
-package = "unic-common"
-
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0081"
 # unic-char-property 0.9.0 — same unmaintained unic family as above.
-package = "unic-char-property"
-
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0098"
 # unic-ucd-version 0.9.0 — same unmaintained unic family as above.
-package = "unic-ucd-version"
-
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0100"
 # unic-ucd-ident 0.9.0 — same unmaintained unic family as above.
-package = "unic-ucd-ident"
