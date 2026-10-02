@@ -285,7 +285,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
         {
           from: { name: "Daniel Okafor", email: "d.okafor@brightlane.io" },
           age: 2 * DAY + 3 * HOUR,
-          body: "Hi Amir,\n\nAttached is invoice #2847 for the March retainer — 42 hours at the agreed rate, covering the sync engine work and the two urgent fixes.\n\nPayment terms as usual: net 14. Let me know if you need it split across quarters.\n\nBest,\nDaniel",
+          body: "Hi Ami,\n\nAttached is invoice #2847 for the March retainer — 42 hours at the agreed rate, covering the sync engine work and the two urgent fixes.\n\nPayment terms as usual: net 14. Let me know if you need it split across quarters.\n\nBest,\nDaniel",
           attachments: [
             attachment("invoice-2847.pdf", "application/pdf", 48213),
           ],
@@ -293,7 +293,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
         {
           from: { name: "Daniel Okafor", email: "d.okafor@brightlane.io" },
           age: 22 * HOUR,
-          body: "Morning Amir — just a gentle nudge on invoice #2847 from last week. If the transfer already went out, feel free to ignore this.",
+          body: "Morning Ami — just a gentle nudge on invoice #2847 from last week. If the transfer already went out, feel free to ignore this.",
           unread: true,
         },
       ],
@@ -415,7 +415,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
           from: { name: "Ingrid Weiss", email: "ingrid.weiss@stahl-nord.de" },
           age: 2 * DAY + 5 * HOUR,
           htmlNone: true,
-          body: "Amir,\n\nShort version: we are moving the shared build servers to the new rack this Saturday. Downtime window is 02:00-06:00 CEST. If you have cron jobs touching stahl-nord infrastructure, pause them Friday evening.\n\nLong version: the old switches are end-of-life and the new top-of-rack units give us 10G to the host. Migration plan and rollback plan are on the internal wiki, page 'Rack migration W38'.\n\nRegards,\nIngrid Weiss\nStahl Nord GmbH, IT Operations\nPhone: +49 40 555 0182",
+          body: "Ami,\n\nShort version: we are moving the shared build servers to the new rack this Saturday. Downtime window is 02:00-06:00 CEST. If you have cron jobs touching stahl-nord infrastructure, pause them Friday evening.\n\nLong version: the old switches are end-of-life and the new top-of-rack units give us 10G to the host. Migration plan and rollback plan are on the internal wiki, page 'Rack migration W38'.\n\nRegards,\nIngrid Weiss\nStahl Nord GmbH, IT Operations\nPhone: +49 40 555 0182",
         },
       ],
     },
@@ -426,9 +426,9 @@ function gmailInboxThreads(): SeedThreadSpec[] {
         {
           from: { name: "Priya Raghavan", email: "priya@fernwoodlabs.com" },
           age: 30 * HOUR,
-          body: "Hi Amir,\n\nLogo pack v2 is ready. The primary mark is embedded below; the full set (mono, dark-mode, favicon) is in the attached guidelines PDF.\n\nWe moved the wordmark 4px left to optically center it — see page 3 if you are curious about the reasoning.",
+          body: "Hi Ami,\n\nLogo pack v2 is ready. The primary mark is embedded below; the full set (mono, dark-mode, favicon) is in the attached guidelines PDF.\n\nWe moved the wordmark 4px left to optically center it — see page 3 if you are curious about the reasoning.",
           html: `<div>
-<p>Hi Amir,</p>
+<p>Hi Ami,</p>
 <p>Logo pack v2 is ready. The primary mark, inline:</p>
 <img src="cid:fernwood-logo@mock.local" alt="Fernwood Labs logo" width="96" height="32">
 <p>And the flat accent strip that ships with the dark-mode variant:</p>
@@ -464,7 +464,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
           body: "Adding: invoice-ready activity export. Accounting asked for it twice last quarter.",
         },
         {
-          from: { name: "Amir Robin", email: "amir@robinlabs.dev" },
+          from: { name: "Ami Robin", email: "amir@robinlabs.dev" },
           age: 7 * DAY - 5 * HOUR,
           body: "Checklist updated. Storage and sync are on track; attachments need the virus-scan decision first. Composer rewrite starts after the FTS index lands.",
         },
@@ -482,7 +482,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
           body: "Priya owns virus-scan then. Next open question: do we ship search before or after attachments? Search has one hard dependency left (snippet quality).",
         },
         {
-          from: { name: "Amir Robin", email: "amir@robinlabs.dev" },
+          from: { name: "Ami Robin", email: "amir@robinlabs.dev" },
           age: 6 * DAY - 2 * HOUR,
           body: "Search after attachments. Snippet quality lands with the trigram index next week; I would rather not ship it half-done.",
         },
@@ -492,7 +492,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
           body: "Works for me. Client demo on the 30th — can we have attachments AND search by then, even behind a flag?",
         },
         {
-          from: { name: "Amir Robin", email: "amir@robinlabs.dev" },
+          from: { name: "Ami Robin", email: "amir@robinlabs.dev" },
           age: 5 * DAY - 2 * HOUR,
           body: "Behind a flag, yes. Demo build would be: local DB, sync on, attachments on, search behind #launch-demo-search.",
         },
@@ -516,7 +516,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
           unread: true,
         },
         {
-          from: { name: "Amir Robin", email: "amir@robinlabs.dev" },
+          from: { name: "Ami Robin", email: "amir@robinlabs.dev" },
           age: 20 * HOUR,
           body: "Checklist current as of now: 11 of 14 items done, 2 in review, 1 blocked (demo laptop HDMI adapter — ordered). See everyone Thursday.",
         },
@@ -532,7 +532,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
           body: "Long time! Are you around Thursday? There is a new ramen place two streets from your office and I have opinions about it.",
         },
         {
-          from: { name: "Amir Robin", email: "amir@robinlabs.dev" },
+          from: { name: "Ami Robin", email: "amir@robinlabs.dev" },
           age: DAY + 3 * HOUR,
           body: "Around from 12. Only if we can also talk about the papercrane site copy — I have notes.",
         },
@@ -576,7 +576,7 @@ function gmailInboxThreads(): SeedThreadSpec[] {
             email: "rafael.duarte@meridianlegal.pt",
           },
           age: 4 * DAY + 2 * HOUR,
-          body: "Hi Amir,\n\nThe current services agreement expires on 31 October. To renew without a gap we should start paperwork by mid-October. Two open points from our side: the liability cap and whether the audit clause survives unchanged.\n\nCan we book 30 minutes next week?\n\nRafael",
+          body: "Hi Ami,\n\nThe current services agreement expires on 31 October. To renew without a gap we should start paperwork by mid-October. Two open points from our side: the liability cap and whether the audit clause survives unchanged.\n\nCan we book 30 minutes next week?\n\nRafael",
         },
         {
           from: {
@@ -1088,7 +1088,7 @@ function gmailSentThreads(): SeedThreadSpec[] {
           from: ME_GMAIL,
           to: [daniel],
           age: DAY + 6 * HOUR,
-          body: "Hi Daniel,\n\nInvoice #2847 is approved and went into today's payment run — it should land within two business days. I flagged the Q2 split question to Rafael so the tax treatment is right.\n\nThanks for the clean breakdown of hours.\n\nAmir",
+          body: "Hi Daniel,\n\nInvoice #2847 is approved and went into today's payment run — it should land within two business days. I flagged the Q2 split question to Rafael so the tax treatment is right.\n\nThanks for the clean breakdown of hours.\n\nAmi",
         },
       ],
     },
@@ -1504,7 +1504,7 @@ function imapInboxThreads(): SeedThreadSpec[] {
           from: elin,
           age: DAY + 3 * HOUR,
           unread: true,
-          body: "Hej Amir! I collected the reunion photos — 214 of them. Best ten are attached; full album link follows once I have everyone's consent notes.",
+          body: "Hej Ami! I collected the reunion photos — 214 of them. Best ten are attached; full album link follows once I have everyone's consent notes.",
         },
       ],
     },
@@ -2015,10 +2015,10 @@ async function seedFolderSyncState(executor: SqlExecutor): Promise<void> {
 async function seedSettings(executor: SqlExecutor): Promise<void> {
   await setSetting(executor, SETTINGS_KEYS.notificationsEnabled, true)
   await setSetting(executor, `signature:${GMAIL_ACCOUNT_ID}`, {
-    html: "<p>Best,</p><p><b>Amir Robin</b> · RobinLabs<br>amir@robinlabs.dev</p>",
+    html: "<p>Best,</p><p><b>Ami Robin</b> · RobinLabs<br>amir@robinlabs.dev</p>",
   })
   await setSetting(executor, `signature:${IMAP_ACCOUNT_ID}`, {
-    html: "<p>Best,</p><p><b>Amir Robin</b><br>amir@fastmail.com</p>",
+    html: "<p>Best,</p><p><b>Ami Robin</b><br>amir@fastmail.com</p>",
   })
 }
 

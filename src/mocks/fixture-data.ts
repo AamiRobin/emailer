@@ -18,11 +18,11 @@ export const IMAP_ACCOUNT_ID = "acc-mock-imap"
 export const GMAIL_HISTORY_ID = 918273
 
 export const ME_GMAIL: ContactRef = {
-  name: "Amir Robin",
+  name: "Ami Robin",
   email: "amir@robinlabs.dev",
 }
 export const ME_IMAP: ContactRef = {
-  name: "Amir Robin",
+  name: "Ami Robin",
   email: "amir@fastmail.com",
 }
 
