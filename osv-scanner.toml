@@ -36,3 +36,10 @@ id = "RUSTSEC-2025-0098"
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0100"
 # unic-ucd-ident 0.9.0 — same unmaintained unic family as above.
+
+[[IgnoredVulns]]
+id = "GHSA-vfj7-8cjw-p6xm"
+# braces 3.0.3 — ReDoS advisory, no patched release exists (3.0.3 is the
+# latest). Dev-only transitive: micromatch under the vite/fast-glob
+# toolchain — it is never bundled into the shipped app. Revisit when
+# micromatch ships a fixed braces range.
