@@ -1316,7 +1316,10 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
       {selectionActive && (
         <div
           data-testid="thread-selection-bar"
-          className="flex shrink-0 items-center gap-2 border-b bg-muted/50 px-3 py-1"
+          // flex-wrap: the bar lives inside the list column, so its eight
+          // actions overflow and clip at every normal width — wrapped rows
+          // keep every action reachable instead.
+          className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b bg-muted/50 px-3 py-1"
         >
           <Checkbox
             aria-label={allSelected ? "Clear selection" : "Select all"}
@@ -1333,7 +1336,7 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
           <span className="text-xs text-muted-foreground tabular-nums">
             {selectedIds.size} selected
           </span>
-          <div className="ml-auto flex items-center gap-0.5">
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-x-0.5 gap-y-1">
             <Button
               variant="ghost"
               size="sm"
