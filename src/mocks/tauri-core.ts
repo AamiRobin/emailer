@@ -51,6 +51,185 @@ function readArg(
   return args?.[key]
 }
 
+/**
+ * Live-AI mode (mock dev mode only, opt-in via `?liveAi=1`): `ai_chat`
+ * calls pass through to the CONFIGURED OpenAI-compatible endpoint
+ * instead of the canned reply, so the whole TS AI stack (gates, tier
+ * routing, prompt builders, parsers, cache, usage rows) can be exercised
+ * against a real model. The wire behavior mirrors ai/openai_compat.rs
+ * exactly — same URL join, Bearer-header-when-keyed, request shape,
+ * `choices[0].message.content` parse, usage block, and error kinds — so
+ * observations transfer to the Rust transport. Vendor kinds (anthropic,
+ * openai, gemini) keep their dedicated Rust modules and are not
+ * proxied here: they reject as a config error, same fail-toward-off
+ * direction the Rust command uses for a missing base URL.
+ */
+const LIVE_AI =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).has("liveAi")
+
+interface LiveAiWireMessage {
+  role: string
+  content: string
+}
+
+/**
+ * POST one chat-completions request: direct fetch first; when the browser
+ * blocks it (a gateway without CORS headers — the Rust transport has no
+ * such restriction), retry through the dev-server relay (`/__live-ai-proxy`,
+ * vite.config.ts liveAiProxy, mock mode only). Status 0 from the relay
+ * means the upstream fetch itself failed there.
+ */
+async function liveAiPost(
+  url: string,
+  headers: Record<string, string>,
+  bodyJson: string
+): Promise<{ status: number; text: string }> {
+  let directFailure: unknown
+  try {
+    const direct = await fetch(url, {
+      method: "POST",
+      headers,
+      body: bodyJson,
+      signal: AbortSignal.timeout(120_000),
+    })
+    return { status: direct.status, text: await direct.text() }
+  } catch (error) {
+    directFailure = error
+  }
+  try {
+    const relay = await fetch("/__live-ai-proxy", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url, headers, body: bodyJson }),
+      signal: AbortSignal.timeout(120_000),
+    })
+    const payload = (await relay.json()) as { status: number; text: string }
+    return payload
+  } catch (relayError) {
+    throw {
+      kind: "network",
+      message: `[mock live-ai] ${directFailure instanceof Error ? directFailure.message : String(directFailure)}; relay: ${relayError instanceof Error ? relayError.message : String(relayError)}`,
+    }
+  }
+}
+
+async function liveAiChat<T>(
+  args: Record<string, unknown> | undefined
+): Promise<T> {
+  const provider = String(readArg(args, "provider") ?? "")
+  let baseUrl = String(readArg(args, "baseUrl") ?? "").trim()
+  if (provider === "ollama" && baseUrl === "") baseUrl = "http://localhost:11434"
+  if (provider !== "custom" && provider !== "openai-compatible" && provider !== "ollama") {
+    throw {
+      kind: "config",
+      message: `[mock live-ai] provider "${provider}" has no browser proxy — use a custom endpoint`,
+    }
+  }
+  if (baseUrl === "") {
+    throw { kind: "config", message: "openai-compatible requires a base URL" }
+  }
+
+  const apiKey = String(readArg(args, "apiKey") ?? "").trim()
+  const system = readArg(args, "system")
+  const rawMessages = Array.isArray(readArg(args, "messages"))
+    ? (readArg(args, "messages") as LiveAiWireMessage[])
+    : []
+  const messages: LiveAiWireMessage[] =
+    typeof system === "string" && system !== ""
+      ? [{ role: "system", content: system }, ...rawMessages]
+      : rawMessages
+  const body = {
+    model: String(readArg(args, "model") ?? ""),
+    max_tokens: typeof readArg(args, "maxTokens") === "number"
+      ? (readArg(args, "maxTokens") as number)
+      : 1024,
+    messages,
+  }
+
+  let response: { status: number; text: string }
+  try {
+    response = await liveAiPost(
+      `${baseUrl.replace(/\/+$/, "")}/v1/chat/completions`,
+      {
+        "content-type": "application/json",
+        ...(apiKey !== "" ? { authorization: `Bearer ${apiKey}` } : {}),
+      },
+      JSON.stringify(body)
+    )
+  } catch (error) {
+    throw {
+      kind: "network",
+      message: `[mock live-ai] ${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+  const text = response.text
+  if (response.status === 429) {
+    throw {
+      kind: "rate_limited",
+      message: `[mock live-ai] 429: ${text.slice(0, 200)}`,
+      status: 429,
+    }
+  }
+  if (!(response.status >= 200 && response.status < 300)) {
+    throw {
+      kind: "status",
+      message: `[mock live-ai] ${response.status}: ${text.slice(0, 200)}`,
+      status: response.status,
+    }
+  }
+
+  let parsed: {
+    choices?: Array<{ message?: { content?: string | null } }>
+    model?: string
+    usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+  }
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw { kind: "parse", message: "[mock live-ai] response body is not JSON" }
+  }
+  const content = parsed.choices?.[0]?.message?.content
+  if (typeof content !== "string") {
+    throw {
+      kind: "parse",
+      message: "no choices[0].message.content in the response",
+    }
+  }
+  const usage =
+    typeof parsed.usage?.prompt_tokens === "number" &&
+    typeof parsed.usage?.completion_tokens === "number"
+      ? {
+          prompt_tokens: parsed.usage.prompt_tokens,
+          completion_tokens: parsed.usage.completion_tokens,
+          total_tokens:
+            parsed.usage.total_tokens ??
+            parsed.usage.prompt_tokens + parsed.usage.completion_tokens,
+        }
+      : undefined
+  const servedModel = parsed.model ?? body.model
+  logLiveAi(args, servedModel, usage?.total_tokens ?? null)
+  return {
+    content,
+    model: servedModel,
+    ...(usage !== undefined ? { usage } : {}),
+  } as T
+}
+
+/** One diagnostic line per live call: surface → served model + token
+ * count. `kilo-auto/free`-style routing aliases may hop underlying
+ * models per request, so the served id is the useful failure signal. */
+function logLiveAi(
+  args: Record<string, unknown> | undefined,
+  servedModel: string,
+  totalTokens: number | null
+): void {
+  console.info(
+    `[mock live-ai] ${String(readArg(args, "surface") ?? "?")} → ${servedModel}` +
+      (totalTokens !== null ? ` (${totalTokens} tokens)` : "")
+  )
+}
+
 export async function invoke<T = unknown>(
   command: string,
   args?: Record<string, unknown>
@@ -101,7 +280,10 @@ export async function invoke<T = unknown>(
   // event-extraction surface gets a shape-valid reply so its review →
   // accept → prefilled-form flow is smokeable end to end (the thread's
   // own messages are not read — the suggestion is fixed demo data).
+  // With `?liveAi=1` the call instead passes through to the configured
+  // endpoint (see liveAiChat) for real-model testing.
   if (command === "ai_chat") {
+    if (LIVE_AI) return liveAiChat<T>(args)
     const system = String(readArg(args, "system") ?? "")
     if (system.includes('"events"')) {
       return {

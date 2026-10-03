@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import path from "path"
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
-import { defineConfig } from "vite"
+import { defineConfig, type Plugin } from "vite"
 
 // App version for the status bar: src-tauri/tauri.conf.json is the
 // authoritative version for a Tauri desktop build (it is what the
@@ -49,9 +49,75 @@ const MOCK_ALIASES: Record<string, string> = {
   ),
 }
 
+/**
+ * POST /__live-ai-proxy — the mock harness's live-AI relay (mock dev
+ * mode only; see liveAiChat in src/mocks/tauri-core.ts). Relays the
+ * JSON-encoded request `{ url, headers, body }` to any http(s) endpoint
+ * and answers `{ status, text }` (status 0 = the relay itself could not
+ * complete the upstream fetch). Dev-server-local by construction.
+ */
+function liveAiProxy(): Plugin {
+  return {
+    name: "mock-live-ai-proxy",
+    apply: "serve",
+    configureServer(server) {
+      server.middlewares.use("/__live-ai-proxy", (req, res) => {
+        const chunks: Buffer[] = []
+        req.on("data", (chunk: Buffer) => chunks.push(chunk))
+        req.on("end", async () => {
+          const answer = (status: number, text: string): void => {
+            res.statusCode = 200
+            res.setHeader("content-type", "application/json")
+            res.end(JSON.stringify({ status, text }))
+          }
+          try {
+            const parsed = JSON.parse(
+              Buffer.concat(chunks).toString("utf-8")
+            ) as {
+              url?: unknown
+              headers?: unknown
+              body?: unknown
+            }
+            const target = typeof parsed.url === "string" ? parsed.url : ""
+            if (!/^https?:\/\//i.test(target)) {
+              answer(400, "relay target must be an http(s) URL")
+              return
+            }
+            const upstream = await fetch(target, {
+              method: "POST",
+              headers:
+                typeof parsed.headers === "object" && parsed.headers !== null
+                  ? (parsed.headers as Record<string, string>)
+                  : {},
+              body: typeof parsed.body === "string" ? parsed.body : "",
+              signal: AbortSignal.timeout(120_000),
+            })
+            answer(upstream.status, await upstream.text())
+          } catch (error) {
+            answer(
+              0,
+              error instanceof Error ? error.message : String(error)
+            )
+          }
+        })
+      })
+    },
+  }
+}
+
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => ({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    // Mock-mode-only relay for the ?liveAi=1 harness (src/mocks/
+    // tauri-core.ts liveAiChat): the browser's fetch is CORS-bound, so
+    // gateways that send no Access-Control-Allow-Origin are unreachable
+    // from the page. The real app's HTTP client is Rust-side and has no
+    // such restriction; this middleware stands in for it in the browser
+    // by relaying { url, headers, body } and returning { status, text }.
+    mode === "mock" && liveAiProxy(),
+  ].filter(Boolean),
   define: {
     __APP_VERSION__: JSON.stringify(APP_VERSION),
   },
