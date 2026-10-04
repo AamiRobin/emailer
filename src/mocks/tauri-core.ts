@@ -180,7 +180,7 @@ async function liveAiChat<T>(
   }
 
   let parsed: {
-    choices?: Array<{ message?: { content?: string | null } }>
+    choices?: Array<{ message?: { content?: string | null }; finish_reason?: string | null }>
     model?: string
     usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
   }
@@ -191,9 +191,17 @@ async function liveAiChat<T>(
   }
   const content = parsed.choices?.[0]?.message?.content
   if (typeof content !== "string") {
+    // Same user-facing distinction the Rust client draws (openai_compat.rs
+    // BUDGET_EXHAUSTED_MESSAGE): a length-capped empty reply means the
+    // budget went to reasoning, not a malformed body.
+    const budgetExhausted = parsed.choices?.some(
+      (choice) => choice.finish_reason === "length"
+    )
     throw {
       kind: "parse",
-      message: "no choices[0].message.content in the response",
+      message: budgetExhausted
+        ? "The model spent its entire token budget before producing an answer — its internal reasoning filled max_tokens. Try again, or switch to a model that reasons less."
+        : "no choices[0].message.content in the response",
     }
   }
   const usage =

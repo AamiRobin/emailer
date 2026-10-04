@@ -105,6 +105,11 @@ struct WireUsage {
 struct WireChoice {
     #[serde(default)]
     message: Option<WireResponseMessage>,
+    /// `"length"` when the provider stopped at max_tokens. With no content
+    /// at all this means the budget went entirely to (reasoning) tokens —
+    /// the specific message in [`parse_completion`] names it.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -150,18 +155,34 @@ fn parse_usage(usage: Option<WireUsage>) -> Option<ChatUsage> {
     Some(ChatUsage::from_parts(prompt, completion, usage.total_tokens))
 }
 
+/// User-facing message when the reply stopped at max_tokens with no
+/// content at all: reasoning models burn the whole budget before writing
+/// anything (observed on gateways that force reasoning), and the generic
+/// "no content" parse text gives the user nothing actionable.
+const BUDGET_EXHAUSTED_MESSAGE: &str = "The model spent its entire token budget before producing an answer — its internal reasoning filled max_tokens. Try again, or switch to a model that reasons less.";
+
 /// Parse a 2xx body into a [`ChatResponse`]: first choice with message
 /// content wins; `fallback_model` is the requested id, used when the
 /// endpoint omits its own `model` field.
 pub(crate) fn parse_completion(body: &str, fallback_model: &str) -> Result<ChatResponse, AiError> {
     let parsed: WireResponse = serde_json::from_str(body)
         .map_err(|error| AiError::Parse(format!("not a chat-completions response: {error}")))?;
+    let mut budget_exhausted = false;
     let content = parsed
         .choices
         .into_iter()
-        .find_map(|choice| choice.message.and_then(|message| message.content))
+        .find_map(|choice| {
+            if choice.finish_reason.as_deref() == Some("length") {
+                budget_exhausted = true;
+            }
+            choice.message.and_then(|message| message.content)
+        })
         .ok_or_else(|| {
-            AiError::Parse("no choices[0].message.content in the response".to_string())
+            if budget_exhausted {
+                AiError::Parse(BUDGET_EXHAUSTED_MESSAGE.to_string())
+            } else {
+                AiError::Parse("no choices[0].message.content in the response".to_string())
+            }
         })?;
     Ok(ChatResponse {
         content,
@@ -262,6 +283,38 @@ mod tests {
         let client = OpenAiCompatClient::new(server.base_url(), None);
         let err = client.chat(sample_request()).await.unwrap_err();
         assert_eq!(err.kind(), "parse");
+    }
+
+    #[tokio::test]
+    async fn length_capped_no_content_names_the_token_budget() {
+        // The reasoning-exhaustion shape seen in the wild: the provider
+        // stopped at max_tokens with content null — the message must name
+        // the budget, not the generic "no content" text.
+        let server = mock::spawn(
+            200,
+            "OK",
+            r#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"length"}]}"#,
+        )
+        .await;
+        let client = OpenAiCompatClient::new(server.base_url(), None);
+        let err = client.chat(sample_request()).await.unwrap_err();
+        match err {
+            AiError::Parse(message) => {
+                assert!(message.contains("token budget"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+        // Content present alongside finish_reason "length" (a truncated
+        // but non-empty answer) still parses as a success.
+        let server = mock::spawn(
+            200,
+            "OK",
+            r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#,
+        )
+        .await;
+        let client = OpenAiCompatClient::new(server.base_url(), None);
+        let response = client.chat(sample_request()).await.expect("succeeds");
+        assert_eq!(response.content, "partial");
     }
 
     #[tokio::test]
