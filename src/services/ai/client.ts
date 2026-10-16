@@ -68,6 +68,10 @@ const SURFACE_WIRE_NAMES: Record<AiSurface, string> = {
   translation: "translation",
   folderDigest: "folder-digest",
   assistant: "assistant",
+  // Parity-round-3 task 7.3: the writing-voice learner — an explicit,
+  // rare user action; the default 20/min bucket applies (no special
+  // case, exactly the design's "the rate-limit bucket applies").
+  voiceProfile: "voice-profile",
 }
 
 /** One conversation turn (plain text; prompt shaping is the caller's). */

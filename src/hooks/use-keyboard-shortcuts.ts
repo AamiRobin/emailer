@@ -388,9 +388,17 @@ export function useKeyboardShortcuts({
             return
           }
           if (id === "compose") {
-            event.preventDefault()
-            if (useComposerStore.getState().minimized) {
-              getComposerKeyActions()?.restore()
+            // "c" restores a minimized composer only when the keystroke
+            // is NOT text input — with focus inside a composer field the
+            // keydown is the user typing a "c" (To/Subject/body), and
+            // preventDefault here ate every "c" typed with the composer
+            // open (a minimized composer can never hold focus, so this
+            // loses nothing).
+            if (!isEditableTarget(event.target)) {
+              event.preventDefault()
+              if (useComposerStore.getState().minimized) {
+                getComposerKeyActions()?.restore()
+              }
             }
             return
           }
@@ -399,11 +407,15 @@ export function useKeyboardShortcuts({
         // Focus is in the mail behind the non-modal card: only `c` is
         // special (see above); everything else falls through — gate 4
         // still guards typing/focused widgets, and the list bindings keep
-        // their thread-list context.
+        // their thread-list context. Same editable guard: "c" typed into
+        // the search box (or any field behind the card) is text input,
+        // not a restore request.
         if (id === "compose") {
-          event.preventDefault()
-          if (useComposerStore.getState().minimized) {
-            getComposerKeyActions()?.restore()
+          if (!isEditableTarget(event.target)) {
+            event.preventDefault()
+            if (useComposerStore.getState().minimized) {
+              getComposerKeyActions()?.restore()
+            }
           }
           return
         }
@@ -420,9 +432,25 @@ export function useKeyboardShortcuts({
         return
       }
 
-      // 4. Never hijack typing — or a focused interactive widget.
+      // 4. Never hijack typing — or a focused interactive widget. Thread
+      // rows are role="button" and take focus on a click (they carry the
+      // context-menu trigger), but they ARE the list these bindings drive:
+      // focus resting on the row itself must not suppress list navigation,
+      // or j/k/e die after every row click (the mailbox-ui keyboard
+      // scenario). A control NESTED in the row (star toggle, snooze menu,
+      // select checkbox) keeps ownership of its own keyboard — Enter must
+      // activate it, not open the thread — so only the row element gets
+      // the exemption, and nested controls stand down for open-thread.
       if (isEditableTarget(event.target)) return
-      if (isInteractiveTarget(event.target)) return
+      if (isInteractiveTarget(event.target)) {
+        const row =
+          event.target instanceof Element
+            ? event.target.closest<HTMLElement>("[data-thread-row]")
+            : null
+        if (row === null || (event.target !== row && id === "open-thread")) {
+          return
+        }
+      }
 
       // Auto-repeat only for list navigation.
       if (event.repeat && !REPEATABLE_IDS.has(id)) return

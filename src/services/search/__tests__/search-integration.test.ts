@@ -1111,3 +1111,255 @@ describe("accent folding + relaxed fallback (task 1.3)", () => {
     })
   })
 })
+
+/**
+ * Parity-round-3 tasks 2.2/2.3 (design D8): operator values fold like
+ * free text, and the relaxed retry ranks by matched-term count under its
+ * cap while deterministic contexts stay strict.
+ */
+describe("folded operators + relaxed ranking (tasks 2.2/2.3)", () => {
+  let executor: TestExecutor
+  let accountId: string
+
+  /** Seed one thread + message with the given text fields. */
+  async function seed(options: {
+    subject?: string
+    fromName?: string
+    fromAddress?: string
+    to?: { name?: string; email: string }[]
+    bodyText?: string
+    date: number
+  }): Promise<string> {
+    const threadId = await createThread(executor, accountId, {
+      subject: options.subject,
+    })
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: options.date,
+      subject: options.subject,
+      fromName: options.fromName,
+      fromAddress: options.fromAddress,
+      to: options.to,
+      bodyText: options.bodyText,
+      snippet: options.bodyText?.slice(0, 40),
+    })
+    await recomputeThreadCaches(executor, threadId)
+    return threadId
+  }
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  describe("spec scenarios: accent-insensitive matching (task 2.2)", () => {
+    it("a base-form query matches accented mail — \"resume\" finds \"résumé\"", async () => {
+      const accented = await seed({
+        subject: "Candidate résumé attached",
+        fromAddress: "hr@corp.example",
+        bodyText: "Please review the résumé.",
+        date: at(100),
+      })
+      await seed({
+        subject: "Unrelated minutes",
+        fromAddress: "biz@corp.example",
+        bodyText: "Nothing relevant.",
+        date: at(200),
+      })
+      expect(
+        (await searchThreadsQuery(executor, accountId, "resume")).map(
+          (thread) => thread.id
+        )
+      ).toEqual([accented])
+    })
+
+    it("an accented query matches base-form mail — \"josé\" finds \"jose\"", async () => {
+      const base = await seed({
+        subject: "Lunch plans",
+        fromName: "Jose Garcia",
+        fromAddress: "jose@corp.example",
+        bodyText: "See you at noon.",
+        date: at(100),
+      })
+      await seed({
+        subject: "Unrelated minutes",
+        fromAddress: "biz@corp.example",
+        bodyText: "Nothing relevant.",
+        date: at(200),
+      })
+      expect(
+        (await searchThreadsQuery(executor, accountId, "josé")).map(
+          (thread) => thread.id
+        )
+      ).toEqual([base])
+    })
+
+    it("operator values fold: subject:resume meets \"Résumé\", from:josé meets \"Jose\"", async () => {
+      const accented = await seed({
+        subject: "Résumé of the candidate",
+        fromName: "Jose Garcia",
+        fromAddress: "jose@corp.example",
+        to: [{ name: "Hélène Dupont", email: "helene@corp.example" }],
+        bodyText: "Forwarded for review.",
+        date: at(100),
+      })
+      await seed({
+        subject: "Minutes",
+        fromName: "Biz",
+        fromAddress: "biz@corp.example",
+        bodyText: "Nothing relevant.",
+        date: at(200),
+      })
+      // base-form values meet accented content (the accent GLOB bridge)
+      expect(
+        (await searchThreadsQuery(executor, accountId, "subject:resume")).map(
+          (thread) => thread.id
+        )
+      ).toEqual([accented])
+      expect(
+        (await searchThreadsQuery(executor, accountId, "from:jose")).map(
+          (thread) => thread.id
+        )
+      ).toEqual([accented])
+      // accented values meet base-form content (the value folds first)
+      expect(
+        (await searchThreadsQuery(executor, accountId, "subject:résumé")).map(
+          (thread) => thread.id
+        )
+      ).toEqual([accented])
+      expect(
+        (await searchThreadsQuery(executor, accountId, "from:josé")).map(
+          (thread) => thread.id
+        )
+      ).toEqual([accented])
+      expect(
+        (await searchThreadsQuery(executor, accountId, "to:hélène")).map(
+          (thread) => thread.id
+        )
+      ).toEqual([accented])
+    })
+
+    it("negated operator values fold identically — the exclusion cannot be dodged", async () => {
+      await seed({
+        subject: "RÉSUMÉ (accented)",
+        fromAddress: "hr@corp.example",
+        bodyText: "Accented copy.",
+        date: at(100),
+      })
+      const plain = await seed({
+        subject: "Minutes",
+        fromAddress: "biz@corp.example",
+        bodyText: "Nothing relevant.",
+        date: at(200),
+      })
+      expect(
+        (
+          await searchThreadsQuery(executor, accountId, "-subject:résumé")
+        ).map((thread) => thread.id)
+      ).toEqual([plain])
+    })
+  })
+
+  describe("relaxed ranking + cap (task 2.3)", () => {
+    it("spec scenario: relaxed results rank by matched-term count, then recency", async () => {
+      // matches BOTH terms — strict zero (no single message carries both
+      // with the third), relaxed leader
+      const both = await seed({
+        subject: "Banking and roadmap",
+        bodyText: "banking roadmap notes",
+        date: at(100),
+      })
+      const roadmapOnly = await seed({
+        subject: "Roadmap review",
+        bodyText: "roadmap moved",
+        date: at(300),
+      })
+      const bankingOnly = await seed({
+        subject: "Banking summary",
+        bodyText: "quarterly banking numbers",
+        date: at(200),
+      })
+      await seed({
+        subject: "Unrelated",
+        bodyText: "neither topic",
+        date: at(400),
+      })
+
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "banking roadmap xyzzyp"
+      )
+      expect(result.relaxed).toBe(true)
+      // two-term match first; the one-term matches follow by recency
+      expect(result.threads.map((thread) => thread.id)).toEqual([
+        both,
+        roadmapOnly,
+        bankingOnly,
+      ])
+    })
+
+    it("caps the relaxed result set at 50", async () => {
+      // 30 + 30 single-term threads, no thread carrying both → strict
+      // finds nothing, the OR retry would surface 60, the cap holds 50
+      for (let index = 0; index < 30; index += 1) {
+        await seed({
+          subject: `Alpha note ${index}`,
+          bodyText: "alpha content",
+          date: at(index),
+        })
+        await seed({
+          subject: `Beta note ${index}`,
+          bodyText: "beta content",
+          date: at(index),
+        })
+      }
+      const result = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        "alpha beta"
+      )
+      expect(result.relaxed).toBe(true)
+      expect(result.threads).toHaveLength(50)
+    })
+
+    it("spec scenario: strict contexts (saved searches, rules) never widen", async () => {
+      await seed({
+        subject: "Banking summary",
+        bodyText: "quarterly banking numbers",
+        date: at(100),
+      })
+      await seed({
+        subject: "Roadmap review",
+        bodyText: "the roadmap moved",
+        date: at(200),
+      })
+      const query = "banking roadmap"
+
+      // the search box widens…
+      const relaxed = await searchThreadsWithRelaxedFallback(
+        executor,
+        [accountId],
+        query
+      )
+      expect(relaxed.relaxed).toBe(true)
+      expect(relaxed.threads.length).toBe(2)
+      // …while the strict pipeline saved searches and rules run (explicit
+      // relaxed: false — the builder default) returns exactly nothing
+      const strict = await searchThreadsAcrossAccounts(
+        executor,
+        [accountId],
+        query,
+        { relaxed: false }
+      )
+      expect(strict).toEqual([])
+      // and the count pipeline (split tabs) agrees with the strict list
+      expect(await countThreadsForQuery(executor, [accountId], query)).toBe(0)
+    })
+  })
+})

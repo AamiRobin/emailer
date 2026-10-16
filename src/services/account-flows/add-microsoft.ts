@@ -4,6 +4,7 @@ import type { SqlExecutor } from "../db/executor"
 import { getExecutor } from "../db/executor"
 import { insertAccount } from "../db/accounts"
 import { encryptCredentials } from "../crypto/credentials"
+import type { HistoryWindowSetting } from "../sync/history-window"
 import { useAccountStore } from "../../stores/account-store"
 import { triggerRefresh } from "../sync/scheduler"
 import {
@@ -59,6 +60,8 @@ export interface AddMicrosoftOptions {
   clientId: string
   /** Optional login_hint for Entra's account chooser. */
   loginHint?: string
+  /** First-sync download boundary (task 3.1, D6); omitted/null = all. */
+  historyWindow?: HistoryWindowSetting
   /** Step callbacks so the UI can show progress. */
   onProgress?: (step: MicrosoftFlowStep) => void
   /** Test seams (vitest); production uses the defaults. */
@@ -247,6 +250,9 @@ export async function addMicrosoftAccount(
     credentialsJson,
     oauthScope: tokens.scope,
     oauthClientId: clientId,
+    ...(options.historyWindow
+      ? { historyWindow: options.historyWindow }
+      : {}),
   })
 
   // 6. Refresh the switcher now; initial sync in the background.

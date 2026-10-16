@@ -105,9 +105,10 @@ interface ThreadListState {
   threads: ThreadRow[]
   /**
    * True when the CURRENT rows came from the relaxed any-term retry
-   * (task 1.3, design D7): the search box's strict query matched nothing
-   * and the operator-free query was re-run in OR mode. Reset on every
-   * page change/refresh; only the `search` scope can ever set it.
+   * (task 2.3, design D8): the search box's strict query matched nothing
+   * and the operator-free query was re-run in OR mode — ranked by
+   * matched-term count, capped. Reset on every page change/refresh; only
+   * the `search` scope can ever set it.
    */
   searchRelaxed: boolean
   /**
@@ -456,6 +457,7 @@ async function runScopeQuery(
     case "search":
       return searchThreadsQuery(executor, scope.accountId, scope.query, {
         sort,
+        relaxed: false,
       })
     case "label":
       return listThreadsByFolder(executor, {
@@ -506,24 +508,30 @@ async function runScopeQuery(
     case "split":
       // A split (task 9.3) runs its stored query through the same search
       // pipeline: pinned to its account, or across the active accounts.
+      // relaxed: false — a stored query keeps exact semantics (task 2.3,
+      // design D8): its rows must equal its count, so it never widens.
       if (scope.accountId) {
         return searchThreadsQuery(executor, scope.accountId, scope.query, {
           sort,
+          relaxed: false,
         })
       }
       return searchThreadsAcrossAccounts(
         executor,
         activeAccountIds,
         scope.query,
-        { sort }
+        { sort, relaxed: false }
       )
     case "saved-search":
       // A saved search is a global bookmark: across every active account.
+      // relaxed: false (task 2.3, design D8) — saved searches require
+      // deterministic matching, so the OR fallback is the search box's
+      // alone and clicking a saved search always runs the exact query.
       return searchThreadsAcrossAccounts(
         executor,
         activeAccountIds,
         scope.query,
-        { sort }
+        { sort, relaxed: false }
       )
     case "category":
       // A category tab (task 3.5, design D4): the unified inbox's exact
@@ -540,11 +548,12 @@ async function runScopeQuery(
 }
 
 /**
- * The page's query + relaxed flag (task 1.3, design D7): every scope runs
+ * The page's query + relaxed flag (task 2.3, design D8): every scope runs
  * its plain query; the per-account SEARCH scope (the search box) runs the
  * strict-then-relaxed entry, so a zero-result operator-free query is
- * retried in OR mode and its rows flagged for the UI's "relaxed search"
- * badge. The flag is false for every other scope, by construction.
+ * retried in OR mode and its rows flagged for the UI's "showing broader
+ * results" notice. The flag is false for every other scope, by
+ * construction (their queries pass relaxed: false explicitly).
  */
 async function queryThreads(
   executor: SqlExecutor,
@@ -981,8 +990,8 @@ export interface UseThreadListResult {
   loaded: boolean
   /**
    * True when the loaded rows are the relaxed any-term fallback of the
-   * search box's zero-result strict query (task 1.3) — the list renders
-   * its "relaxed search" badge from this.
+   * search box's zero-result strict query (task 2.3, design D8) — the
+   * list renders its "showing broader results" notice from this.
    */
   searchRelaxed: boolean
 }

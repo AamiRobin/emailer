@@ -1,4 +1,6 @@
 import type { SqlExecutor } from "./executor"
+import type { HistoryWindowSetting } from "../sync/history-window"
+import { parseHistoryWindow } from "../sync/history-window"
 import type {
   AccountStatus,
   AccountType,
@@ -33,12 +35,31 @@ export interface AccountRow {
   /** Delta-sync cursor: the gmail history id (null until the first sync). */
   gmail_history_id: string | null
   labels_synced_at: number | null
+  /**
+   * First-sync download boundary (migration v20, design D6): the sync
+   * layer's TEXT grammar ("1m"/"3m"/"6m"/"1y"), null = all history. The
+   * three drivers' initial passes clamp to it; delta sync never does.
+   */
+  history_window: string | null
+  /**
+   * Meeting-reminder lead (migration v20, task 8.5, design D5): minutes
+   * before a meeting start to raise one notification; NULL = OFF (the
+   * default — no meeting reminders until the user opts in per account).
+   */
+  reminder_lead_minutes: number | null
   status: AccountStatus
   last_sync_at: number | null
   last_full_sync_at: number | null
   is_active: number
   is_pinned: number
   created_at: number
+}
+
+/** The row's stored window through the sync layer's grammar. */
+export function accountHistoryWindow(
+  row: Pick<AccountRow, "history_window">
+): HistoryWindowSetting {
+  return parseHistoryWindow(row.history_window)
 }
 
 export async function listAccounts(
@@ -211,6 +232,11 @@ export interface NewAccountInput {
   oauthClientId?: string
   /** Defaults to "active". */
   status?: AccountStatus
+  /**
+   * First-sync download boundary (D6); omitted/null = all history — a new
+   * account downloads everything unless the add flow carried a pick.
+   */
+  historyWindow?: HistoryWindowSetting
 }
 
 /**
@@ -228,8 +254,8 @@ export async function insertAccount(
       id, type, email, display_name,
       imap_host, imap_port, imap_security,
       smtp_host, smtp_port, smtp_security,
-      credentials_json, oauth_scope, oauth_client_id, status
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      credentials_json, oauth_scope, oauth_client_id, status, history_window
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
     RETURNING *`,
     [
       id,
@@ -246,6 +272,7 @@ export async function insertAccount(
       input.oauthScope ?? null,
       input.oauthClientId ?? null,
       input.status ?? "active",
+      input.historyWindow ?? null,
     ]
   )
   return rows[0]
@@ -273,6 +300,88 @@ export async function updateStatus(
     status,
     accountId,
   ])
+}
+
+/**
+ * Flag EVERY account for re-authentication (task 5.4, restore side).
+ *
+ * A backup snapshot carries NO credentials by construction — the export
+ * strip nulls the sealed envelopes (backup-snapshot.ts) — so after a
+ * replace-mode restore every account row is credential-less. The
+ * persisted flag is the accounts table's own `status` column (present
+ * since the v15 rebuild): flipping each row to "auth-error" IS the
+ * needs-reauth state, because the existing re-auth failure UX already
+ * consumes that value end to end — the switcher badge and the
+ * "Re-authenticate…" entry (account-switcher.tsx), the ReauthDialog
+ * hosts, and the sync gate (listActiveAccounts picks up only status
+ * "active"). A successful re-auth flips the row back to "active"
+ * (reauth.ts finishReauth), which lifts the flag — no extra column, no
+ * migration.
+ *
+ * Reading restored mail never consults account status, so restored mail
+ * stays readable offline while the flag is set.
+ */
+export async function flagAllAccountsForReauth(
+  executor: SqlExecutor
+): Promise<number> {
+  const result = await executor.execute(
+    "UPDATE accounts SET status = 'auth-error' WHERE status != 'auth-error'"
+  )
+  return result.rowsAffected
+}
+
+/**
+ * Persist the first-sync download boundary (D6, task 3.1). The accounts
+ * editor writes the user's pick; widening callers additionally queue the
+ * targeted backfill op (queue/operation.ts) — this write is deliberately
+ * download-semantics-only and never touches stored messages (a narrower
+ * window deletes nothing).
+ */
+export async function updateHistoryWindow(
+  executor: SqlExecutor,
+  accountId: string,
+  window: HistoryWindowSetting
+): Promise<void> {
+  await executor.execute(
+    "UPDATE accounts SET history_window = $1 WHERE id = $2",
+    [window, accountId]
+  )
+}
+
+/**
+ * The account's meeting-reminder lead minutes (task 8.5): the stored
+ * column through its only grammar — NULL (or a non-positive/garbage
+ * value) reads as null = OFF, so a legacy/garbage value can never
+ * produce a reminder storm.
+ */
+export async function getAccountReminderLeadMinutes(
+  executor: SqlExecutor,
+  accountId: string
+): Promise<number | null> {
+  const rows = await executor.select<{ reminder_lead_minutes: number | null }>(
+    "SELECT reminder_lead_minutes FROM accounts WHERE id = $1",
+    [accountId]
+  )
+  const stored = rows[0]?.reminder_lead_minutes
+  return typeof stored === "number" && Number.isFinite(stored) && stored > 0
+    ? stored
+    : null
+}
+
+/** Persist the meeting-reminder lead; null turns reminders OFF. */
+export async function setAccountReminderLeadMinutes(
+  executor: SqlExecutor,
+  accountId: string,
+  minutes: number | null
+): Promise<void> {
+  const value =
+    minutes !== null && Number.isFinite(minutes) && minutes > 0
+      ? Math.floor(minutes)
+      : null
+  await executor.execute(
+    "UPDATE accounts SET reminder_lead_minutes = $1 WHERE id = $2",
+    [value, accountId]
+  )
 }
 
 /**

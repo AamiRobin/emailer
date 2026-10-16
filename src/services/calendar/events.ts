@@ -51,6 +51,21 @@ export interface CalendarEvent {
   recurrence: string | null
   /** confirmed | tentative | cancelled */
   status: string | null
+  // --- Migration-v20 RSVP columns (parity-round-3 task 8.6) ---
+  /**
+   * The signed-in user's recorded answer on this event (ACCEPTED /
+   * TENTATIVE / DECLINED / NEEDS-ACTION / DELEGATED) — mirrored from the
+   * provider or stamped by the RSVP write-back; the details surface's
+   * status badge renders it. Null/absent when the event carries no
+   * answer.
+   */
+  partstat?: string | null
+  /** The invitation revision stamped by invite detection; null when the
+   * event never came from an invite. */
+  sequence?: number | null
+  /** The iCalendar RECURRENCE-ID of the addressed occurrence (null =
+   * whole series / not an invite). */
+  recurrenceId?: string | null
 }
 
 /** One calendar (source × provider calendar) that has cached events. */
@@ -104,7 +119,8 @@ export async function listEventsInRange(
   const params: unknown[] = [rangeEnd, rangeStart]
   let sql = `
     SELECT id, source_id, calendar_id, uid, summary, location, description,
-           start_at, end_at, all_day, recurrence, status
+           start_at, end_at, all_day, recurrence, status,
+           partstat, sequence, recurrence_id
       FROM calendar_events
      WHERE start_at < $1
        AND (end_at > $2 OR recurrence IS NOT NULL)`
@@ -128,6 +144,9 @@ export async function listEventsInRange(
     all_day: number
     recurrence: string | null
     status: string | null
+    partstat: string | null
+    sequence: number | null
+    recurrence_id: string | null
   }>(sql, params)
   return rows.map((row) => ({
     id: row.id,
@@ -142,6 +161,9 @@ export async function listEventsInRange(
     allDay: row.all_day === 1,
     recurrence: row.recurrence,
     status: row.status,
+    partstat: row.partstat,
+    sequence: row.sequence,
+    recurrenceId: row.recurrence_id,
   }))
 }
 
@@ -201,9 +223,13 @@ export async function getCalendarEvent(
     all_day: number
     recurrence: string | null
     status: string | null
+    partstat: string | null
+    sequence: number | null
+    recurrence_id: string | null
   }>(
     `SELECT id, source_id, calendar_id, uid, summary, location, description,
-            start_at, end_at, all_day, recurrence, status
+            start_at, end_at, all_day, recurrence, status,
+            partstat, sequence, recurrence_id
        FROM calendar_events WHERE id = $1`,
     [id]
   )
@@ -222,6 +248,9 @@ export async function getCalendarEvent(
     allDay: row.all_day === 1,
     recurrence: row.recurrence,
     status: row.status,
+    partstat: row.partstat,
+    sequence: row.sequence,
+    recurrenceId: row.recurrence_id,
   }
 }
 

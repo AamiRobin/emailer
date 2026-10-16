@@ -16,6 +16,8 @@ import {
   OauthCancelledError,
 } from "@/services/account-flows"
 import type { GmailFlowStep } from "@/services/account-flows"
+import type { HistoryWindowSetting } from "@/services/sync/history-window"
+import { HistoryWindowField } from "./history-window-field"
 
 /**
  * Add-Gmail flow UI (task 5.3): Client ID entry, then the browser consent
@@ -41,6 +43,8 @@ interface AddGmailFlowProps {
 export function AddGmailFlow({ onBack, onSuccess }: AddGmailFlowProps) {
   const [clientId, setClientId] = useState("")
   const [validationError, setValidationError] = useState<string | null>(null)
+  const [historyWindow, setHistoryWindow] =
+    useState<HistoryWindowSetting>(null)
   const [working, setWorking] = useState(false)
   const [step, setStep] = useState<GmailFlowStep>("consent")
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
@@ -75,6 +79,7 @@ export function AddGmailFlow({ onBack, onSuccess }: AddGmailFlowProps) {
     try {
       await addGmailAccount({
         clientId: trimmed,
+        historyWindow,
         onProgress: setStep,
       })
       onSuccess()
@@ -161,6 +166,12 @@ export function AddGmailFlow({ onBack, onSuccess }: AddGmailFlowProps) {
             </p>
           )}
         </div>
+        <HistoryWindowField
+          id="gmail-history-window"
+          value={historyWindow}
+          onChange={setHistoryWindow}
+          disabled={working}
+        />
         {errorMessage && (
           <p role="alert" className="text-sm text-destructive">
             {errorMessage}

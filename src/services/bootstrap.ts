@@ -25,6 +25,11 @@ import {
 } from "./composer/scheduled-send-runner"
 import { useSyncStore } from "../stores/sync-store"
 import { notifySnoozedThreadsChanged } from "../components/layout/use-snoozed-threads"
+import { backfillFoldedText } from "./search/folded-backfill"
+import {
+  runSemanticIndexSlice,
+  SEMANTIC_INDEX_DUE_JOB,
+} from "./embeddings/indexer"
 
 let bootstrapPromise: Promise<void> | null = null
 
@@ -142,6 +147,35 @@ function registerCategoryBackfillJob(): void {
 }
 
 /**
+ * Register the semantic-index slice with the scheduler's due-jobs
+ * registry (parity-round-3 design D1, task 6.2): every tick runs one
+ * bounded slice (the module's gating no-ops it while the feature is
+ * disabled or the model is absent, and its resume cursor spans ticks —
+ * a large first index fills over several ticks), so index updates ride
+ * the same idle pass as the sync without ever delaying it, and
+ * runDueJobsOnce() gives a fresh enable its immediate first pickup.
+ */
+function registerSemanticIndexJob(): void {
+  registerDueJobHandler(SEMANTIC_INDEX_DUE_JOB, () =>
+    runSemanticIndexSlice(getExecutor())
+  )
+}
+
+/**
+ * Fire-and-forget the v20 folded-text FTS backfill (parity-round-3
+ * design D8, task 1.3): pre-existing messages get their `folded` column
+ * stamped batch-by-batch so accent-folded search covers old mail too.
+ * Until a row is stamped it still matches through the raw columns (the
+ * pre-v20 behavior), so a slow or failed backfill degrades, never breaks
+ * — hence no startup await.
+ */
+function startFoldedTextBackfill(): void {
+  void backfillFoldedText(getExecutor()).catch((error) => {
+    console.warn("[bootstrap] folded-text FTS backfill failed", error)
+  })
+}
+
+/**
  * One-time app startup initialization, awaited by App before the shell
  * renders. The database (and its migrations) must be ready before any
  * feature init or store hydration runs, since stores are rebuilt from the
@@ -171,12 +205,14 @@ export function bootstrap(): Promise<void> {
     .then(() => initQueueSystem())
     .then(() => hydrateSyncStoreFromAccounts())
     .then(() => {
+      startFoldedTextBackfill()
       registerSnoozeWakeJob()
       registerScheduledSendsJob()
       registerDeliveryHoldsJob()
       registerAutoArchiveJob()
       registerFollowUpsJob()
       registerCategoryBackfillJob()
+      registerSemanticIndexJob()
       startScheduler()
       void runDueJobsOnce()
     })

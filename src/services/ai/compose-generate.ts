@@ -16,6 +16,7 @@ import {
   withOutputLanguage,
 } from "./prompt"
 import { getOutputLanguage } from "./settings"
+import { loadVoiceProfileApplication } from "./voice-profile"
 
 /**
  * AI compose-from-prompt + generate-reply (batch C3, Shortwave-style
@@ -123,11 +124,18 @@ export async function generateDraftFromPrompt({
   if (!runtime) {
     throw new AiUnavailableError("not-configured")
   }
+  // Parity-round-3 task 7.4: a stored writing-voice profile appends its
+  // fenced block to the prompt and folds its learnedAt into the cache
+  // identity; with no profile both stay exactly the pre-feature shape.
+  const voice = await loadVoiceProfileApplication(db)
   const identity = {
     provider: runtime.provider,
     model: runtime.model,
     kind: DRAFT_CACHE_KIND,
-    input: prompt,
+    input:
+      voice.cacheComponent !== null
+        ? `${prompt}\n${voice.cacheComponent}`
+        : prompt,
   }
   if (!regenerate) {
     const cached = await getAiCache(db, identity)
@@ -137,7 +145,9 @@ export async function generateDraftFromPrompt({
     surface: "composeTransform",
     model: runtime.model,
     system: withOutputLanguage(
-      DRAFT_SYSTEM_PROMPT,
+      voice.prompt !== null
+        ? `${DRAFT_SYSTEM_PROMPT}\n\n${voice.prompt}`
+        : DRAFT_SYSTEM_PROMPT,
       await getOutputLanguage(db)
     ),
     // The user's own instruction: trusted input, sent verbatim.
@@ -195,13 +205,22 @@ export async function generateReplyForThread({
   const context = messages.slice(-CONTEXT_MESSAGE_LIMIT)
   const lastMessage = messages[messages.length - 1]
 
+  // Parity-round-3 task 7.4: the writing-voice profile rides the identity
+  // (invalidating cached replies when learned/refreshed) and the prompt;
+  // absent, both stay byte-identical to the pre-feature shape.
+  const voice = await loadVoiceProfileApplication(db)
+
   // Identity mirrors smart replies: the message-id set in prompt order
   // plus the last message's id — a new message changes the key.
   const identity = {
     provider: runtime.provider,
     model: runtime.model,
     kind: REPLY_CACHE_KIND,
-    input: [...messages.map((message) => message.id), lastMessage.id].join(","),
+    input: [
+      ...messages.map((message) => message.id),
+      lastMessage.id,
+      ...(voice.cacheComponent !== null ? [voice.cacheComponent] : []),
+    ].join(","),
   }
   if (!regenerate) {
     const cached = await getAiCache(db, identity)
@@ -215,7 +234,9 @@ export async function generateReplyForThread({
     surface: "composeTransform",
     model: runtime.model,
     system: withOutputLanguage(
-      REPLY_SYSTEM_PROMPT,
+      voice.prompt !== null
+        ? `${REPLY_SYSTEM_PROMPT}\n\n${voice.prompt}`
+        : REPLY_SYSTEM_PROMPT,
       await getOutputLanguage(db)
     ),
     messages: [

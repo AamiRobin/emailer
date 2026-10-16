@@ -71,6 +71,18 @@ export interface IcsDateTime {
 /** One parsed VEVENT (skipped components like VALARM never surface). */
 export interface IcsEvent {
   uid: string | null
+  /**
+   * SEQUENCE property (parity-round-3 task 8.2, design D5): the
+   * invitation revision the iTIP REPLY must echo; null when absent.
+   * Optional so hand-built IcsEvent literals (tests, builders) only set
+   * what they carry.
+   */
+  sequence?: number | null
+  /**
+   * RECURRENCE-ID of the specific occurrence an invite addresses
+   * (parity-round-3 task 8.2, design D5); null = the whole series.
+   */
+  recurrenceId?: IcsDateTime | null
   summary: string | null
   location: string | null
   description: string | null
@@ -457,6 +469,8 @@ export function parseIcsCalendar(text: string): IcsParseResult {
       } else if (component === "VEVENT" && stackTop(stack, 1) === "VCALENDAR") {
         currentEvent = {
           uid: null,
+          sequence: null,
+          recurrenceId: null,
           summary: null,
           location: null,
           description: null,
@@ -532,6 +546,22 @@ function applyEventProperty(
     case "UID":
       event.uid = property.value.trim() || null
       break
+    case "SEQUENCE": {
+      const parsed = Number.parseInt(property.value.trim(), 10)
+      event.sequence = Number.isFinite(parsed) ? parsed : null
+      break
+    }
+    case "RECURRENCE-ID": {
+      const parsed = parseIcsDateValue(property.value, property.params)
+      if (parsed) {
+        event.recurrenceId = parsed
+      } else {
+        addWarning(
+          `Could not parse the RECURRENCE-ID ("${property.value.trim()}").`
+        )
+      }
+      break
+    }
     case "SUMMARY":
       event.summary = nonEmptyText(property)
       break

@@ -37,7 +37,12 @@ import type { FolderSyncStateRow } from "../folder-sync-state"
 import { getFolderSyncState } from "../folder-sync-state"
 import type { FetchFlagsChangedFn } from "../flag-sync"
 import type { ImapSyncSummary } from "../imap-sync"
-import { syncImapAccount } from "../imap-sync"
+import { backfillImapHistory, syncImapAccount } from "../imap-sync"
+import {
+  historyWindowBoundary,
+  isBoundedFirstSync,
+  type HistoryBackfillRange,
+} from "../history-window"
 import { setJunkFilterEnabledPreference } from "../../settings/preferences"
 import {
   getSubscription,
@@ -1725,9 +1730,7 @@ describe("imap sync categorization", () => {
     harness.executor.close()
   })
 
-  async function categoryByThread(
-    threadId: string
-  ): Promise<string | null> {
+  async function categoryByThread(threadId: string): Promise<string | null> {
     const rows = await harness.executor.select<{ category: string | null }>(
       "SELECT category FROM threads WHERE id = $1",
       [threadId]
@@ -1881,10 +1884,7 @@ describe("imap sync subscriptions", () => {
     // Detection never touches the notification count.
     expect(summary.newMessages).toBe(2)
 
-    const entries = await listSubscriptions(
-      harness.executor,
-      harness.accountId
-    )
+    const entries = await listSubscriptions(harness.executor, harness.accountId)
     // ONLY the header-carrying sender is detected as a newsletter; the
     // plain correspondent never enters the list.
     expect(entries.map((entry) => entry.sender)).toEqual(["news@lists.example"])
@@ -1948,5 +1948,167 @@ describe("imap sync subscriptions", () => {
     expect(
       await listSubscriptions(harness.executor, harness.accountId)
     ).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// History window (parity-round-3 task 3.2/3.3, design D6)
+// ---------------------------------------------------------------------------
+
+describe("imap sync history window", () => {
+  let harness: TestHarness
+  let inbox: FakeFolder
+  /** The 3-month boundary the fixture dates anchor to. */
+  let since: number
+
+  beforeEach(async () => {
+    harness = await createHarness()
+    inbox = harness.addFolder("INBOX", 7, "inbox")
+    since = historyWindowBoundary("3m", Math.floor(Date.now() / 1000))!
+  })
+
+  afterEach(() => {
+    harness.executor.close()
+  })
+
+  /** uids 1–2 sit far below the window, 3–4 just below it, 5–6 in it. */
+  function seedMailbox(): void {
+    for (let uid = 1; uid <= 2; uid += 1) {
+      inbox.insert({
+        subject: `Old ${uid}`,
+        fromEmail: `old${uid}@x`,
+        flags: ["\\Seen"],
+        date: since - 5_000,
+      })
+    }
+    for (let uid = 3; uid <= 4; uid += 1) {
+      inbox.insert({
+        subject: `Mid ${uid}`,
+        fromEmail: `mid${uid}@x`,
+        flags: ["\\Seen"],
+        date: since - 1_000,
+      })
+    }
+    for (let uid = 5; uid <= 6; uid += 1) {
+      inbox.insert({
+        subject: `New ${uid}`,
+        fromEmail: `new${uid}@x`,
+        flags: [],
+        date: since + 1_000,
+      })
+    }
+  }
+
+  async function storedUids(): Promise<number[]> {
+    const rows = await harness.executor.select<{ imap_uid: number }>(
+      "SELECT imap_uid FROM messages WHERE account_id = $1 AND imap_folder = 'INBOX' ORDER BY imap_uid ASC",
+      [harness.accountId]
+    )
+    return rows.map((row) => row.imap_uid)
+  }
+
+  function inboxQueries(): FetchQuery[] {
+    return harness.provider.calls
+      .filter((call) => call.folder === "INBOX")
+      .map((call) => call.query)
+  }
+
+  it("a bounded window stops the page-down at the first stale page and stores only in-range mail", async () => {
+    await harness.executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", harness.accountId]
+    )
+    seedMailbox()
+
+    const summary = await harness.sync(2, { reconcileFlags: false })
+
+    // The leading window covers uids 5–6 (in range); the first page-down
+    // "3:4" is entirely stale — the walk STOPS there ("1:2" is never
+    // fetched) and the stale uids are never stored.
+    expect(inboxQueries()).toEqual([{ last: 2 }, { uidSet: "3:4" }])
+    expect(await storedUids()).toEqual([5, 6])
+    expect(summary.newMessages).toBe(0) // a seed pass never announces
+    expect(await isBoundedFirstSync(harness.executor, harness.accountId)).toBe(
+      true
+    )
+  })
+
+  it("null window keeps the full page-down and stores everything", async () => {
+    seedMailbox()
+
+    await harness.sync(2, { reconcileFlags: false })
+
+    expect(inboxQueries()).toEqual([
+      { last: 2 },
+      { uidSet: "3:4" },
+      { uidSet: "1:2" },
+    ])
+    expect(await storedUids()).toEqual([1, 2, 3, 4, 5, 6])
+    expect(await isBoundedFirstSync(harness.executor, harness.accountId)).toBe(
+      false
+    )
+  })
+
+  it("delta arrivals ignore the window (the boundary is download-only)", async () => {
+    await harness.executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", harness.accountId]
+    )
+    seedMailbox()
+    await harness.sync(2, { reconcileFlags: false })
+
+    // An OLD-dated message arrives after the bounded first sync — normal
+    // delta sync must store it.
+    inbox.insert({
+      subject: "Old but new here",
+      fromEmail: "late@x",
+      flags: [],
+      date: since - 5_000,
+    })
+    const summary = await harness.sync(2, { reconcileFlags: false })
+
+    expect(await storedUids()).toContain(7)
+    expect(summary.newMessages).toBe(1)
+  })
+
+  it("backfillImapHistory fetches ONLY a frozen range and never announces or moves cursors", async () => {
+    await harness.executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", harness.accountId]
+    )
+    seedMailbox()
+    await harness.sync(2, { reconcileFlags: false })
+    const cursorBefore = await getFolderSyncState(
+      harness.executor,
+      harness.accountId,
+      "INBOX"
+    )
+
+    // Widen 3m → ~4 months worth: the newly covered range sits below the
+    // current boundary. The range walk keeps uids 3–4 only.
+    const range: HistoryBackfillRange = {
+      since: since - 2_000,
+      until: since,
+    }
+    const summary = await backfillImapHistory(
+      {
+        executor: harness.executor,
+        provider: harness.provider,
+        accountId: harness.accountId,
+        batchSize: 2,
+      },
+      range
+    )
+
+    expect(await storedUids()).toEqual([3, 4, 5, 6])
+    expect(summary.storedMessages).toBe(2)
+    expect(summary.newMessages).toBe(0) // a backfill never announces
+    // The folder cursor is untouched: the range sits below the live window.
+    const cursorAfter = await getFolderSyncState(
+      harness.executor,
+      harness.accountId,
+      "INBOX"
+    )
+    expect(cursorAfter?.last_seen_uid).toBe(cursorBefore?.last_seen_uid)
   })
 })

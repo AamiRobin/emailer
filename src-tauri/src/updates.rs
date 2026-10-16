@@ -14,7 +14,6 @@ use tauri_plugin_updater::UpdaterExt;
  * the checked `Update` handle in state, and downloads/installs on the
  * second command, emitting progress events for the settings UI.
  */
-
 /// The two published channels. Keep in sync with docs/releases.md and
 /// the `channels` release the workflow uploads manifests to.
 const STABLE_ENDPOINT: &str =

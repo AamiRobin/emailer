@@ -77,6 +77,8 @@ export type {
 
 export { removeAccount } from "./remove-account"
 
+export type { HistoryWindowSetting } from "../sync/history-window"
+
 export {
   AccountNotFoundError,
   AccountTypeError,

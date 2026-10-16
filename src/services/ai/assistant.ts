@@ -7,6 +7,12 @@ import {
   type ThreadRow,
 } from "../db/threads"
 import { searchThreadsAcrossAccounts } from "../search"
+import {
+  DEFAULT_SEMANTIC_K,
+  isSemanticIndexAvailable,
+  semanticSearchThreads,
+  type SemanticSearchHit,
+} from "../embeddings/search"
 import { ASK_INBOX_GRAMMAR } from "./ask-inbox"
 import {
   AiUnavailableError,
@@ -92,12 +98,30 @@ const MAX_READ_MESSAGES = 20
 /** Snippet cap in a thread-list row — list rows stay scannable. */
 const MAX_SNIPPET_CHARS = 200
 
-/** The registered read-only tools (design D3) — anything else is a
- * `[TOOL_ERROR]`, never executed. */
+/** Hits a semantic_search payload shows at most (design D2's tool cap —
+ * the same scannable scale as the keyword search rows). */
+const SEMANTIC_RESULT_LIMIT = 20
+
+/** Threads the opening seed block cites at most (design D2: top-8
+ * blended hits). */
+export const SEED_MAX_THREADS = 8
+
+/** The seed block's total size cap in characters (design D2
+ * "size-capped"): eight well-fed rows stay far under it, but snippets
+ * are attacker-controlled text and get a hard ceiling regardless. */
+const MAX_SEED_CHARS = 4000
+
+/** Per-hit snippet cap inside semantic rows (the list-row cap). */
+const MAX_SEMANTIC_SNIPPET_CHARS = MAX_SNIPPET_CHARS
+
+/** The registered read-only tools (design D3; parity-round-3 task 6.4
+ * adds `semantic_search`) — anything else is a `[TOOL_ERROR]`, never
+ * executed. */
 export const ASSISTANT_TOOLS = [
   "search",
   "read_thread",
   "list_unread",
+  "semantic_search",
 ] as const
 
 export type AssistantToolName = (typeof ASSISTANT_TOOLS)[number]
@@ -171,6 +195,10 @@ function buildSystemPrompt(): string {
       'tool result>"}}',
     '   - list_unread — recent unread threads: {"tool": "list_unread", ' +
       '"args": {}}',
+    '   - semantic_search — meaning-based thread search: {"tool": ' +
+      '"semantic_search", "args": {"query": "what did the venue ' +
+      'coordinator say about deposits", "k": 8}} (k optional; the ' +
+      "results blend similarity-ranked and keyword matches)",
     "   read_thread accepts only thread ids an earlier tool result " +
       "returned in this conversation.",
     "2. The final answer as plain text — no JSON, no code fence. " +
@@ -182,6 +210,12 @@ function buildSystemPrompt(): string {
       "answer the question, stop calling tools and answer. Ground every " +
       "claim in the threads the tools returned and reference them by " +
       "subject; never invent threads, senders or content.",
+    "",
+    "The conversation may open with a [SEMANTIC_CONTEXT] block: " +
+      "retrieved threads that already relate to the question, each with " +
+      "its id — treat them like tool results (cite by subject, read " +
+      "their ids with read_thread). When they already answer the " +
+      "question, answer without further tool calls.",
     "",
     ASK_INBOX_GRAMMAR,
     "",
@@ -301,6 +335,56 @@ function formatThreadMessages(
   ].join("\n")
 }
 
+/**
+ * One semantic hit row for the semantic_search payload and the seed
+ * block (task 6.4) — the same field shape as formatThreadRow, plus the
+ * provenance line: the cosine similarity when the meaning leg surfaced
+ * the thread, "keyword match" when only the FTS leg did (inventing a
+ * similarity number for a keyword hit would mislead the model). Every
+ * display field is untrusted email content and passes cleanUntrusted.
+ */
+function formatSemanticRow(hit: SemanticSearchHit): string {
+  const subject = cleanUntrusted(hit.subject?.trim() || "(no subject)")
+  const snippet = cleanUntrusted((hit.snippet ?? "").trim()).slice(
+    0,
+    MAX_SEMANTIC_SNIPPET_CHARS
+  )
+  const provenance =
+    hit.score === null ? "keyword match" : `similarity ${hit.score.toFixed(3)}`
+  return [
+    `- id: ${hit.threadId}`,
+    `  subject: ${subject}`,
+    `  snippet: ${snippet}`,
+    `  ${provenance}`,
+  ].join("\n")
+}
+
+/**
+ * The opening seed block's payload (task 6.4b, design D2): the top
+ * blended hits for the user's question, one cited row per thread,
+ * wrapped in fenceThread by the caller (sentinel escalation included).
+ * Size-capped at MAX_SEED_CHARS — overflow drops whole rows from the
+ * tail and says so, never a silent truncation mid-row.
+ */
+function buildSeedPayload(hits: SemanticSearchHit[]): string {
+  const rows: string[] = []
+  for (const hit of hits) {
+    const row = formatSemanticRow(hit)
+    if (
+      rows.length > 0 &&
+      [...rows, row].join("\n").length > MAX_SEED_CHARS
+    ) {
+      rows.push(`(and ${hits.length - rows.length} more not shown)`)
+      break
+    }
+    rows.push(row)
+  }
+  return [
+    "Threads retrieved for the user's question (most relevant first):",
+    ...rows,
+  ].join("\n")
+}
+
 /** What one tool execution produced: a fenced-ready payload plus the ids
  * it surfaced, or a reason for the `[TOOL_ERROR]` feedback. */
 interface ToolOutcome {
@@ -400,6 +484,54 @@ async function executeTool(
         surfacedThreadIds: [],
       }
     }
+    // semantic_search — the D2 meaning-based lookup (parity-round-3
+    // task 6.4): the query is natural language (operators still work —
+    // the keyword leg is the same parser), the blend is cosine ∪ FTS.
+    // Degradation is a first-class RESULT, never a TOOL_ERROR (spec
+    // "Feature disabled"): a disabled/absent index answers "no semantic
+    // index" and the model falls back to the keyword tools, exactly as
+    // before this tool existed.
+    if (tool === "semantic_search") {
+      const query = typeof args.query === "string" ? args.query.trim() : ""
+      if (query === "") {
+        return {
+          kind: "error",
+          reason:
+            'the semantic_search tool needs a non-empty "query" string argument',
+        }
+      }
+      const rawK = typeof args.k === "number" ? Math.floor(args.k) : NaN
+      const k =
+        Number.isFinite(rawK) && rawK > 0
+          ? Math.min(rawK, SEMANTIC_RESULT_LIMIT)
+          : DEFAULT_SEMANTIC_K
+      const accounts = await context.getAccounts()
+      const hits = await semanticSearchThreads(
+        executor,
+        accounts.ids,
+        query,
+        { k }
+      )
+      if (hits.length === 0) {
+        // Two honest zeros: no index at all (the model is pointed back
+        // at its keyword tools — spec "Feature disabled": the assistant
+        // works exactly as before), or a real empty result.
+        const available = await isSemanticIndexAvailable(executor)
+        return {
+          kind: "result",
+          payload: available
+            ? "No threads matched the semantic search."
+            : "No semantic index is available for this mailbox — use the " +
+              "search tool instead.",
+          surfacedThreadIds: [],
+        }
+      }
+      return {
+        kind: "result",
+        payload: hits.map((hit) => formatSemanticRow(hit)).join("\n"),
+        surfacedThreadIds: hits.map((hit) => hit.threadId),
+      }
+    }
     // list_unread — the folder-digest gather shape: list threads across
     // the active accounts (the "all" preset: trash/spam excluded, the
     // same exclusions the search pipeline applies), keep unread_count >
@@ -452,6 +584,14 @@ async function executeTool(
  * across turns of the open conversation. */
 export interface AssistantTurnOptions {
   touchedThreadIds?: string[]
+  /**
+   * Whether this turn belongs to an inbox-scoped conversation (default
+   * true — the only assistant surface today). The retrieval seed (task
+   * 6.4b) applies ONLY while true (spec: seeded context is excluded from
+   * answers the user redirects away from the inbox); the
+   * semantic_search TOOL is unaffected by this flag.
+   */
+  inboxScoped?: boolean
 }
 
 /** One user turn's outcome: the answer, the threads the tools surfaced
@@ -496,10 +636,7 @@ export async function runAssistantTurn(
     await getOutputLanguage(executor)
   )
 
-  const messages: AiChatMessage[] = [
-    ...history,
-    { role: "user", content: userMessage },
-  ]
+  const messages: AiChatMessage[] = [...history]
   // The conversation's touched threads, in first-surfaced order: the ids
   // read_thread accepts and the source chips render (design D4).
   const touched: string[] = []
@@ -508,27 +645,65 @@ export async function runAssistantTurn(
   }
   for (const threadId of options?.touchedThreadIds ?? []) addTouched(threadId)
 
-  // Active accounts resolve once per turn, on the first tool that needs
-  // them (a plain answer never pays for the query).
+  // Active accounts resolve once per turn — eagerly when the seed will
+  // run (below), lazily on the first tool that needs them otherwise (a
+  // plain answer never pays for the query).
   let accounts: { ids: string[]; labels: Map<string, string> } | null = null
-  const context: ToolContext = {
-    getAccounts: async () => {
-      if (!accounts) {
-        const rows = await listActiveAccounts(executor)
-        accounts = {
-          ids: rows.map((account) => account.id),
-          labels: new Map(
-            rows.map((account) => [
-              account.id,
-              account.display_name?.trim() || account.email,
-            ])
-          ),
-        }
+  const resolveAccounts = async () => {
+    if (!accounts) {
+      const rows = await listActiveAccounts(executor)
+      accounts = {
+        ids: rows.map((account) => account.id),
+        labels: new Map(
+          rows.map((account) => [
+            account.id,
+            account.display_name?.trim() || account.email,
+          ])
+        ),
       }
-      return accounts
-    },
+    }
+    return accounts
+  }
+  const context: ToolContext = {
+    getAccounts: resolveAccounts,
     isKnownThread: (threadId) => touched.includes(threadId),
   }
+
+  // The retrieval seed (task 6.4b, design D2): on the conversation's
+  // OPENING turn, when the conversation is inbox-scoped and the index
+  // can answer, prepend the top-8 blended hits as one fenced
+  // [SEMANTIC_CONTEXT] block inside the user's message. Every seeded
+  // thread is marked cited exactly like a tool result (touched = source
+  // chips + read_thread's allow-list). The seed is NOT a model call —
+  // it rides this turn's existing calls, so usage accounting and the
+  // surface tier apply unchanged. Failure degrades to no seed; the turn
+  // runs exactly as before.
+  let userContent = userMessage
+  if (history.length === 0 && options?.inboxScoped !== false) {
+    try {
+      if (await isSemanticIndexAvailable(executor)) {
+        const active = await resolveAccounts()
+        const hits = await semanticSearchThreads(
+          executor,
+          active.ids,
+          userMessage,
+          { k: SEED_MAX_THREADS }
+        )
+        if (hits.length > 0) {
+          userContent = [
+            "[SEMANTIC_CONTEXT]",
+            fenceThread(buildSeedPayload(hits)),
+            "",
+            userMessage,
+          ].join("\n")
+          for (const hit of hits) addTouched(hit.threadId)
+        }
+      }
+    } catch (error) {
+      console.warn("[assistant] retrieval seed failed; continuing without", error)
+    }
+  }
+  messages.push({ role: "user", content: userContent })
 
   let approxTokens = 0
   let toolRounds = 0

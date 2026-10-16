@@ -63,6 +63,8 @@ import {
   type StyleProfileBuildFailure,
   type WritingStyleProfileEnvelope,
 } from "@/services/ai/style-profile"
+import { SemanticSearchSection } from "@/components/settings/semantic-search-section"
+import { VoiceSection } from "@/components/settings/voice-section"
 import { useAccountStore } from "@/stores/account-store"
 import { getExecutor } from "@/services/db/executor"
 
@@ -178,6 +180,11 @@ const SURFACE_COPY: Record<AiSurfaceId, { label: string; description: string }> 
       label: "AI assistant",
       description:
         "Chat with your mailbox: ask questions and the assistant looks threads up read-only to answer. Nothing is changed by it.",
+    },
+    voiceProfile: {
+      label: "Writing voice learning",
+      description:
+        "The one-call action that learns your writing voice from sent mail for dictation-adjacent drafting. Runs only when you click Learn.",
     },
   }
 
@@ -661,6 +668,22 @@ export function AiSection() {
               void changeOutputLanguage(language)
             }}
           />
+
+          <Separator />
+
+          {/* Semantic search (parity-round-3 task 6.5): the local vector
+              index behind the assistant's meaning-based retrieval — a
+              self-contained block (its own component file), inserted
+              here and nowhere else. */}
+          <SemanticSearchSection />
+
+          <Separator />
+
+          {/* Voice (parity-round-3 tasks 7.2/7.3): dictation model +
+              language picker and the writing-voice profile — a
+              self-contained block (its own component file), inserted
+              here and nowhere else. */}
+          <VoiceSection />
 
           <Separator />
 

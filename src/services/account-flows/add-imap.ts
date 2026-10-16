@@ -4,6 +4,7 @@ import type {
   SmtpTestResult,
   WireSecurity,
 } from "../email/invoke"
+import type { HistoryWindowSetting } from "../sync/history-window"
 import type { SecurityKind } from "../email/types"
 import type { SqlExecutor } from "../db/executor"
 import { getExecutor } from "../db/executor"
@@ -115,6 +116,8 @@ export interface AddImapOptions {
    * Connection tests run in BOTH cases before the account is saved.
    */
   config?: ImapAccountConfig
+  /** First-sync download boundary (task 3.1, D6); omitted/null = all. */
+  historyWindow?: HistoryWindowSetting
   executor?: SqlExecutor
 }
 
@@ -167,6 +170,7 @@ export async function addImapAccount(
     smtpPort: config.smtpPort,
     smtpSecurity: config.smtpSecurity,
     credentialsJson,
+    ...(options.historyWindow ? { historyWindow: options.historyWindow } : {}),
   })
 
   // Local DB write → the switcher can pick the account up immediately;

@@ -5,6 +5,7 @@ import "./index.css"
 import App from "./App.tsx"
 import { ThemeProvider } from "@/components/theme-provider.tsx"
 import { initAccent } from "@/lib/accent"
+import { isPrintWindow } from "@/services/desktop/print-window"
 import { isComposerPopoutWindow, isPopoutWindow } from "@/services/desktop/popout"
 
 // Restore the persisted accent before mounting so the first paint is already
@@ -12,11 +13,20 @@ import { isComposerPopoutWindow, isPopoutWindow } from "@/services/desktop/popou
 initAccent()
 
 // Pop-out windows (task 1.9 + batch C2): every window loads this bundle;
-// the Tauri label is the route. `popout-composer-<draftKey>` renders the
+// the Tauri label is the route. `popout-print-…` renders the print-only
+// surface (parity-round-3 D7); `popout-composer-<draftKey>` renders the
 // composer pop-out surface; `popout-<threadId>` the single-thread surface;
 // anything else is the mail shell. No hash router needed.
 if (isPopoutWindow()) {
-  if (isComposerPopoutWindow()) {
+  if (isPrintWindow()) {
+    void import("./components/print/print-app").then(({ PrintApp }) => {
+      createRoot(document.getElementById("root")!).render(
+        <StrictMode>
+          <PrintApp />
+        </StrictMode>
+      )
+    })
+  } else if (isComposerPopoutWindow()) {
     void import("./components/composer/composer-popout").then(
       ({ ComposerPopoutApp }) => {
         createRoot(document.getElementById("root")!).render(

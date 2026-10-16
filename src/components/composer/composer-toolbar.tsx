@@ -47,6 +47,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { COMPOSE_TRANSFORM_LABELS } from "./compose-transform"
+import { DictationButton } from "./dictation-button"
 import { SnippetPicker } from "./snippet-picker"
 
 /**
@@ -511,6 +512,12 @@ export function ComposerToolbar({
 
       {/* Task 6.2: at-cursor snippet insertion. */}
       <SnippetPicker editor={editor} snippets={snippets} disabled={disabled} />
+
+      {/* Parity-round-3 task 7.2: local dictation — a self-contained
+          control (record/consent/download/cancel inside it) that inserts
+          the transcript at the cursor; hides itself entirely where the
+          platform cannot dictate (no MediaRecorder / not Tauri). */}
+      <DictationButton editor={editor} />
 
       {/* Task 4.6 + batch C3: compose transforms and generative offers —
           hidden unless AI is configured and the surface is enabled (spec:

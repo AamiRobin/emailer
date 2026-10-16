@@ -1,4 +1,4 @@
-import { ALL_GMAIL_LABELS, GMAIL_HISTORY_ID } from "./fixture-data"
+import { ALL_GMAIL_LABELS, GMAIL_HISTORY_ID, ME_GMAIL } from "./fixture-data"
 
 /**
  * Mock Gmail REST + OAuth token endpoints (mock dev mode only). The gmail
@@ -97,6 +97,23 @@ async function mockGoogleResponse(
     })
   }
 
+  if (path === `${GMAIL_API_ROOT}/settings/sendAs` && method === "GET") {
+    // The alias reconcile sweep (best-effort per sync pass) — one
+    // verified primary matching the seeded account identity, so the
+    // pass stays green instead of warning "alias sync failed".
+    return jsonResponse({
+      sendAs: [
+        {
+          sendAsEmail: ME_GMAIL.email,
+          displayName: ME_GMAIL.name,
+          isDefault: true,
+          isPrimary: true,
+          verificationStatus: "accepted",
+        },
+      ],
+    })
+  }
+
   if (path === `${GMAIL_API_ROOT}/history`) {
     // Empty delta at a cursor just past the seeded one: zero new mail,
     // healthy pass.
@@ -156,6 +173,33 @@ async function mockGoogleResponse(
   }
 
   if (path.startsWith(`${GMAIL_API_ROOT}/messages/`)) {
+    // format=raw (View source, task 1.2): the demo has no server copy of
+    // the message, so answer with a synthetic but well-formed RFC 822
+    // document — the dialog renders the raw source verbatim.
+    if (/[?&]format=raw/.test(url)) {
+      const messageId = path.slice(`${GMAIL_API_ROOT}/messages/`.length)
+      const rfc822 = [
+        `Message-Id: <mock-${messageId}@robinlabs.dev>`,
+        "Date: Mon, 12 Oct 2026 09:15:00 +0000",
+        "From: Maya Lindholm <maya.lindholm@northwind-analytics.com>",
+        "To: Ami Robin <amir@robinlabs.dev>",
+        "Subject: [mock] raw source placeholder",
+        "MIME-Version: 1.0",
+        'Content-Type: text/plain; charset="UTF-8"',
+        "",
+        "This is the synthetic raw source served by the mock harness.",
+        "The seeded message body lives in the local database; this",
+        "placeholder only exercises the View source surface.",
+        "",
+      ].join("\r\n")
+      return jsonResponse({
+        id: messageId,
+        raw: btoa(rfc822)
+          .replace(/\+/g, "-")
+          .replace(/\//g, "_")
+          .replace(/=+$/, ""),
+      })
+    }
     // Full message bodies are seeded locally; the server copy 404s and
     // every caller skips 404s by design.
     return googleError(

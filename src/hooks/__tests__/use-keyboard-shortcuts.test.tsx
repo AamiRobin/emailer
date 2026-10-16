@@ -219,6 +219,60 @@ describe("useKeyboardShortcuts — list navigation", () => {
     expect(useUiStore.getState().activeThread).toBe("t3")
   })
 
+  // Thread rows are role="button" and take focus on click, so a row click
+  // leaves the keydown target ON the row. The interactive-target standdown
+  // must not swallow list navigation there — j selects and e archives with
+  // focus resting on the row (regression: rows went keyboard-dead after
+  // every click).
+  it("list keys stay live while a thread row holds focus", () => {
+    renderHarness({
+      children: (
+        <button type="button" data-thread-row="t2" aria-current="true">
+          Subject t2
+        </button>
+      ),
+    })
+    const row = screen.getByRole("button", { name: "Subject t2" })
+    row.focus()
+    expect(document.activeElement).toBe(row)
+    expect(useUiStore.getState().activeThread).toBeNull()
+
+    press("j", {}, row)
+    expect(useUiStore.getState().activeThread).toBe("t1")
+
+    press("e", {}, row)
+    expect(archiveThread).toHaveBeenCalledTimes(1)
+  })
+
+  // A control NESTED in the row (star toggle, snooze menu, select
+  // checkbox) owns its own keyboard: Enter must reach it as native
+  // activation — preventDefault there would cancel the click — while the
+  // other list keys may still drive the list from its focus.
+  it("Enter on a nested row control is left to the control itself", () => {
+    renderHarness({
+      children: (
+        <div data-thread-row="t2">
+          <button type="button" aria-label="Star">
+            ★
+          </button>
+        </div>
+      ),
+    })
+    const star = screen.getByRole("button", { name: "Star" })
+    star.focus()
+
+    let prevented = false
+    star.addEventListener("keydown", (event) => {
+      if (event.defaultPrevented) prevented = true
+    })
+    press("Enter", {}, star)
+    expect(prevented).toBe(false)
+
+    // Navigation keys still flow through from the nested control's focus.
+    press("j", {}, star)
+    expect(useUiStore.getState().activeThread).toBe("t1")
+  })
+
   it("ArrowDown / ArrowUp are aliases; k walks back up and clamps at the top", () => {
     renderHarness()
     press("ArrowDown")
@@ -550,6 +604,54 @@ describe("useKeyboardShortcuts — non-modal centered composer", () => {
     // openNew would have reset the subject — the swallow kept the draft.
     expect(useComposerStore.getState().open).toBe(true)
     expect(useComposerStore.getState().subject).toBe("open draft")
+  })
+
+  // Regression: the compose binding is plain "c", and the composer-owns
+  // branch preventDefault'd it unconditionally — every "c" typed into a
+  // composer field (To/Subject/body) was swallowed while a draft was open.
+  it("typing `c` inside a composer field is text input, not a restore", () => {
+    useUiStore.setState({ composerOpen: true, composerMode: "centered" })
+    useComposerStore.setState({
+      open: true,
+      activeAccountId: "acc1",
+      subject: "open draft",
+      minimized: false,
+    })
+    renderHarness({
+      children: (
+        <div data-testid="composer-surface">
+          <input aria-label="To" />
+        </div>
+      ),
+    })
+    const input = screen.getByRole("textbox", { name: "To" })
+    const events: KeyboardEvent[] = []
+    input.addEventListener("keydown", (event) => {
+      events.push(event)
+    })
+    fireEvent.keyDown(input, { key: "c" })
+    // The hook must leave the keystroke alone so the "c" reaches the field.
+    expect(events[0]!.defaultPrevented).toBe(false)
+    expect(useComposerStore.getState().open).toBe(true)
+    expect(useComposerStore.getState().subject).toBe("open draft")
+  })
+
+  it("typing `c` in a field behind the card is not swallowed either", () => {
+    useUiStore.setState({ composerOpen: true, composerMode: "centered" })
+    useComposerStore.setState({
+      open: true,
+      activeAccountId: "acc1",
+      subject: "open draft",
+      minimized: true,
+    })
+    renderHarness()
+    const input = screen.getByTestId("search-input")
+    const events: KeyboardEvent[] = []
+    input.addEventListener("keydown", (event) => {
+      events.push(event)
+    })
+    fireEvent.keyDown(input, { key: "c" })
+    expect(events[0]!.defaultPrevented).toBe(false)
   })
 })
 

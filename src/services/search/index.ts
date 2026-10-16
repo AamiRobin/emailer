@@ -8,9 +8,11 @@
  * - searchThreadsAcrossAccounts — the same pipeline over an account-id
  *   set (design D4: the unified/split/saved-search scopes run the same
  *   search minus the single-account filter; rows keep their account_id)
- * - searchThreadsWithRelaxedFallback — the search-box entry (task 1.3,
- *   design D7): strict first, and on zero results an operator-free query
- *   is re-run in OR mode, returned with `relaxed: true` for the UI badge
+ * - searchThreadsWithRelaxedFallback — the search-box entry (task 2.3,
+ *   design D8): strict first, and on zero results an operator-free query
+ *   is re-run with `relaxed: true` (any-term, ranked by matched-term
+ *   count then recency, capped), returned with `relaxed: true` for the
+ *   results view's "showing broader results" notice
  * - countThreadsForQuery — the same pipeline's total-match COUNT (task
  *   9.3: the split tab bar's per-tab counts)
  * - foldText — the accent fold (NFD diacritic-strip) the query side uses
@@ -115,26 +117,37 @@ export async function countThreadsForQuery(
 }
 
 /** Result of the search-box entry point: the rows plus whether they came
- * from the relaxed any-term retry — the UI renders its "relaxed search"
- * badge from the flag (task 1.3, mail-search spec "Relaxed fallback"). */
+ * from the relaxed any-term retry — the UI renders its "showing broader
+ * results" notice from the flag (task 2.3, mail-search spec "Relaxed
+ * fallback"). */
 export interface RelaxedSearchResult {
   threads: ThreadRow[]
   relaxed: boolean
 }
 
 /**
- * The search box's run seam (task 1.3, design D7): the strict all-terms
+ * The relaxed retry's result cap (mail-search spec "Relaxed fallback"):
+ * the widened any-term match set can be huge, so it is capped — an
+ * explicit caller limit still applies, but never exceeds this.
+ */
+const RELAXED_RESULT_CAP = 50
+
+/**
+ * The search box's run seam (task 2.3, design D8): the strict all-terms
  * query first; only when it returns ZERO rows and the query carries NO
  * operators (usesOperators — an operator query is never rewritten, so
  * from:/is:/-term scopes can never silently widen into mail the user
- * filtered out) is the same query re-run in OR mode (freeTextMatch
- * "any") and flagged `relaxed: true` when that retry finds rows. The
- * original query string is never touched — only its free-text terms
- * recombine; a second retry makes no sense, so a single-term query
+ * filtered out) is the same query re-run with `relaxed: true` (free-text
+ * terms OR-ed, ranked by matched-term count then recency, capped at
+ * RELAXED_RESULT_CAP), flagged `relaxed: true` when that retry finds rows
+ * — the results view shows its "showing broader results" notice from the
+ * flag. The original query string is never touched — only its free-text
+ * terms recombine; a second retry makes no sense, so a single-term query
  * (whose OR form IS the strict form) and a query with no positive terms
  * (negation-only) skip the retry. Splits, saved searches and the split
- * tab counts deliberately run the plain strict pipeline — their stored
- * queries keep exact semantics and stay in sync with their counts.
+ * tab counts deliberately run the plain strict pipeline (`relaxed: false`
+ * — their stored queries keep exact semantics and stay in sync with their
+ * counts), so a deterministic context never widens.
  */
 export async function searchThreadsWithRelaxedFallback(
   executor: SqlExecutor,
@@ -161,7 +174,11 @@ export async function searchThreadsWithRelaxedFallback(
     executor,
     accountIds,
     input,
-    { ...options, freeTextMatch: "any" }
+    {
+      ...options,
+      relaxed: true,
+      limit: Math.min(options?.limit ?? RELAXED_RESULT_CAP, RELAXED_RESULT_CAP),
+    }
   )
   return { threads: relaxed, relaxed: relaxed.length > 0 }
 }

@@ -1,7 +1,9 @@
+/// <reference types="node" />
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
 import { searchThreadsQuery } from "../../search/index"
-import { at, createAccount, createMessage, createThread } from "./fixtures"
+import { backfillFoldedText } from "../../search/folded-backfill"
+import { at, createAccount, createThread, uid } from "./fixtures"
 import { createTestExecutor, type TestExecutor } from "./test-executor"
 
 /**
@@ -19,6 +21,49 @@ import { createTestExecutor, type TestExecutor } from "./test-executor"
  * triggers keep the index in sync. Migration v14 (parity-round-2 task
  * 2.2, D8): the ai_usage per-request token table.
  */
+
+/**
+ * Seed a message with the PRE-v20 write shape — the columns the write
+ * path filled before the folded stamp (parity-round-3 task 2.1) extended
+ * insertMessage. The upgrade-path suites seed OLD-schema databases
+ * (upToVersion ≤ 19, where messages.folded does not exist yet), so they
+ * must write with the era's shape, not the current v20-aware fixture —
+ * the raw insert still fires the era's own FTS upkeep triggers.
+ */
+async function createPreV20Message(
+  executor: TestExecutor,
+  options: {
+    threadId: string
+    accountId: string
+    date: number
+    subject?: string
+    fromName?: string
+    fromAddress?: string
+    bodyText?: string
+    snippet?: string
+  }
+): Promise<string> {
+  const id = uid("msg")
+  await executor.execute(
+    `INSERT INTO messages (
+       id, thread_id, account_id, date, subject, from_name, from_address,
+       to_json, body_text, snippet
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [
+      id,
+      options.threadId,
+      options.accountId,
+      options.date,
+      options.subject ?? null,
+      options.fromName ?? null,
+      options.fromAddress ?? null,
+      null,
+      options.bodyText ?? null,
+      options.snippet ?? null,
+    ]
+  )
+  return id
+}
 
 const NEW_THREAD_COLUMNS = [
   "snoozed_until",
@@ -626,7 +671,7 @@ describe("migration v13 upgrade path (task 1.3, D7)", () => {
     const threadId = await createThread(executor, accountId, {
       subject: "Bé Dọn Dẹp",
     })
-    await createMessage(executor, {
+    await createPreV20Message(executor, {
       threadId,
       accountId,
       date: at(100),
@@ -661,7 +706,7 @@ describe("migration v13 upgrade path (task 1.3, D7)", () => {
     const secondThread = await createThread(executor, accountId, {
       subject: "Phở Hà Nội",
     })
-    await createMessage(executor, {
+    await createPreV20Message(executor, {
       threadId: secondThread,
       accountId,
       date: at(200),
@@ -841,7 +886,7 @@ describe("migration v15 upgrade path (parity-round-2, task 3.1)", () => {
     const threadId = await createThread(executor, gmailAccountId, {
       subject: "Survives",
     })
-    await createMessage(executor, {
+    await createPreV20Message(executor, {
       threadId,
       accountId: gmailAccountId,
       date: at(10),
@@ -1133,5 +1178,430 @@ describe("migration v18 upgrade path (parity-round-2, task 4.4)", () => {
       [accountId]
     )
     expect(assigned[0]?.profile_id).toBe("prof-new")
+  })
+})
+
+describe("migration v20 schema (parity-round-3 task 1.3, D5/D6/D8)", () => {
+  let executor: TestExecutor
+
+  beforeEach(() => {
+    executor = createTestExecutor()
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("adds the nullable accounts.history_window column", async () => {
+    const columns = await executor.select<{ name: string; notnull: number }>(
+      "PRAGMA table_info(accounts)"
+    )
+    const column = columns.find((entry) => entry.name === "history_window")
+    expect(column, "accounts.history_window should exist").toBeDefined()
+    expect(column?.notnull, "history_window should be nullable").toBe(0)
+  })
+
+  it("adds the nullable accounts.reminder_lead_minutes column (task 8.5)", async () => {
+    const columns = await executor.select<{
+      name: string
+      notnull: number
+      type: string
+    }>("PRAGMA table_info(accounts)")
+    const column = columns.find(
+      (entry) => entry.name === "reminder_lead_minutes"
+    )
+    expect(
+      column,
+      "accounts.reminder_lead_minutes should exist"
+    ).toBeDefined()
+    expect(column?.type, "reminder_lead_minutes type").toBe("INTEGER")
+    expect(
+      column?.notnull,
+      "reminder_lead_minutes should be nullable (NULL = off, the default)"
+    ).toBe(0)
+  })
+
+  it("adds the nullable calendar RSVP columns beside the existing v11 uid", async () => {
+    const columns = await executor.select<{
+      name: string
+      notnull: number
+      type: string
+    }>("PRAGMA table_info(calendar_events)")
+    const byName = new Map(columns.map((column) => [column.name, column]))
+    // The invite identity already exists as NOT NULL (v11) — v20 must not
+    // re-add it.
+    expect(byName.get("uid")?.notnull).toBe(1)
+    for (const [name, type] of [
+      ["sequence", "INTEGER"],
+      ["recurrence_id", "TEXT"],
+      ["partstat", "TEXT"],
+      ["reminded_at", "INTEGER"],
+    ] as const) {
+      const column = byName.get(name)
+      expect(column, `calendar_events.${name} should exist`).toBeDefined()
+      expect(column?.type, `calendar_events.${name} type`).toBe(type)
+      expect(column?.notnull, `calendar_events.${name} should be nullable`).toBe(0)
+    }
+  })
+
+  it("adds the nullable threads.invite_uid column with its partial index", async () => {
+    const columns = await executor.select<{ name: string; notnull: number }>(
+      "PRAGMA table_info(threads)"
+    )
+    const column = columns.find((entry) => entry.name === "invite_uid")
+    expect(column, "threads.invite_uid should exist").toBeDefined()
+    expect(column?.notnull, "invite_uid should be nullable").toBe(0)
+
+    const indexes = await executor.select<{ name: string; sql: string | null }>(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'threads'"
+    )
+    const inviteIndex = indexes.find(
+      (entry) => entry.name === "idx_threads_invite_uid"
+    )
+    expect(inviteIndex?.sql).toContain("WHERE invite_uid IS NOT NULL")
+  })
+
+  it("adds the folded FTS column backed by messages.folded", async () => {
+    const ftsColumns = await executor.select<{ name: string }>(
+      "PRAGMA table_info(messages_fts)"
+    )
+    expect(ftsColumns.map((column) => column.name)).toContain("folded")
+
+    const messageColumns = await executor.select<{
+      name: string
+      notnull: number
+    }>("PRAGMA table_info(messages)")
+    const folded = messageColumns.find((entry) => entry.name === "folded")
+    expect(folded, "messages.folded should exist").toBeDefined()
+    expect(folded?.notnull, "messages.folded should be nullable").toBe(0)
+  })
+
+  it("accepts smoke inserts across all three feature areas", async () => {
+    const accountId = await createAccount(executor)
+    await executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", accountId]
+    )
+    await executor.execute(
+      `INSERT INTO calendar_sources (id, account_id, provider, name, config_json)
+       VALUES ('src-1', $1, 'google', 'me@gmail.com', 'sealed')`,
+      [accountId]
+    )
+    await executor.execute(
+      `INSERT INTO calendar_events (
+         id, source_id, calendar_id, uid, ical, start_at, end_at,
+         sequence, recurrence_id, partstat, reminded_at
+       ) VALUES ('e-1', 'src-1', 'cal-1', 'uid-1', 'BEGIN:VEVENT', 100, 200,
+                 2, '20260101T100000Z', 'ACCEPTED', 1_700_001_000)`
+    )
+    const event = await executor.select<{
+      sequence: number
+      recurrence_id: string
+      partstat: string
+      reminded_at: number
+    }>("SELECT sequence, recurrence_id, partstat, reminded_at FROM calendar_events")
+    expect(event[0]).toEqual({
+      sequence: 2,
+      recurrence_id: "20260101T100000Z",
+      partstat: "ACCEPTED",
+      reminded_at: 1_700_001_000,
+    })
+
+    const threadId = await createThread(executor, accountId)
+    await executor.execute(
+      "UPDATE threads SET invite_uid = $1 WHERE id = $2",
+      ["invite-uid-1", threadId]
+    )
+    const threads = await executor.select<{ invite_uid: string }>(
+      "SELECT invite_uid FROM threads WHERE invite_uid IS NOT NULL"
+    )
+    expect(threads).toEqual([{ invite_uid: "invite-uid-1" }])
+  })
+})
+
+describe("migration v20 upgrade path (parity-round-3 task 1.3, D8)", () => {
+  let executor: TestExecutor
+  let accountId: string
+
+  beforeEach(async () => {
+    // ONLY the migrations ≤ v19: the pre-v20 install whose FTS index has
+    // no folded column and whose rows carry no window/RSVP columns.
+    executor = createTestExecutor({ upToVersion: 19 })
+    accountId = await createAccount(executor, "gmail")
+    const threadId = await createThread(executor, accountId, {
+      subject: "Bé Dọn Dẹp",
+    })
+    await createPreV20Message(executor, {
+      threadId,
+      accountId,
+      date: at(10),
+      subject: "Bé Dọn Dẹp",
+      fromName: "Hoà Bình",
+      fromAddress: "hoa@vn.example",
+      bodyText: "Lịch họp tuần sau đã đổi.",
+      snippet: "Lịch họp tuần sau đã đổi.",
+    })
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("rebuilds the FTS index additively and keeps raw search working", async () => {
+    executor.applyMigration(20)
+
+    // Existing rows and accounts survive the rebuild; the new columns
+    // read NULL (all-mail window, no invite, no RSVP state).
+    const account = await executor.select<{
+      id: string
+      history_window: string | null
+    }>("SELECT id, history_window FROM accounts")
+    expect(account).toEqual([{ id: accountId, history_window: null }])
+    const threads = await executor.select<{ invite_uid: string | null }>(
+      "SELECT invite_uid FROM threads"
+    )
+    expect(threads[0]?.invite_uid).toBeNull()
+
+    // The v13 folded query still finds the pre-v20 rows through the raw
+    // columns — the rebuild preserved the external-content semantics and
+    // repopulated from the surviving rows.
+    expect(
+      (await searchThreadsQuery(executor, accountId, "be don dep")).map(
+        (thread) => thread.subject
+      )
+    ).toEqual(["Bé Dọn Dẹp"])
+  })
+
+  it("carries the folded column through the trigger once the backfill stamps it", async () => {
+    executor.applyMigration(20)
+
+    // Pre-existing rows sit at folded IS NULL (SQL has no Unicode fold;
+    // the bootstrap backfill owns them — see the design.md spike notes).
+    const before = await executor.select<{ folded: string | null }>(
+      "SELECT folded FROM messages"
+    )
+    expect(before[0]?.folded).toBeNull()
+
+    // The bootstrap's backfill (services/search/folded-backfill.ts):
+    // stamps messages.folded, and the upkeep trigger rewrites the FTS
+    // row, so the index carries the folded copy too.
+    const foldedCount = await backfillFoldedText(executor)
+    expect(foldedCount).toBe(1)
+
+    const after = await executor.select<{ folded: string | null }>(
+      "SELECT folded FROM messages"
+    )
+    // foldText strips combining marks only: é/à fold, but đ (d-with-
+    // stroke, U+0111) has no decomposition and survives — the normalizer
+    // transliterates nothing (fts.ts contract).
+    expect(after[0]?.folded).toBe(
+      "Be Don Dep\nHoa Binh\nhoa@vn.example\n" +
+        "Lich hop tuan sau đa đoi.\nLich hop tuan sau đa đoi."
+    )
+
+    // The folded copy is independently searchable through its column
+    // filter — the D8 query-side contract (raw OR folded columns).
+    const viaFoldedColumn = await executor.select<{ subject: string }>(
+      `SELECT subject FROM messages_fts WHERE messages_fts MATCH $1`,
+      ['folded: "hoa binh"']
+    )
+    expect(viaFoldedColumn).toEqual([{ subject: "Bé Dọn Dẹp" }])
+
+    // A second run is a no-op (the column is the resume cursor).
+    expect(await backfillFoldedText(executor)).toBe(0)
+  })
+})
+
+describe("migration v21 schema (parity-round-3 task 1.3, D1/D3)", () => {
+  let executor: TestExecutor
+
+  beforeEach(() => {
+    executor = createTestExecutor()
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("creates the three local-AI tables", async () => {
+    const rows = await executor.select<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table'"
+    )
+    const names = rows.map((row) => row.name)
+    for (const table of ["thread_vectors", "voice_profiles", "model_downloads"]) {
+      expect(names, `${table} table should exist`).toContain(table)
+    }
+  })
+
+  it("gives thread_vectors the (account, thread) identity with cascade deletes", async () => {
+    const columns = await executor.select<{
+      name: string
+      notnull: number
+      pk: number
+      type: string
+    }>("PRAGMA table_info(thread_vectors)")
+    const byName = new Map(columns.map((column) => [column.name, column]))
+    expect(byName.get("account_id")?.pk).toBe(1)
+    expect(byName.get("thread_id")?.pk).toBe(2)
+    for (const [name, type] of [
+      ["dim", "INTEGER"],
+      ["vector", "BLOB"],
+      ["content_hash", "TEXT"],
+    ] as const) {
+      const column = byName.get(name)
+      expect(column, `thread_vectors.${name} should exist`).toBeDefined()
+      expect(column?.type, `thread_vectors.${name} type`).toBe(type)
+      expect(column?.notnull, `thread_vectors.${name} should be NOT NULL`).toBe(1)
+    }
+
+    const indexes = await executor.select<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'thread_vectors'"
+    )
+    expect(indexes.map((row) => row.name)).toContain("idx_thread_vectors_account")
+
+    // One vector per (account, thread); deleting either side cascades.
+    const accountId = await createAccount(executor)
+    const threadId = await createThread(executor, accountId)
+    const vector = Buffer.from(new Float32Array([0.1, 0.2, 0.3]).buffer)
+    await executor.execute(
+      `INSERT INTO thread_vectors (account_id, thread_id, dim, vector, content_hash)
+       VALUES ($1, $2, 384, $3, 'hash-1')`,
+      [accountId, threadId, vector]
+    )
+    await expect(
+      executor.execute(
+        `INSERT INTO thread_vectors (account_id, thread_id, dim, vector, content_hash)
+         VALUES ($1, $2, 384, $3, 'hash-2')`,
+        [accountId, threadId, vector]
+      )
+    ).rejects.toThrow()
+
+    const stored = await executor.select<{ dim: number; content_hash: string }>(
+      "SELECT dim, content_hash FROM thread_vectors WHERE account_id = $1",
+      [accountId]
+    )
+    expect(stored).toEqual([{ dim: 384, content_hash: "hash-1" }])
+
+    await executor.execute("DELETE FROM threads WHERE id = $1", [threadId])
+    expect(
+      await executor.select("SELECT 1 FROM thread_vectors")
+    ).toEqual([])
+  })
+
+  it("gives voice_profiles a global NULL-account shape and cascades scoped rows", async () => {
+    const columns = await executor.select<{
+      name: string
+      notnull: number
+      pk: number
+    }>("PRAGMA table_info(voice_profiles)")
+    const byName = new Map(columns.map((column) => [column.name, column]))
+    expect(byName.get("id")?.pk).toBe(1)
+    expect(byName.get("account_id")?.notnull).toBe(0)
+    for (const name of ["profile_json", "learned_at", "message_count"]) {
+      expect(byName.get(name)?.notnull, `voice_profiles.${name}`).toBe(1)
+    }
+
+    // A GLOBAL profile (account_id NULL) coexists with a scoped one, and
+    // deleting the account removes only the scoped row.
+    const accountId = await createAccount(executor)
+    await executor.execute(
+      `INSERT INTO voice_profiles (id, account_id, profile_json, learned_at, message_count)
+       VALUES ('vp-global', NULL, '{"tone":"warm"}', 1_700_000_000, 30)`
+    )
+    await executor.execute(
+      `INSERT INTO voice_profiles (id, account_id, profile_json, learned_at, message_count)
+       VALUES ('vp-scoped', $1, '{"tone":"terse"}', 1_700_000_100, 10)`,
+      [accountId]
+    )
+    await executor.execute("DELETE FROM accounts WHERE id = $1", [accountId])
+    const kept = await executor.select<{ id: string }>(
+      "SELECT id FROM voice_profiles"
+    )
+    expect(kept).toEqual([{ id: "vp-global" }])
+  })
+
+  it("gives model_downloads the per-model state row with defaults", async () => {
+    const columns = await executor.select<{
+      name: string
+      notnull: number
+      pk: number
+      dflt_value: string | null
+    }>("PRAGMA table_info(model_downloads)")
+    const byName = new Map(columns.map((column) => [column.name, column]))
+    expect(byName.get("model_id")?.pk).toBe(1)
+    expect(byName.get("state")?.notnull).toBe(1)
+    expect(byName.get("bytes_downloaded")?.dflt_value).toBe("0")
+    expect(byName.get("total_bytes")?.notnull).toBe(0)
+    expect(byName.get("error")?.notnull).toBe(0)
+
+    await executor.execute(
+      `INSERT INTO model_downloads (model_id, state, total_bytes)
+       VALUES ('bge-small', 'downloading', 110_000_000)`
+    )
+    const rows = await executor.select<{
+      bytes_downloaded: number
+      updated_at: number
+      error: string | null
+    }>("SELECT bytes_downloaded, updated_at, error FROM model_downloads")
+    expect(rows[0]).toMatchObject({ bytes_downloaded: 0, error: null })
+    expect(rows[0]?.updated_at).toBeGreaterThan(0)
+
+    // One state row per model — the re-download is an upsert on the PK.
+    await expect(
+      executor.execute(
+        "INSERT INTO model_downloads (model_id, state) VALUES ('bge-small', 'done')"
+      )
+    ).rejects.toThrow()
+  })
+})
+
+describe("migration v21 upgrade path (parity-round-3 task 1.3)", () => {
+  let executor: TestExecutor
+  let accountId: string
+
+  beforeEach(async () => {
+    // ONLY the migrations ≤ v19: the pre-v20/v21 install. v21 applies on
+    // top of v20 (the runner order), so both upgrade in one sequence.
+    executor = createTestExecutor({ upToVersion: 19 })
+    accountId = await createAccount(executor, "gmail")
+    const threadId = await createThread(executor, accountId, {
+      subject: "Survives",
+    })
+    await createPreV20Message(executor, {
+      threadId,
+      accountId,
+      date: at(10),
+      subject: "Survives",
+    })
+    executor.applyMigration(20)
+    executor.applyMigration(21)
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("applies additively onto the upgraded schema and keeps every row", async () => {
+    // Pre-existing data untouched by both steps.
+    const kept = await executor.select<{ subject: string }>(
+      "SELECT subject FROM messages"
+    )
+    expect(kept).toEqual([{ subject: "Survives" }])
+
+    // And the new tables round-trip against the upgraded (v20) schema.
+    const threads = await executor.select<{ id: string }>(
+      "SELECT id FROM threads WHERE account_id = $1",
+      [accountId]
+    )
+    await executor.execute(
+      `INSERT INTO thread_vectors (account_id, thread_id, dim, vector, content_hash)
+       VALUES ($1, $2, 384, $3, 'hash')`,
+      [accountId, threads[0]!.id, Buffer.from(new Float32Array([1]).buffer)]
+    )
+    const vectors = await executor.select<{ dim: number }>(
+      "SELECT dim FROM thread_vectors WHERE account_id = $1",
+      [accountId]
+    )
+    expect(vectors).toEqual([{ dim: 384 }])
   })
 })

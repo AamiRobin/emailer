@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
-import { getTotalUnreadCount, listActiveAccounts } from "../accounts"
+import {
+  flagAllAccountsForReauth,
+  getTotalUnreadCount,
+  listActiveAccounts,
+} from "../accounts"
 import { at, createAccount, createMessage, createThread } from "./fixtures"
 import { createTestExecutor, type TestExecutor } from "./test-executor"
 import { snoozeThread, wakeDueThreads } from "../../email-actions/snooze"
@@ -125,5 +129,68 @@ describe("listActiveAccounts", () => {
 
     const rows = await listActiveAccounts(executor)
     expect(rows.map((row) => row.id)).toEqual([healthy])
+  })
+})
+
+describe("flagAllAccountsForReauth (task 5.4, restore side)", () => {
+  let executor: TestExecutor
+
+  beforeEach(() => {
+    executor = createTestExecutor()
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  it("flips every account to the persisted needs-reauth state and lifts with re-auth", async () => {
+    const gmail = await createAccount(executor, "gmail")
+    const imap = await createAccount(executor, "imap")
+    // An account that was ALREADY paused (a pre-existing auth failure)
+    // must not inflate the count.
+    await executor.execute(
+      "UPDATE accounts SET status = 'auth-error' WHERE id = $1",
+      [imap]
+    )
+
+    const flagged = await flagAllAccountsForReauth(executor)
+    expect(flagged).toBe(1)
+
+    // The flag IS the accounts table's status column: the sync gate
+    // (listActiveAccounts) and the send gate (status "auth-error") pick
+    // it up from the same persisted value, so it survives restarts.
+    const statuses = await executor.select<{ id: string; status: string }>(
+      "SELECT id, status FROM accounts ORDER BY id"
+    )
+    expect(statuses).toEqual([
+      { id: gmail, status: "auth-error" },
+      { id: imap, status: "auth-error" },
+    ])
+    expect(await listActiveAccounts(executor)).toEqual([])
+
+    // A second pass is a no-op: nothing left to flag.
+    expect(await flagAllAccountsForReauth(executor)).toBe(0)
+
+    // A successful re-auth flips the row back (reauth.ts finishReauth)
+    // and the account syncs again.
+    await executor.execute(
+      "UPDATE accounts SET status = 'active' WHERE id = $1",
+      [gmail]
+    )
+    expect((await listActiveAccounts(executor)).map((row) => row.id)).toEqual([
+      gmail,
+    ])
+  })
+
+  it("keeps restored mail readable offline while the flag is set", async () => {
+    const accountId = await createAccount(executor, "gmail")
+    const threadId = await createThread(executor, accountId)
+    await createMessage(executor, { threadId, accountId, date: at(1) })
+
+    await flagAllAccountsForReauth(executor)
+
+    // Reading never consults account status: the unread count — a plain
+    // mailbox aggregation — is unchanged by the needs-reauth flag.
+    expect(await getTotalUnreadCount(executor)).toBe(1)
   })
 })

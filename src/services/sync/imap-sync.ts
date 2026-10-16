@@ -4,7 +4,7 @@ import {
   categorizeIncomingMessages,
 } from "../categorization/ingestion"
 import { reconcileProvisionalSent } from "../composer/send"
-import { getAccount } from "../db/accounts"
+import { accountHistoryWindow, getAccount } from "../db/accounts"
 import { findLabelByImapFolder, getLabel, insertLabel } from "../db/labels"
 import type { SpecialUse } from "../db/labels"
 import type { AttachmentInput, ContactRef, MessageInput } from "../db/messages"
@@ -36,6 +36,14 @@ import { ProviderAuthError } from "../email/types"
 import { getFolderSyncState, upsertFolderSyncState } from "./folder-sync-state"
 import type { FetchFlagsChangedFn } from "./flag-sync"
 import { reconcileAllFolderFlags } from "./flag-sync"
+import {
+  clampToRange,
+  clampToWindow,
+  historyWindowBoundary,
+  markBoundedFirstSync,
+  pageIsEntirelyOutOfWindow,
+  type HistoryBackfillRange,
+} from "./history-window"
 import { listEnabledRules } from "../rules/db"
 import {
   applyBlockedSenderFiling,
@@ -179,6 +187,16 @@ export async function syncImapAccount(
     newMessages: 0,
   })
 
+  // History window (task 3.2, D6): the account's first-sync boundary.
+  // The Rust fetch seam has no SINCE parameter, so the clamp is applied
+  // engine-side on the full paths (SEARCH SINCE-style): pages stop once a
+  // whole page predates the boundary and out-of-window messages are
+  // dropped before anything is stored. Delta passes never see it.
+  const since = historyWindowBoundary(
+    accountHistoryWindow(account),
+    Math.floor(Date.now() / 1000)
+  )
+
   const summary: ImapSyncSummary = {
     foldersSynced: 0,
     newMessages: 0,
@@ -198,7 +216,8 @@ export async function syncImapAccount(
         folder,
         labelId,
         batchSize,
-        account.email
+        account.email,
+        since
       )
       summary.foldersSynced += 1
       summary.newMessages += outcome.newMessages
@@ -330,7 +349,10 @@ async function syncFolder(
   folder: EmailFolder,
   labelId: string | null,
   batchSize: number,
-  accountEmail: string
+  accountEmail: string,
+  /** First-sync boundary (unix seconds, exclusive below) — applied to the
+   * full paths only (null = unbounded). */
+  since: number | null
 ): Promise<FolderOutcome> {
   const state = await getFolderSyncState(executor, accountId, folder.path)
 
@@ -359,10 +381,22 @@ async function syncFolder(
 
   let fetched: NormalizedMessage[]
   if (state === null || state.uidvalidity === null) {
-    fetched = await collectFullFolder(provider, folder.path, first, batchSize)
+    fetched = await collectFullFolder(
+      provider,
+      folder.path,
+      first,
+      batchSize,
+      since
+    )
   } else if (invalidated) {
     await replaceFolderLocalState(executor, accountId, folder.path)
-    fetched = await collectFullFolder(provider, folder.path, first, batchSize)
+    fetched = await collectFullFolder(
+      provider,
+      folder.path,
+      first,
+      batchSize,
+      since
+    )
   } else {
     fetched = await collectDeltaFolder(
       provider,
@@ -371,6 +405,16 @@ async function syncFolder(
       first,
       batchSize
     )
+  }
+
+  // Bounded-first-sync marker (task 3.4): an initial download (fresh or
+  // uidvalidity-less cursor, or a UIDVALIDITY reset) that ran under a
+  // boundary tells the mailbox UI older mail was skipped. Idempotent.
+  if (
+    since !== null &&
+    (state === null || state.uidvalidity === null || invalidated)
+  ) {
+    await markBoundedFirstSync(executor, accountId)
   }
 
   const invalidatedCursor =
@@ -422,15 +466,22 @@ async function syncFolder(
  * Full folder fetch: the leading {last: batch} window followed by
  * explicit UID-range pages down to UID 1, so folders larger than one
  * batch sync completely while each provider call stays bounded.
+ *
+ * History window (task 3.2, D6): with a boundary, the page-down stops as
+ * soon as a whole page predates `since` (UIDs run newest→oldest, so the
+ * first fully-stale page ends the walk) and every page is filtered to the
+ * window before it is returned — the SEARCH SINCE-style clamp, engine-side.
  */
 async function collectFullFolder(
   provider: EmailProvider,
   folderPath: string,
   first: FetchMessagesResult,
-  batchSize: number
+  batchSize: number,
+  since: number | null
 ): Promise<NormalizedMessage[]> {
-  const collected = [...first.messages]
-  const oldestFetched = collected.reduce(
+  const collected = clampToWindow([...first.messages], since)
+  if (pageIsEntirelyOutOfWindow(first.messages, since)) return collected
+  const oldestFetched = first.messages.reduce(
     (min, message) => Math.min(min, message.uid),
     Number.POSITIVE_INFINITY
   )
@@ -442,7 +493,10 @@ async function collectFullFolder(
     const page = await provider.fetchMessages(folderPath, {
       uidSet: `${lower}:${upper}`,
     })
-    collected.push(...page.messages)
+    if (page.messages.length > 0) {
+      collected.push(...clampToWindow(page.messages, since))
+      if (pageIsEntirelyOutOfWindow(page.messages, since)) break
+    }
     upper = lower - 1
   }
   return collected
@@ -483,8 +537,8 @@ async function collectDeltaFolder(
 }
 
 /**
- * UIDVALIDITY invalidation: every stored UID for the folder refers to
- * the old UID space, so drop the folder's messages and the account's
+ * UIDVALIDITY invalidation: every stored UID for the folder refers to the
+ * old UID space, so drop the folder's messages and the account's
  * threads left empty by the drop. (Server-side expunges without a
  * UIDVALIDITY change are out of scope — see the module comment.)
  */
@@ -503,6 +557,138 @@ async function replaceFolderLocalState(
     )`,
     [accountId]
   )
+}
+
+// ---------------------------------------------------------------------------
+// Widening backfill (task 3.3, D6 — replayed through the offline queue)
+// ---------------------------------------------------------------------------
+
+export interface HistoryBackfillSummary {
+  /** Messages the range fetch ran upserts for. */
+  storedMessages: number
+  /** Messages that were genuinely new to the local store. */
+  newMessages: number
+  /** Folders whose range pass completed. */
+  foldersSynced: number
+}
+
+/**
+ * Fetch ONLY a widened window's newly covered range across every folder
+ * and store it silently. Called by the queue processor when a
+ * `history_backfill` op replays — the payload froze the range at enqueue
+ * time, so a restart/retry replays the exact promised range.
+ *
+ * Mechanically the full-sync walk (newest window, then UID-range pages
+ * down) with two differences: only in-range messages are kept, and the
+ * walk stops at the first page that is entirely OLDER than `since` (the
+ * pages above `until` are walked through but contribute nothing). A
+ * backfill is a seed pass in the engine's established sense — everything
+ * stores and files, nothing announces (`countNew: false`) — and the
+ * folder cursors are deliberately untouched: the range sits below the
+ * live window, and the UIDs it visits must not move last_seen_uid.
+ * Upserts are idempotent (provider-keyed, server-wins), so a replayed
+ * range converges.
+ */
+export async function backfillImapHistory(
+  options: Omit<
+    ImapSyncOptions,
+    "onProgress" | "reconcileFlags" | "fetchFlagsChanged"
+  > & {
+    onProgress?: ImapSyncOptions["onProgress"]
+  },
+  range: HistoryBackfillRange
+): Promise<HistoryBackfillSummary> {
+  const { executor, provider, accountId } = options
+  const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
+  const onProgress = options.onProgress ?? ((): void => {})
+  const account = await getAccount(executor, accountId)
+  if (!account) {
+    throw new Error(`imap backfill: account ${accountId} not found`)
+  }
+
+  const folders = await provider.listFolders()
+  const labelIdsByPath = await ensureFolderLabels(executor, accountId, folders)
+
+  const summary: HistoryBackfillSummary = {
+    storedMessages: 0,
+    newMessages: 0,
+    foldersSynced: 0,
+  }
+  let done = 0
+  for (const folder of folders) {
+    const labelId = labelIdsByPath.get(folder.path) ?? null
+    // No per-folder isolation here (unlike syncImapAccount): a failed
+    // folder FAILS the op so the queue retries it whole — the upserts are
+    // idempotent, so the replay converges instead of silently missing a
+    // folder's slice of the promised range.
+    const fetched = await collectRangeFolder(
+      provider,
+      folder.path,
+      batchSize,
+      range
+    )
+    if (fetched.length > 0) {
+      const outcome = await storeFolderMessages(
+        executor,
+        accountId,
+        folder.path,
+        labelId,
+        fetched,
+        0,
+        account.email,
+        { countNew: false, arrivalIsInbox: folder.specialUse === "inbox" }
+      )
+      summary.storedMessages += fetched.length
+      summary.newMessages += outcome.newMessages
+    }
+    summary.foldersSynced += 1
+    done += 1
+    onProgress({
+      phase: "messages",
+      folderPath: folder.path,
+      foldersDone: done,
+      foldersTotal: folders.length,
+      newMessages: summary.newMessages,
+    })
+  }
+  return summary
+}
+
+/**
+ * One folder's range walk: the newest {last: batch} window, then explicit
+ * UID-range pages downward, keeping only the messages inside `range` and
+ * stopping at the first page that is entirely older than `since` (UIDs run
+ * newest→oldest). Pages newer than `until` are walked through and filtered.
+ */
+async function collectRangeFolder(
+  provider: EmailProvider,
+  folderPath: string,
+  batchSize: number,
+  range: HistoryBackfillRange
+): Promise<NormalizedMessage[]> {
+  const first = await provider.fetchMessages(folderPath, { last: batchSize })
+  const collected = clampToRange(first.messages, range)
+  if (pageIsEntirelyOutOfWindow(first.messages, range.since)) return collected
+
+  const oldestFetched = first.messages.reduce(
+    (min, message) => Math.min(min, message.uid),
+    Number.POSITIVE_INFINITY
+  )
+  if (!Number.isFinite(oldestFetched)) return collected
+
+  let upper = oldestFetched - 1
+  while (upper >= 1) {
+    const lower = Math.max(1, upper - batchSize + 1)
+    const page = await provider.fetchMessages(folderPath, {
+      uidSet: `${lower}:${upper}`,
+    })
+    if (page.messages.length > 0) {
+      collected.push(...clampToRange(page.messages, range))
+      if (pageIsEntirelyOutOfWindow(page.messages, range.since)) break
+    }
+    upper = lower - 1
+  }
+  return collected
 }
 
 // ---------------------------------------------------------------------------

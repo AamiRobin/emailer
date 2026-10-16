@@ -133,7 +133,7 @@ describe("relaxed search badge (task 1.3)", () => {
     render(<ThreadList />)
 
     const badge = await screen.findByTestId("search-relaxed-badge")
-    expect(badge.textContent).toContain("Relaxed search")
+    expect(badge.textContent).toContain("Showing broader results")
     // both single-term matches render as rows
     await screen.findByText(/banking thread/i)
     await screen.findByText(/roadmap thread/i)

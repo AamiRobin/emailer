@@ -6,14 +6,31 @@ use tauri_plugin_opener::OpenerExt;
 mod ai;
 mod avatar;
 mod badge;
+// Backup archive writer/verifier + replace-mode file swap (parity-round-3
+// tasks 5.1–5.3, design D4): Rust moves and hashes file bytes only — the
+// snapshot's SQL (VACUUM INTO + secret strip) stays frontend-side.
+mod backup;
 // Minimal CalDAV client + caldav_* commands (task 5.2, design D5).
 mod caldav;
 // Minimal CardDAV address-book client + carddav_* commands
 // (parity-round-2 tasks 4.1–4.3, design D4).
 mod carddav;
 mod desktop;
+// iCalendar (RFC 5545) parse + REPLY build (parity-round-3 task 8.1,
+// design D5): the PURE Rust half of meeting RSVP — parses text/calendar
+// payloads and builds the METHOD:REPLY blob. No SQL, no I/O: every app
+// database statement stays frontend-side (tauri-plugin-sql).
+mod ics;
+// Local semantic-search embeddings (parity-round-3 design D1, task 6.1,
+// candle): the one `embed_texts` command. Feature-gated — the handler
+// registration below carries the same cfg attribute.
+#[cfg(feature = "local-embeddings")]
+mod embeddings;
 mod imap;
 mod mail_import;
+// Shared pinned-model downloader for the local-AI features (parity-round-3
+// task 1.4, design D1/D3): streaming + SHA-256 + progress/cancel events.
+mod model_downloads;
 mod net;
 mod oauth;
 mod smtp;
@@ -21,6 +38,11 @@ mod smtp;
 mod storage;
 // OS secret-store commands for the credential-sealing key (review L1).
 mod secrets;
+// Local voice dictation (parity-round-3 design D3, task 7.1, whisper-rs):
+// the one `transcribe` command over the pinned ggml-base model. Feature-
+// gated — the handler registration below carries the same cfg attribute.
+#[cfg(feature = "voice")]
+mod voice;
 // One-Click List-Unsubscribe POSTs (RFC 8058).
 mod unsubscribe;
 mod updates;
@@ -137,6 +159,9 @@ pub fn run() {
         // AI assistance (task 4.1, design D1): the shared per-surface
         // rate limiter for ai_chat calls.
         .manage(ai::AiState::default())
+        // Pinned-model downloads (parity-round-3 task 1.4): cancel flags
+        // for the in-flight HuggingFace model files.
+        .manage(model_downloads::ModelDownloadsState::default())
         .setup(|app| {
             // System tray (task 1.2): a build failure is the
             // platform-without-tray path (Linux without appindicator) —
@@ -216,6 +241,27 @@ pub fn run() {
             secrets::credentials_key_os_load,
             secrets::credentials_key_os_delete,
             unsubscribe::unsubscribe_one_click_post,
+            model_downloads::download_model,
+            model_downloads::cancel_model_download,
+            backup::export_backup,
+            backup::verify_backup_archive,
+            backup::extract_backup_snapshot,
+            backup::replace_database_with_snapshot,
+            backup::finalize_replaced_database,
+            // Semantic-search embeddings (parity-round-3 task 6.1) — only
+            // registered with the heavy candle feature on; the macro
+            // applies per-entry cfg attributes to the match arms.
+            #[cfg(feature = "local-embeddings")]
+            embeddings::embed_texts,
+            // Local voice dictation (parity-round-3 task 7.1) — only
+            // registered with the whisper feature on; the macro applies
+            // per-entry cfg attributes to the match arms.
+            #[cfg(feature = "voice")]
+            voice::transcribe,
+            // Meeting RSVP ics grammar (parity-round-3 task 8.1): pure
+            // parse/build over strings — no SQL, no I/O.
+            ics::ics_parse_calendar,
+            ics::ics_build_reply,
         ])
         .on_page_load(|webview, payload| {
             if webview.label() == "main" && matches!(payload.event(), PageLoadEvent::Finished) {

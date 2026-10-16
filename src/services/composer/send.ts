@@ -157,6 +157,25 @@ export class FailedSendNotFoundError extends Error {
   }
 }
 
+/**
+ * The account is in the needs-reauth state ("auth-error" — a provider
+ * failure, or the post-restore flag task 5.4 sets: a backup snapshot
+ * carries no credentials, so every restored account must re-authenticate
+ * before it may send). Thrown BEFORE anything is queued; the composer
+ * surfaces it as a send error and the user routes through the existing
+ * re-auth dialog (switcher badge → Reauthenticate…, reauth.ts), which
+ * flips the account back to "active".
+ */
+export class ReauthRequiredError extends SendValidationError {
+  constructor(email: string) {
+    super(
+      `${email} needs to be signed in again before sending — ` +
+        "use “Re-authenticate…” in the account picker."
+    )
+    this.name = "ReauthRequiredError"
+  }
+}
+
 /** retryFailedSend for an op that is not parked in terminal 'failed'. */
 export class FailedSendNotRetryableError extends Error {
   constructor(opId: string, status: string) {
@@ -378,6 +397,14 @@ export async function sendComposerDraft(
   const executor = args.executor ?? getExecutor()
   const account = await getAccount(executor, accountId)
   if (!account) throw new SendAccountNotFoundError(accountId)
+
+  // Needs-reauth gate (task 5.4): an "auth-error" account — most notably
+  // one just restored from a credential-free backup — must re-authenticate
+  // before anything is queued. Thrown before every mutation, so the draft
+  // is untouched.
+  if (account.status === "auth-error") {
+    throw new ReauthRequiredError(account.email)
+  }
 
   // Shape-sanitized here, then VERIFIED against the account's aliases
   // table (resolveSendableFromAlias below): the selection came from the

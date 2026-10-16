@@ -1504,7 +1504,12 @@ function imapInboxThreads(): SeedThreadSpec[] {
           from: elin,
           age: DAY + 3 * HOUR,
           unread: true,
-          body: "Hej Ami! I collected the reunion photos — 214 of them. Best ten are attached; full album link follows once I have everyone's consent notes.",
+          body: "Hej Ami! I collected the reunion photos — 214 of them. A few of the best are attached; full album link follows once I have everyone's consent notes.",
+          attachments: [
+            attachment("reunion-01.jpg", "image/jpeg", 2_411_966),
+            attachment("reunion-02.jpg", "image/jpeg", 1_982_140),
+            attachment("reunion-03.jpg", "image/jpeg", 2_764_505),
+          ],
         },
       ],
     },
@@ -1516,6 +1521,9 @@ function imapInboxThreads(): SeedThreadSpec[] {
           from: oskar,
           age: DAY + 8 * HOUR,
           body: "NDA draft attached. Mutual, 3-year term, standard carve-outs. If the liability wording looks familiar it is because it borrows from your emailer agreement.",
+          attachments: [
+            attachment("nda-draft-mutual.pdf", "application/pdf", 318_772),
+          ],
         },
       ],
     },
@@ -1832,6 +1840,7 @@ export async function seedIfEmpty(executor: SqlExecutor): Promise<void> {
 
     await seedFolderSyncState(executor)
     await seedSettings(executor)
+    await seedSnippets(executor)
     await seedImageAllowlist(executor)
     await seedLocalDrafts(executor)
     await seedPendingOperation(executor)
@@ -2020,6 +2029,37 @@ async function seedSettings(executor: SqlExecutor): Promise<void> {
   await setSetting(executor, `signature:${IMAP_ACCOUNT_ID}`, {
     html: "<p>Best,</p><p><b>Ami Robin</b><br>amir@fastmail.com</p>",
   })
+}
+
+/**
+ * A few composer snippets (Settings → Snippets / the composer's "Insert
+ * snippet" menu) so the affordance has content to show in the demo —
+ * without these the menu only renders its "No snippets yet" empty state.
+ */
+async function seedSnippets(executor: SqlExecutor): Promise<void> {
+  const snippets = [
+    {
+      name: "Best regards",
+      body: "Best regards,\nAmi Robin",
+      shortcut: "breg",
+    },
+    {
+      name: "Meeting follow-up",
+      body: "Thanks for the meeting — quick recap of the decisions and next steps below. Shout if I misheard anything.",
+      shortcut: "followup",
+    },
+    {
+      name: "Availability this week",
+      body: "I have open slots Tuesday and Thursday afternoons — pick whichever works and I will send an invite.",
+      shortcut: "avail",
+    },
+  ]
+  for (const [index, snippet] of snippets.entries()) {
+    await executor.execute(
+      "INSERT INTO snippets (id, name, body, shortcut) VALUES ($1, $2, $3, $4)",
+      [`mock-snippet-${index + 1}`, snippet.name, snippet.body, snippet.shortcut]
+    )
+  }
 }
 
 async function seedImageAllowlist(executor: SqlExecutor): Promise<void> {

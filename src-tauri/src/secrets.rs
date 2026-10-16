@@ -115,6 +115,12 @@ pub fn credentials_key_os_delete() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The keychain-touching tests share ONE entry name, so they must not
+    /// run concurrently — cargo runs tests in parallel threads, and a
+    /// delete from one test racing another's set/get made the missing-
+    /// entry assertion flake.
+    static KEYCHAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A test key: 32 arbitrary-but-fixed bytes, base64.
     const TEST_KEY_B64: &str = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU=";
 
@@ -135,6 +141,8 @@ mod tests {
     fn roundtrip_when_the_os_store_is_available() {
         // CI Linux runners have no Secret Service daemon — skip honestly
         // instead of failing (the file fallback path is what runs there).
+        let _keychain =
+            KEYCHAIN_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if !store_available() {
             eprintln!("skipping: os secret store unavailable on this host");
             return;
@@ -162,6 +170,8 @@ mod tests {
         // delete returns Err — the commands layer maps unavailability for
         // the caller, so here we only assert the NoEntry semantics when
         // the store is present.
+        let _keychain =
+            KEYCHAIN_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if !store_available() {
             eprintln!("skipping: os secret store unavailable on this host");
             return;

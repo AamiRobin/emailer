@@ -30,9 +30,11 @@ import {
   testSmtpSettings,
 } from "@/services/account-flows"
 import type { ImapAccountConfig } from "@/services/account-flows"
+import type { HistoryWindowSetting } from "@/services/sync/history-window"
 import type { SecurityKind } from "@/services/email/types"
 import { ProviderIcon } from "@/components/providers/provider-icon"
 import { providerBrandName } from "@/components/providers/provider-brands"
+import { HistoryWindowField } from "./history-window-field"
 
 /**
  * Add-IMAP/SMTP flow UI (task 5.4): email + password first, then server
@@ -109,6 +111,8 @@ export function AddImapFlow({ onBack, onSuccess }: AddImapFlowProps) {
   const [identityError, setIdentityError] = useState<string | null>(null)
   const [discovered, setDiscovered] = useState(false)
   const [servers, setServers] = useState<ServerForm>(defaultServers)
+  const [historyWindow, setHistoryWindow] =
+    useState<HistoryWindowSetting>(null)
   const [tests, setTests] = useState<Record<Side, SideTestState>>(IDLE_BOTH)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -239,6 +243,7 @@ export function AddImapFlow({ onBack, onSuccess }: AddImapFlowProps) {
           email: email.trim(),
           password,
           config: toConfig(servers),
+          historyWindow,
         })
         onSuccess()
       } catch (error) {
@@ -270,6 +275,7 @@ export function AddImapFlow({ onBack, onSuccess }: AddImapFlowProps) {
         email: email.trim(),
         password,
         config: toConfig(servers),
+        historyWindow,
       })
       onSuccess()
     } catch (error) {
@@ -397,6 +403,12 @@ export function AddImapFlow({ onBack, onSuccess }: AddImapFlowProps) {
           onPortChange={(port) => patchServer({ smtpPort: port })}
           onSecurityChange={(security) => changeSecurity("smtp", security)}
           onTest={() => void runSideTest("smtp")}
+        />
+        <HistoryWindowField
+          id="imap-history-window"
+          value={historyWindow}
+          onChange={setHistoryWindow}
+          disabled={saving}
         />
         {saveError && (
           <p role="alert" className="text-sm text-destructive">

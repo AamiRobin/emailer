@@ -455,6 +455,32 @@ export interface FolderDeltaResult {
 }
 
 /**
+ * Window bounds for an INITIAL delta pull (parity-round-3 task 3.2, D6):
+ * `since` becomes the folder's `receivedDateTime ge` $filter — the one
+ * $filter form Graph documents for message delta queries — so the first
+ * enumeration never lists older mail; `until` (exclusive) has no
+ * server-side delta form, so the caller filters it client-side. Only the
+ * initial pull honors them: a deltaLink replay carries its own encoded
+ * query and must stay untouched (delta sync is never re-clamped).
+ */
+export interface FolderDeltaWindow {
+  since?: number
+  until?: number
+}
+
+/**
+ * `since` → the URL-encoded `$filter=receivedDateTime ge {iso}` term for
+ * the initial delta URL (undefined → ""). Midnight-UTC ISO of the
+ * boundary second — the same day-granular boundary the engines' client-
+ * side filter applies, so both grammars agree.
+ */
+export function graphSinceFilter(since: number | undefined): string {
+  if (since === undefined) return ""
+  const iso = new Date(since * 1000).toISOString().replace(/\.\d{3}Z$/, "Z")
+  return `&$filter=${encodeURIComponent(`receivedDateTime ge ${iso}`)}`
+}
+
+/**
  * Build the provider for one Microsoft account. Throws eagerly when the
  * account has no client id; the refresh-token check happens lazily on
  * first API call (decryption is async, the factory contract is sync).
@@ -467,7 +493,8 @@ export function createMicrosoftGraphProvider(
   /** Per-folder delta (the dedicated sync engine's seam, task 3.2). */
   syncFolderDelta(
     folder: string,
-    deltaLink: string | null
+    deltaLink: string | null,
+    window?: FolderDeltaWindow
   ): Promise<FolderDeltaResult>
 } {
   // OAuth-only: the imap-style password is unused (same as gmail).
@@ -583,7 +610,8 @@ export function createMicrosoftGraphProvider(
    */
   async function syncFolderDelta(
     folder: string,
-    deltaLink: string | null
+    deltaLink: string | null,
+    window?: FolderDeltaWindow
   ): Promise<FolderDeltaResult> {
     const removedIds: string[] = []
     const messages: NormalizedMessage[] = []
@@ -597,11 +625,16 @@ export function createMicrosoftGraphProvider(
       // `folder` is the folder PATH (the engine's cursor key), a
       // well-known name, a labels-table id, or a raw Graph id. An explicit
       // $top keeps the initial pull's pages full (Graph's default page is
-      // small enough to exhaust the page cap on large mailboxes).
+      // small enough to exhaust the page cap on large mailboxes). The
+      // history window's server-side clamp (task 3.2, D6): `receivedDateTime
+      // ge` is the only $filter Graph supports on message delta, and it
+      // applies to the INITIAL request only — query parameters ride the
+      // returned nextLink/deltaLink tokens untouched afterwards.
       const folderId = await resolveFolderId(folder)
       url =
         `me/mailFolders/${encodeURIComponent(folderId)}/messages/delta` +
-        `?$top=${DELTA_PAGE_SIZE}`
+        `?$top=${DELTA_PAGE_SIZE}` +
+        graphSinceFilter(window?.since)
     }
 
     // The last nextLink seen before the pass ended; on page-cap exhaustion

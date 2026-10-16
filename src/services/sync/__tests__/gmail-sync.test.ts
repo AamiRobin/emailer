@@ -30,7 +30,8 @@ import type {
   SendEmailResult,
 } from "../../email/types"
 import type { GmailSyncSummary } from "../gmail-sync"
-import { syncGmailAccount } from "../gmail-sync"
+import { backfillGmailHistory, syncGmailAccount } from "../gmail-sync"
+import { historyWindowBoundary, isBoundedFirstSync } from "../history-window"
 import { setJunkFilterEnabledPreference } from "../../settings/preferences"
 import {
   getSubscription,
@@ -155,7 +156,15 @@ class FakeGmailProvider implements EmailProvider {
     if (query.last === undefined) {
       throw new Error("fake gmail provider only enumerates via {last}")
     }
-    const all = [...this.messages.values()].sort((a, b) => a.date - b.date)
+    // The messages.list q clamp (after:/before: terms), simulated: only
+    // the window's date range is listed server-side.
+    let all = [...this.messages.values()].sort((a, b) => a.date - b.date)
+    if (query.since !== undefined) {
+      all = all.filter((message) => message.date >= query.since!)
+    }
+    if (query.until !== undefined) {
+      all = all.filter((message) => message.date < query.until!)
+    }
     return {
       messages: all.slice(-query.last).map(toNormalizedMessage),
       folderStatus: {
@@ -1586,10 +1595,7 @@ describe("gmail sync subscriptions", () => {
     // Detection never touches the notification count.
     expect(summary.newMessages).toBe(2)
 
-    const entries = await listSubscriptions(
-      harness.executor,
-      harness.accountId
-    )
+    const entries = await listSubscriptions(harness.executor, harness.accountId)
     expect(entries.map((entry) => entry.sender)).toEqual([
       "news@lists.example.com",
     ])
@@ -1637,3 +1643,225 @@ describe("gmail sync subscriptions", () => {
     expect(entry?.unsubscribedAt).toBe(150)
   })
 })
+
+// ---------------------------------------------------------------------------
+// History window (parity-round-3 task 3.2, design D6)
+// ---------------------------------------------------------------------------
+
+describe("gmail sync history window", () => {
+  let harness: TestHarness
+
+  beforeEach(async () => {
+    harness = await createHarness()
+  })
+
+  afterEach(() => {
+    harness.executor.close()
+  })
+
+  function seedMailbox(since: number): void {
+    // Boundary-relative fixture: two in-window and one older message.
+    harness.provider.addMessage(
+      message({
+        id: "601",
+        threadId: "t1",
+        date: since + 9_000,
+        subject: "Recent",
+      })
+    )
+    harness.provider.addMessage(
+      message({
+        id: "602",
+        threadId: "t2",
+        date: since + 9_500,
+        subject: "Newer",
+      })
+    )
+    harness.provider.addMessage(
+      message({
+        id: "603",
+        threadId: "t3",
+        date: since - 1_000,
+        subject: "Ancient",
+      })
+    )
+  }
+
+  it("a bounded window sends the after: boundary and stores only in-range mail", async () => {
+    await harness.executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", harness.accountId]
+    )
+    const expectedSince = historyWindowBoundary(
+      "3m",
+      Math.floor(Date.now() / 1000)
+    )!
+    seedMailbox(expectedSince)
+
+    const summary = await harness.sync()
+
+    expect(harness.provider.fetchCalls).toEqual([
+      { last: 500, since: expectedSince },
+    ])
+    // The old message never reached the engine (the fake's q clamp does
+    // what the real after: search term does); the engine-side clamp is
+    // proven in the next test.
+    expect(await storedIds(harness)).toEqual(["601", "602"])
+    expect(summary.mode).toBe("full")
+    expect(summary.newMessages).toBe(2)
+    // Bounded first sync: the indicator flag is recorded.
+    expect(await isBoundedFirstSync(harness.executor, harness.accountId)).toBe(
+      true
+    )
+  })
+
+  it("the engine-side clamp drops messages older than the boundary", async () => {
+    await harness.executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", harness.accountId]
+    )
+    const since = historyWindowBoundary("3m", Math.floor(Date.now() / 1000))!
+    // In-window messages relative to the computed boundary.
+    harness.provider.addMessage(
+      message({
+        id: "611",
+        threadId: "t611",
+        date: since + 1_000,
+        subject: "In window",
+      })
+    )
+    harness.provider.addMessage(
+      message({
+        id: "612",
+        threadId: "t612",
+        date: since - 1_000,
+        subject: "Out of window",
+      })
+    )
+
+    const summary = await harness.sync()
+
+    // 612 is dropped even though the fake (as any real server could with
+    // date drift) listed it: the client-side clamp is authoritative.
+    expect(await storedIds(harness)).toEqual(["611"])
+    expect(summary.newMessages).toBe(1)
+    expect(await isBoundedFirstSync(harness.executor, harness.accountId)).toBe(
+      true
+    )
+  })
+
+  it("null window keeps the unbounded enumeration and records no marker", async () => {
+    seedMailbox(historyWindowBoundary("3m", Math.floor(Date.now() / 1000))!)
+    const summary = await harness.sync()
+
+    expect(harness.provider.fetchCalls).toEqual([{ last: 500 }])
+    expect(await storedIds(harness)).toEqual(["601", "602", "603"])
+    expect(summary.newMessages).toBe(3)
+    expect(await isBoundedFirstSync(harness.executor, harness.accountId)).toBe(
+      false
+    )
+  })
+
+  it("the marker records first syncs only, not history-expiry re-enumerations", async () => {
+    seedMailbox(historyWindowBoundary("3m", Math.floor(Date.now() / 1000))!)
+    await harness.sync()
+    expect(await isBoundedFirstSync(harness.executor, harness.accountId)).toBe(
+      false
+    ) // unbounded first sync
+
+    // Expire the cursor: the needsFullSync pass re-enumerates (a backfill,
+    // not a first sync) and must stay a silent no-marker pass even under
+    // a window.
+    await harness.executor.execute(
+      "UPDATE accounts SET history_window = $1, gmail_history_id = $2 WHERE id = $3",
+      ["3m", "400", harness.accountId]
+    )
+    harness.provider.expiredCursors.add("400")
+    await harness.sync()
+    expect(await isBoundedFirstSync(harness.executor, harness.accountId)).toBe(
+      false
+    )
+  })
+
+  it("delta arrivals ignore the window (the boundary is download-only)", async () => {
+    await harness.executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", harness.accountId]
+    )
+    await harness.sync() // bounded first sync, cursor captured
+
+    // A message OLDER than the window arrives through the history delta
+    // (a backfilled label change, a delayed delivery) — it must store.
+    harness.provider.queueDeltaAdd(
+      message({
+        id: "621",
+        threadId: "t621",
+        date: 100,
+        subject: "Old but new here",
+      })
+    )
+    const summary = await harness.sync()
+
+    expect(summary.mode).toBe("delta")
+    expect(await storedIds(harness)).toContain("621")
+    expect(summary.newMessages).toBe(1)
+  })
+
+  it("backfillGmailHistory fetches ONLY a frozen range via after:/before: and never announces", async () => {
+    await harness.executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", harness.accountId]
+    )
+    const since = historyWindowBoundary("3m", Math.floor(Date.now() / 1000))!
+    seedMailbox(since)
+    await harness.sync() // bounded first sync: 601/602 stored, 603 skipped
+
+    // Widen 3m → ~4 months worth: the newly covered range [since-2000,
+    // since). 603 (since-1000) is now covered; 605 is still too old.
+    harness.provider.addMessage(
+      message({
+        id: "604",
+        threadId: "t604",
+        date: since - 1_500,
+        subject: "Widened",
+      })
+    )
+    harness.provider.addMessage(
+      message({
+        id: "605",
+        threadId: "t605",
+        date: since - 9_000,
+        subject: "Still too old",
+      })
+    )
+
+    const summary = await backfillGmailHistory(
+      {
+        executor: harness.executor,
+        provider: harness.provider,
+        accountId: harness.accountId,
+      },
+      { since: since - 2_000, until: since }
+    )
+
+    // The range fetch carried both search terms (the server-side clamp)…
+    expect(harness.provider.fetchCalls).toEqual([
+      { last: 500, since },
+      { last: 500, since: since - 2_000, until: since },
+    ])
+    // …and the client-side clamp stored exactly the promised range — 603
+    // and 604 in, 605 below `since` out; the delta cursor is untouched.
+    expect(await storedIds(harness)).toEqual(["601", "602", "603", "604"])
+    expect(summary.storedMessages).toBe(2)
+    expect(summary.newMessages).toBe(0) // a backfill never announces
+  })
+})
+
+/** Stored gmail ids for this harness's account, sorted. */
+async function storedIds(harness: TestHarness): Promise<string[]> {
+  const rows = await harness.executor.select<{ gmail_message_id: string }>(
+    "SELECT gmail_message_id FROM messages WHERE account_id = $1 ORDER BY gmail_message_id ASC",
+    [harness.accountId]
+  )
+  return rows.map((row) => row.gmail_message_id)
+}

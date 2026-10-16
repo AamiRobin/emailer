@@ -183,6 +183,43 @@ describe("aiChat transport", () => {
     expect(surfaces).toEqual(["categorization-assist", "smart-replies"])
   })
 
+  it("routes voiceProfile through the registry: cheap tier, wire name, usage row (parity-round-3 task 7.3/7.4)", async () => {
+    await seedActiveProvider()
+    // The surface's DEFAULT tier assignment is cheap; giving the cheap
+    // tier a model proves the resolution flows through the existing
+    // tier routing untouched.
+    await setTierModel(executor, "cheap", "qwen-cheap")
+    invokeMock.mockResolvedValue({
+      content: "profile json",
+      model: "qwen-cheap",
+      usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+    })
+    await aiChat({
+      system: "distill",
+      messages: [{ role: "user", content: "samples" }],
+      surface: "voiceProfile",
+    })
+    // Wire name: the Rust rate limiter's bucket key.
+    const args = invokeMock.mock.calls[0]![1] as Record<string, unknown>
+    expect(args.surface).toBe("voice-profile")
+    expect(args.model).toBe("qwen-cheap")
+    // Usage accounting: one completed call, one ai_usage row on the
+    // surface id (the existing per-surface accounting — nothing new).
+    await vi.waitFor(async () => {
+      const rows = await executor.select("SELECT * FROM ai_usage")
+      expect(rows.length).toBeGreaterThan(0)
+    })
+    const usage = await executor.select(
+      "SELECT surface, model, total_tokens FROM ai_usage"
+    )
+    expect(usage).toHaveLength(1)
+    expect(usage[0]).toMatchObject({
+      surface: "voiceProfile",
+      model: "qwen-cheap",
+      total_tokens: 120,
+    })
+  })
+
   it("sends the custom provider's base URL", async () => {
     await seedActiveProvider({
       kind: "custom",
@@ -378,6 +415,7 @@ describe("tier routing (parity-round-2 task 2.2)", () => {
       translation: "cheap",
       folderDigest: "cheap",
       assistant: "intelligent",
+      voiceProfile: "cheap",
     },
   }
 

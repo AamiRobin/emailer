@@ -4,7 +4,7 @@ import {
   categorizeIncomingMessages,
 } from "../categorization/ingestion"
 import { reconcileProvisionalSent } from "../composer/send"
-import { getAccount } from "../db/accounts"
+import { accountHistoryWindow, getAccount } from "../db/accounts"
 import type { AttachmentInput, ContactRef, MessageInput } from "../db/messages"
 import { upsertMessageByProviderId } from "../db/messages"
 import {
@@ -28,7 +28,17 @@ import type {
 } from "../email/types"
 import { ProviderAuthError } from "../email/types"
 import type { FolderDeltaResult } from "../email/microsoft-graph-provider"
-import { parseGraphDeltaCursor } from "../email/microsoft-graph-provider"
+import {
+  parseGraphDeltaCursor,
+  type FolderDeltaWindow,
+} from "../email/microsoft-graph-provider"
+import {
+  clampToRange,
+  clampToWindow,
+  historyWindowBoundary,
+  markBoundedFirstSync,
+  type HistoryBackfillRange,
+} from "./history-window"
 import { listEnabledRules } from "../rules/db"
 import {
   applyBlockedSenderFiling,
@@ -146,7 +156,8 @@ export async function syncMicrosoftAccount(
   const provider = plainProvider as EmailProvider & {
     syncFolderDelta(
       folderId: string,
-      deltaLink: string | null
+      deltaLink: string | null,
+      window?: FolderDeltaWindow
     ): Promise<FolderDeltaResult>
   }
   const onProgress = options.onProgress ?? ((): void => {})
@@ -163,6 +174,20 @@ export async function syncMicrosoftAccount(
     foldersTotal: folders.length,
     newMessages: 0,
   })
+
+  // History window (task 3.2, D6): the account's first-sync boundary,
+  // applied to the per-folder INITIAL pulls only (receivedDateTime ge —
+  // the one $filter form Graph supports on message delta), never to a
+  // deltaLink replay. The returned deltaLink is persisted as usual: its
+  // tokens carry the filter forward, and every genuinely NEW message is
+  // newer than the boundary by construction, so delta sync keeps
+  // delivering all new mail ("delta sync unaffected").
+  const since = historyWindowBoundary(
+    accountHistoryWindow(account),
+    Math.floor(Date.now() / 1000)
+  )
+  const initialPullWindow: FolderDeltaWindow | undefined =
+    since !== null ? { since } : undefined
 
   // The per-folder delta links ride the account's provider-private
   // cursor column (see the module comment).
@@ -183,25 +208,49 @@ export async function syncMicrosoftAccount(
       const labelId = labelIdsByPath.get(folder.path) ?? null
       const storedLink = cursorMap[folder.path] ?? null
 
-      let result = await provider.syncFolderDelta(folder.id, storedLink)
+      // The window rides the INITIAL pull only (no stored link yet): the
+      // server-side `receivedDateTime ge` filter. A stored-link replay is
+      // unfiltered — the boundary is never re-applied to delta sync.
+      let result = await provider.syncFolderDelta(
+        folder.id,
+        storedLink,
+        storedLink === null ? initialPullWindow : undefined
+      )
       // A rejected/expired link (410/400): full re-pull as a silent
-      // backfill (countNew false — a resync must not announce).
+      // backfill (countNew false — a resync must not announce). A
+      // re-initial pull re-clamps like any initial download.
       let backfill = false
       if (result.needsFullSync) {
         backfill = true
-        result = await provider.syncFolderDelta(folder.id, null)
+        result = await provider.syncFolderDelta(
+          folder.id,
+          null,
+          initialPullWindow
+        )
       }
       // A folder with no stored link runs its initial pull — a seed
       // pass that files everything but announces nothing.
       const seed = storedLink === null
       anyFullPull = anyFullPull || seed || backfill
+      // Bounded-first-sync marker (task 3.4): a bounded initial pull
+      // tells the mailbox UI older mail was skipped. Idempotent.
+      if (since !== null && (seed || backfill)) {
+        await markBoundedFirstSync(executor, accountId)
+      }
+      // The clamp's client-side half (the `ge` filter bounds the pull
+      // server-side; Graph's documented filter drift and any provider
+      // that ignored the term are covered here).
+      const messages =
+        seed || backfill
+          ? clampToWindow(result.messages, since)
+          : result.messages
 
       const outcome = await storeFolderMessages(
         executor,
         accountId,
         folder,
         labelId,
-        result.messages,
+        messages,
         account.email,
         {
           countNew: !seed && !backfill,
@@ -511,17 +560,12 @@ async function storeFolderMessages(
   // Ingestion hook — the imap engine's consumer chain, in the same
   // order, before the new-mail count is finalized (ruled-away mail and
   // filed/seeded messages never announce).
-  const outcomes = await runIngestionRules(
-    executor,
-    accountId,
-    newEvents,
-    {
-      rules: enabledRules,
-      schedules: deliverySchedules,
-      blockedSenders,
-      ...(junkFilter ? { junk: junkFilter } : {}),
-    }
-  )
+  const outcomes = await runIngestionRules(executor, accountId, newEvents, {
+    rules: enabledRules,
+    schedules: deliverySchedules,
+    blockedSenders,
+    ...(junkFilter ? { junk: junkFilter } : {}),
+  })
   await applyDeliveryHolds(executor, outcomes)
   await applyBlockedSenderFiling(executor, accountId, outcomes)
   await applyJunkFiling(executor, accountId, outcomes)
@@ -713,4 +757,100 @@ function nowSeconds(): number {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+// ---------------------------------------------------------------------------
+// Widening backfill (task 3.3, D6 — replayed through the offline queue)
+// ---------------------------------------------------------------------------
+
+export interface HistoryBackfillSummary {
+  /** Messages the range fetch ran upserts for. */
+  storedMessages: number
+  /** Messages that were genuinely new to the local store (always 0 — a
+   * backfill is a seed pass and never announces). */
+  newMessages: number
+  /** Folders whose range pull completed. */
+  foldersSynced: number
+}
+
+/**
+ * Fetch ONLY a widened window's newly covered range across every folder
+ * and store it silently. Called by the queue processor when a
+ * `history_backfill` op replays — the payload froze the range at enqueue
+ * time, so a restart/retry replays the exact promised range.
+ *
+ * Each folder runs a fresh INITIAL delta pull bounded below by
+ * `range.since` (the receivedDateTime ge filter) and clamped to the range
+ * client-side (`until` has no server-side delta grammar). The pull's
+ * deltaLink is deliberately discarded — the live per-folder cursors
+ * already stored on the account stay authoritative, and a filtered
+ * round's link must not displace them. Upserts are idempotent
+ * (provider-keyed, server-wins) and the pass stores with countNew false,
+ * so a replayed op converges without announcing.
+ */
+export async function backfillMicrosoftHistory(
+  options: MicrosoftSyncOptions,
+  range: HistoryBackfillRange
+): Promise<HistoryBackfillSummary> {
+  const { executor, provider: plainProvider, accountId } = options
+  if (!("syncFolderDelta" in plainProvider)) {
+    throw new Error(
+      `microsoft backfill: the provider for account ${accountId} does not ` +
+        "implement syncFolderDelta (register the MicrosoftGraphProvider)"
+    )
+  }
+  const provider = plainProvider as EmailProvider & {
+    syncFolderDelta(
+      folderId: string,
+      deltaLink: string | null,
+      window?: FolderDeltaWindow
+    ): Promise<FolderDeltaResult>
+  }
+  const onProgress = options.onProgress ?? ((): void => {})
+  const account = await getAccount(executor, accountId)
+  if (!account) {
+    throw new Error(`microsoft backfill: account ${accountId} not found`)
+  }
+
+  const folders = await provider.listFolders()
+  const labelIdsByPath = await ensureFolderLabels(executor, accountId, folders)
+
+  const summary: HistoryBackfillSummary = {
+    storedMessages: 0,
+    newMessages: 0,
+    foldersSynced: 0,
+  }
+  let foldersDone = 0
+  for (const folder of folders) {
+    // No per-folder isolation (the imap engine's backfill rationale):
+    // a failed folder fails the op so the queue retries it whole.
+    const result = await provider.syncFolderDelta(folder.id, null, {
+      since: range.since,
+    })
+    const fetched = clampToRange(result.messages, range)
+    if (fetched.length > 0) {
+      const outcome = await storeFolderMessages(
+        executor,
+        accountId,
+        folder,
+        labelIdsByPath.get(folder.path) ?? null,
+        fetched,
+        account.email,
+        { countNew: false, arrivalIsInbox: folder.specialUse === "inbox" }
+      )
+      summary.storedMessages += fetched.length
+      summary.newMessages += outcome.newMessages
+    }
+    summary.foldersSynced += 1
+    foldersDone += 1
+    onProgress({
+      phase: "messages",
+      folderPath: folder.path,
+      foldersDone,
+      foldersTotal: folders.length,
+      newMessages: summary.newMessages,
+    })
+  }
+  await updateSyncState(executor, accountId, { lastSyncAt: nowSeconds() })
+  return summary
 }

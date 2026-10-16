@@ -37,11 +37,13 @@ import {
   type LabelAdminService,
 } from "../labels/label-admin"
 import { postOneClickUnsubscribe } from "../security/unsubscribe"
+import { executeHistoryBackfill } from "./history-backfill"
 import { isOnline } from "../online"
 import { notifyScheduledSendsChanged } from "../../components/layout/use-scheduled-sends"
 import type {
   DraftDeleteOperation,
   DraftUpsertOperation,
+  HistoryBackfillOperation,
   QueueOperation,
   SendMimeOperation,
   UnsubscribePostOperation,
@@ -150,6 +152,15 @@ export interface ProcessQueueOptions {
   unsubscribePostForTest?: (
     accountId: string,
     op: UnsubscribePostOperation
+  ) => Promise<void>
+  /**
+   * Test seam for the history-window widening backfill (parity-round-3
+   * task 3.3, D6): replaces the drivers' range fetch only; dispatch and
+   * row lifecycle run for real. Never set in production code.
+   */
+  historyBackfillForTest?: (
+    accountId: string,
+    op: HistoryBackfillOperation
   ) => Promise<void>
   /** Base delay for the exponential retry backoff in ms (tests use 0). */
   backoffBaseMs?: number
@@ -337,6 +348,14 @@ async function processAccountBatch(
       ? options.unsubscribePostForTest(accountId, op)
       : postOneClickUnsubscribe(op.url)
 
+  // The history-window widening backfill (parity-round-3 task 3.3, D6):
+  // the drivers' range fetch is replaceable for tests (see
+  // historyBackfillForTest); the dispatch runs the real executor otherwise.
+  const runHistoryBackfill = (op: HistoryBackfillOperation): Promise<void> =>
+    options.historyBackfillForTest
+      ? options.historyBackfillForTest(accountId, op)
+      : executeHistoryBackfill(executor, accountId, provider, op)
+
   for (const row of ops) {
     // Defense in depth for the account-wide FIFO gate: if a mid-batch op
     // somehow carries a live backoff (its retry time is still in the
@@ -353,7 +372,8 @@ async function processAccountBatch(
         resolveAdmin,
         transmitMime,
         executeDraftOp,
-        postUnsubscribe
+        postUnsubscribe,
+        runHistoryBackfill
       )
       await markOperationDone(executor, row.id)
       // Task 10.2: the provider accepted the transmission — stamp the
@@ -580,7 +600,8 @@ async function executeOperation(
   executeDraftOp: (
     op: DraftUpsertOperation | DraftDeleteOperation
   ) => Promise<void>,
-  postUnsubscribe: (op: UnsubscribePostOperation) => Promise<void>
+  postUnsubscribe: (op: UnsubscribePostOperation) => Promise<void>,
+  runHistoryBackfill: (op: HistoryBackfillOperation) => Promise<void>
 ): Promise<void> {
   switch (op.kind) {
     case "send":
@@ -650,6 +671,13 @@ async function executeOperation(
       // performUnsubscribe while offline). No provider involvement — the
       // target is an arbitrary https list-owner URL carried by the payload.
       await postUnsubscribe(op)
+      return
+    case "history_backfill":
+      // Parity-round-3 task 3.3, D6: the widened history window's range
+      // fetch, replayed through the account's sync driver (see
+      // history-backfill.ts). No provider mutation — the drivers fetch
+      // and store; upserts make the replay idempotent.
+      await runHistoryBackfill(op)
       return
   }
 }

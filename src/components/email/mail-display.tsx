@@ -101,6 +101,7 @@ import {
 } from "@/services/calendar/ics-detect"
 import { SafeEmailFrame } from "@/components/email/safe-email-frame"
 import { AuthBadge } from "./auth-badge"
+import { MeetingInviteCard } from "./meeting-card"
 import { PgpPassphraseDialog } from "./pgp-passphrase-dialog"
 import { SourceViewDialog } from "./source-view-dialog"
 import { TranslateControl } from "./translate-control"
@@ -424,6 +425,16 @@ export function MailDisplay({
           forward; TranslateControl's disabled prop stays for the thread
           chrome to wire when one lands.) */}
       <TranslateControl message={message} />
+      {/* Meeting card (parity-round-3 task 8.2, design D5): SELF-gating —
+          messages whose text/calendar part carries an invitation render
+          the RSVP card above the body; non-invites render nothing (the
+          detection mounts per expanded message, so a non-invite open
+          costs one attachment-row read). */}
+      <MeetingInviteCard
+        message={message}
+        account={account}
+        attachmentDeps={attachmentDeps}
+      />
       <MessageBody
         message={message}
         imagesAllowed={imagesAllowed}

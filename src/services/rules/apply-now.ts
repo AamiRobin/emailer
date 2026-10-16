@@ -76,6 +76,9 @@ export async function countMatchingThreads(
   if (!parsed) return 0
   const { sql, params } = buildThreadSearchSql(accountId, parsed, {
     countOnly: true,
+    // relaxed: false (task 2.3, design D8) — a rule's count is the number
+    // the apply would act on; deterministic criteria never widen.
+    relaxed: false,
   })
   const rows = await executor.select<{ count: number }>(sql, params)
   return rows[0]?.count ?? 0
@@ -111,7 +114,11 @@ export async function applyRuleNow(
 
   // No limit option: the apply acts on the whole match set (see the module
   // comment) — the human confirmation is the bound, not a page size.
-  const { sql, params } = buildThreadSearchSql(accountId, parsed)
+  // relaxed: false (task 2.3, design D8): automation runs the criteria
+  // exactly as stored — the OR fallback is the search box's alone.
+  const { sql, params } = buildThreadSearchSql(accountId, parsed, {
+    relaxed: false,
+  })
   const matchedRows = await executor.select<{ id: string }>(sql, params)
 
   let applied = 0

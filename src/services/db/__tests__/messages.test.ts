@@ -345,3 +345,165 @@ describe("upsertMessageByProviderId", () => {
     expect(second.created).toBe(true)
   })
 })
+
+/**
+ * The folded FTS stamp (parity-round-3 task 2.1, design D8): the write
+ * path fills `messages.folded` — the diacritic-folded copy migration v20's
+ * rebuilt messages_fts indexes — on every insert and on every update that
+ * touches an FTS-covered column, with the same composer the bootstrap
+ * backfill runs (search/fts.ts composeFoldedText).
+ */
+describe("folded FTS stamp (task 2.1, design D8)", () => {
+  let executor: TestExecutor
+  let accountId: string
+  let threadId: string
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    accountId = await createAccount(executor, "gmail")
+    threadId = await createThread(executor, accountId)
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  /** The messages.folded value, plus proof the FTS index itself carries
+   * the folded column (column-filtered MATCH — the inverted index only
+   * has the column if the trigger wrote it). */
+  async function foldedOf(
+    messageId: string
+  ): Promise<{ column: string | null; indexed: number }> {
+    const column = await executor.select<{ folded: string | null }>(
+      "SELECT folded FROM messages WHERE id = $1",
+      [messageId]
+    )
+    const indexed = await executor.select<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM messages_fts
+       WHERE messages_fts MATCH $1 AND rowid = (
+         SELECT rowid FROM messages WHERE id = $2
+       )`,
+      ['folded: "be don dep"', messageId]
+    )
+    return {
+      column: column[0]?.folded ?? null,
+      indexed: indexed[0]?.count ?? 0,
+    }
+  }
+
+  it("insert stamps both raw and folded columns through the trigger", async () => {
+    await insertMessage(executor, {
+      id: "msg-folded",
+      threadId,
+      accountId,
+      date: at(0),
+      subject: "Bé Dọn Dẹp",
+      fromName: "Hoà Bình",
+      fromAddress: "hoa@vn.example",
+      to: [{ name: "José", email: "jose@vn.example" }],
+      bodyText: "Lịch họp tuần sau đã đổi.",
+      snippet: "Lịch họp tuần sau đã đổi.",
+    })
+
+    // foldText strips combining marks only; đ (d-with-stroke) has no
+    // decomposition and survives — the normalizer transliterates nothing.
+    // Newline-joined per field so no trigram straddles two fields.
+    const { column, indexed } = await foldedOf("msg-folded")
+    expect(column).toBe(
+      "Be Don Dep\nHoa Binh\nhoa@vn.example\n" +
+        '[{"name":"Jose","email":"jose@vn.example"}]\n' +
+        "Lich hop tuan sau đa đoi.\nLich hop tuan sau đa đoi."
+    )
+    // the messages_fts_ai trigger carried the folded value into the index
+    expect(indexed).toBe(1)
+  })
+
+  it("insert with no searchable text folds to the empty string", async () => {
+    await insertMessage(executor, {
+      id: "msg-bare",
+      threadId,
+      accountId,
+      date: at(0),
+    })
+    const rows = await executor.select<{ folded: string | null }>(
+      "SELECT folded FROM messages WHERE id = $1",
+      ["msg-bare"]
+    )
+    expect(rows[0]?.folded).toBe("")
+  })
+
+  it("update touching an FTS-covered column re-stamps folded over the merged row", async () => {
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: at(0),
+      subject: "Bé Dọn Dẹp",
+      bodyText: "Old body",
+      snippet: "Old body",
+    })
+    const rows = await executor.select<{ id: string }>(
+      "SELECT id FROM messages WHERE thread_id = $1",
+      [threadId]
+    )
+    const messageId = rows[0]!.id
+
+    // only body_text + snippet change — subject must still be folded in
+    await updateMessage(executor, messageId, {
+      bodyText: "New Be Don Dep body",
+      snippet: "New body",
+    })
+
+    const { column, indexed } = await foldedOf(messageId)
+    expect(column).toBe("Be Don Dep\nNew Be Don Dep body\nNew body")
+    // the messages_fts_au trigger rewrote the index row with the new fold
+    expect(indexed).toBe(1)
+  })
+
+  it("update of a non-FTS field leaves folded untouched", async () => {
+    await createMessage(executor, {
+      threadId,
+      accountId,
+      date: at(0),
+      subject: "Bé Dọn Dẹp",
+      bodyText: "Body",
+      snippet: "Body",
+    })
+    const rows = await executor.select<{ id: string }>(
+      "SELECT id FROM messages WHERE thread_id = $1",
+      [threadId]
+    )
+    const messageId = rows[0]!.id
+
+    await updateMessage(executor, messageId, { isRead: true })
+    const { column } = await foldedOf(messageId)
+    expect(column).toBe("Be Don Dep\nBody\nBody")
+  })
+
+  it("upsertMessageByProviderId re-stamps folded on the update path", async () => {
+    await upsertMessageByProviderId(executor, {
+      id: "up-1",
+      threadId,
+      accountId,
+      gmailMessageId: "gm-folded",
+      date: at(0),
+      subject: "Bé Dọn Dẹp",
+      bodyText: "First body",
+      snippet: "First body",
+    })
+
+    await upsertMessageByProviderId(executor, {
+      id: "up-ignored",
+      threadId,
+      accountId,
+      gmailMessageId: "gm-folded",
+      date: at(1),
+      subject: "Bé Dọn Dẹp",
+      bodyText: "Second Be Don Dep body",
+      snippet: "Second body",
+    })
+
+    const { column, indexed } = await foldedOf("up-1")
+    expect(column).toBe("Be Don Dep\nSecond Be Don Dep body\nSecond body")
+    expect(indexed).toBe(1)
+  })
+})

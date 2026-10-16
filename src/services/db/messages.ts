@@ -1,5 +1,6 @@
 import type { SqlExecutor } from "./executor"
 import { placeholders } from "./executor"
+import { composeFoldedText, type FoldedTextSource } from "../search/fts"
 
 /** `{ name?, email }` participant, serialized into the *_json columns. */
 export interface ContactRef {
@@ -135,11 +136,32 @@ export function parseContacts(json: string | null | undefined): ContactRef[] {
   }
 }
 
+/** The `folded` FTS source value for a message input: the fold of every
+ * FTS-covered field (task 2.1, design D8 — the same composer the bootstrap
+ * backfill runs, so forward-stamped and backfilled rows agree). */
+function foldedFor(
+  fields: Pick<
+    MessageInput,
+    "subject" | "fromName" | "fromAddress" | "to" | "bodyText" | "snippet"
+  >
+): string {
+  return composeFoldedText({
+    subject: fields.subject ?? null,
+    from_name: fields.fromName ?? null,
+    from_address: fields.fromAddress ?? null,
+    to_json: serializeContacts(fields.to),
+    body_text: fields.bodyText ?? null,
+    snippet: fields.snippet ?? null,
+  })
+}
+
 /**
  * Insert a message row (and optionally its attachment descriptors). FTS5
  * indexing happens via the messages_fts_ai trigger — never written to
- * directly. No upsert semantics here: use upsertMessageByProviderId for
- * sync flows, or check existence first for user-driven inserts.
+ * directly; the trigger copies `folded` (the diacritic-folded copy, task
+ * 2.1 design D8) from the row like every other indexed column. No upsert
+ * semantics here: use upsertMessageByProviderId for sync flows, or check
+ * existence first for user-driven inserts.
  */
 export async function insertMessage(
   executor: SqlExecutor,
@@ -151,10 +173,10 @@ export async function insertMessage(
       message_id_header, in_reply_to, references_header, subject, from_name,
       from_address, to_json, cc_json, bcc_json, date, snippet, body_html,
       body_text, headers, auth_results, size_estimate, is_read, is_flagged,
-      has_attachments, parts_json
+      has_attachments, parts_json, folded
     ) VALUES (
       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26
+      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
     )`,
     [
       input.id,
@@ -183,6 +205,7 @@ export async function insertMessage(
       boolToInt(input.isFlagged),
       boolToInt(input.hasAttachments),
       input.partsJson ?? null,
+      foldedFor(input),
     ]
   )
   if (input.attachments?.length) {
@@ -292,9 +315,24 @@ function encodePatch(key: keyof MessagePatch, patch: MessagePatch): unknown {
   }
 }
 
+/** Patch keys whose column feeds the FTS index — any of them in a patch
+ * means `folded` must be recomputed (task 2.1, design D8). */
+const FTS_SOURCE_KEYS: readonly (keyof MessagePatch)[] = [
+  "subject",
+  "fromName",
+  "fromAddress",
+  "snippet",
+  "bodyText",
+  "to",
+]
+
 /**
  * Partial update. Every UPDATE rewrites the FTS row via the
- * messages_fts_au trigger, so body/subject edits stay searchable.
+ * messages_fts_au trigger, so body/subject edits stay searchable. A patch
+ * touching an FTS-covered column also re-stamps `folded` (task 2.1, D8):
+ * the trigger copies the row's folded value wholesale, so it must reflect
+ * the merged row — the untouched fields are read back and folded together
+ * with the patch (SQL has no Unicode fold; the composer is TS-side).
  */
 export async function updateMessage(
   executor: SqlExecutor,
@@ -307,10 +345,44 @@ export async function updateMessage(
   if (!keys.length) return
   // placeholder numbers ascend by occurrence in the SQL text (see executor.ts)
   const sets = keys.map((key, index) => `${PATCH_COLUMNS[key]} = $${index + 1}`)
+  const params: unknown[] = keys.map((key) => encodePatch(key, patch))
+
+  if (keys.some((key) => FTS_SOURCE_KEYS.includes(key))) {
+    const rows = await executor.select<FoldedTextSource>(
+      `SELECT subject, from_name, from_address, to_json, body_text, snippet
+       FROM messages WHERE id = $1`,
+      [messageId]
+    )
+    const current = rows[0]
+    if (current) {
+      const merged: FoldedTextSource = {
+        subject: pick(patch.subject, current.subject),
+        from_name: pick(patch.fromName, current.from_name),
+        from_address: pick(patch.fromAddress, current.from_address),
+        to_json:
+          patch.to === undefined
+            ? current.to_json
+            : serializeContacts(patch.to),
+        body_text: pick(patch.bodyText, current.body_text),
+        snippet: pick(patch.snippet, current.snippet),
+      }
+      // folded takes the next placeholder; the id probe moves to the one
+      // after it (ascending by occurrence — folded's SET precedes WHERE).
+      sets.push(`folded = $${keys.length + 1}`)
+      params.push(composeFoldedText(merged))
+    }
+  }
+
   await executor.execute(
-    `UPDATE messages SET ${sets.join(", ")} WHERE id = $${keys.length + 1}`,
-    [keys.map((key) => encodePatch(key, patch)), messageId].flat()
+    `UPDATE messages SET ${sets.join(", ")} WHERE id = $${params.length + 1}`,
+    [...params, messageId]
   )
+}
+
+/** `patch !== undefined ? patch : current`, normalized to null — the
+ * merged FTS source field for a partial patch. */
+function pick<T>(patch: T | undefined, current: T): T {
+  return patch !== undefined ? patch : current
 }
 
 export async function deleteMessage(

@@ -179,10 +179,7 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
 /// fallback stays.
 fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(line_end) = body.windows(2).position(|window| window == b"\r\n") else {
-            break;
-        };
+    while let Some(line_end) = body.windows(2).position(|window| window == b"\r\n") {
         let size_line = String::from_utf8_lossy(&body[..line_end]);
         // Chunk extensions (";name=value") are ignored, per RFC 9112.
         let size = usize::from_str_radix(

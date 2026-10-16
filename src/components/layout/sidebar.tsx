@@ -41,7 +41,11 @@ import { useAccountStore } from "@/stores/account-store"
 import { useFolderCountsStore } from "@/stores/folder-counts-store"
 import { useThreadListStore } from "@/stores/thread-list-store"
 import type { FolderSelection, ViewSelection } from "@/stores/ui-store"
-import { useUiStore } from "@/stores/ui-store"
+import {
+  DEFAULT_VIEW,
+  useUiStore,
+  type ListScopeOverride,
+} from "@/stores/ui-store"
 import {
   buildLabelHierarchy,
   DEPTH_SPACERS,
@@ -236,14 +240,26 @@ export function Sidebar({ isCollapsed }: SidebarProps) {
   const enterCalendar = () => {
     setView({ kind: "calendar" })
   }
+  // Scope entries (unified / priority / nudges) only retitle the center
+  // list — from a full-pane surface (contacts, attachments, calendar,
+  // settings) there is no list to retitle, so the click would be a silent
+  // no-op. Land on the inbox folder first; the scope applies on top.
+  const enterListScope = (scope: ListScopeOverride): void => {
+    const ui = useUiStore.getState()
+    const kind = ui.view.kind
+    if (kind !== "folder" && kind !== "label" && kind !== "search") {
+      ui.setView(DEFAULT_VIEW)
+    }
+    ui.setListScope(scope)
+  }
   const enterUnifiedInbox = () => {
-    useUiStore.getState().setListScope({ kind: "unified" })
+    enterListScope({ kind: "unified" })
   }
   const enterPriorityInbox = () => {
-    useUiStore.getState().setListScope({ kind: "priority" })
+    enterListScope({ kind: "priority" })
   }
   const enterNudges = () => {
-    useUiStore.getState().setListScope({ kind: "nudges" })
+    enterListScope({ kind: "nudges" })
   }
   const activeAccount = useAccountStore(
     (state) =>

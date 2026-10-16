@@ -4,6 +4,7 @@ import {
   CalendarDays,
   ChevronLeft,
   ChevronRight,
+  ExternalLink,
   Pencil,
   RefreshCw,
   Trash2,
@@ -21,11 +22,17 @@ import {
 
 import { cn } from "@/lib/utils"
 import { EmptyState } from "@/components/email/empty-state"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import type { CalendarEvent } from "@/services/calendar/events"
 import { getCalendarEvent } from "@/services/calendar/events"
 import { deleteEvent } from "@/services/calendar/event-writes"
+import { extractJoinLink } from "@/services/calendar/join-links"
+import {
+  rsvpAnswerBadgeClass,
+  rsvpAnswerLabel,
+} from "@/services/calendar/rsvp"
 import { useOnlineStore } from "@/stores/online-store"
 import { useUiStore } from "@/stores/ui-store"
 import { EventDialog } from "./event-dialog"
@@ -444,6 +451,9 @@ function EventDetailsCard({
   onClose: () => void
 }) {
   const color = eventColor(event)
+  // Join link (parity-round-3 task 8.6): the same curated extractor the
+  // mail-side meeting card uses, over the same surfaces (location first).
+  const joinLink = extractJoinLink(event.location, event.description)
   return (
     <div
       data-testid="calendar-event-details"
@@ -455,24 +465,62 @@ function EventDetailsCard({
         style={{ backgroundColor: color.dot }}
       />
       <div className="grid min-w-0 flex-1 gap-0.5">
-        <p className="truncate text-sm font-semibold text-foreground">
-          {event.summary ?? "(untitled)"}
-          {event.status === "cancelled" && (
-            <span className="ml-1.5 text-xs font-normal text-muted-foreground">
-              (cancelled)
-            </span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <p className="truncate text-sm font-semibold text-foreground">
+            {event.summary ?? "(untitled)"}
+            {event.status === "cancelled" && (
+              <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+                (cancelled)
+              </span>
+            )}
+            {event.status === "tentative" && (
+              <span className="ml-1.5 text-xs font-normal text-muted-foreground">
+                (tentative)
+              </span>
+            )}
+          </p>
+          {/* RSVP status badge (task 8.6): mirrors the mail-side meeting
+              card's answer badge — the SAME mapping (rsvpAnswer*), so an
+              answer reads identically in mail and calendar. */}
+          {event.partstat && (
+            <Badge
+              variant="outline"
+              data-testid="calendar-event-partstat"
+              data-partstat={event.partstat}
+              className={cn(
+                "shrink-0",
+                rsvpAnswerBadgeClass(event.partstat)
+              )}
+            >
+              {rsvpAnswerLabel(event.partstat)}
+            </Badge>
           )}
-          {event.status === "tentative" && (
-            <span className="ml-1.5 text-xs font-normal text-muted-foreground">
-              (tentative)
-            </span>
-          )}
-        </p>
+        </div>
         <p className="text-xs text-muted-foreground tabular-nums">
           {formatEventRange(event)}
         </p>
         {event.location && (
           <p className="truncate text-xs text-foreground">{event.location}</p>
+        )}
+        {/* Join link: click-to-open in the OS browser (the reading pane's
+            external-navigation rule — http(s) routes through the opener). */}
+        {joinLink?.url && (
+          <Button
+            variant="outline"
+            size="xs"
+            className="mt-0.5 gap-1 self-start"
+            data-testid="calendar-event-join"
+            onClick={() => {
+              void import("@tauri-apps/plugin-opener")
+                .then(({ openUrl }) => openUrl(joinLink.url!))
+                .catch((error) => {
+                  console.warn("[calendar-view] join-link open failed", error)
+                })
+            }}
+          >
+            <ExternalLink className="size-3" />
+            Join — {joinLink.label}
+          </Button>
         )}
         {event.description && (
           <p className="line-clamp-3 text-xs text-muted-foreground">

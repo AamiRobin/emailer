@@ -2,6 +2,7 @@ import type { SqlExecutor } from "../db/executor"
 import { getExecutor } from "../db/executor"
 import { deleteAccount } from "../db/accounts"
 import { purgeAiCacheForAccount } from "../ai/cache"
+import { invalidateAccountIndex } from "../embeddings/loader"
 import { useAccountStore } from "../../stores/account-store"
 
 /**
@@ -33,5 +34,10 @@ export async function removeAccount(
   const executor = options?.executor ?? getExecutor()
   await purgeAiCacheForAccount(executor, accountId)
   await deleteAccount(executor, accountId)
+  // The thread_vectors rows cascade away with the account row (migration
+  // v21's FK, same mechanism as messages/threads — ai-assistance spec
+  // "Account deletion"); this only drops the in-memory matrix so a
+  // stale index never outlives its data.
+  invalidateAccountIndex(accountId)
   await useAccountStore.getState().reload()
 }

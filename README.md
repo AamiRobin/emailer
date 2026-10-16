@@ -62,6 +62,10 @@ the amber pill in some shots marks demo data.
   search and drafts work offline and sync resumes when you're back.
   Settings → Storage breaks down the disk usage, and a two-step reset
   deletes all local data — your mail servers are never touched
+- **Choose how much history downloads** — a per-account first-sync
+  window (last month, 3 or 6 months, a year, or everything) keeps a
+  big mailbox from arriving all at once; widening it later offers to
+  backfill the newly covered range in the background
 - **Unified inbox** — combine all accounts into one list (with per-account
   color attribution) or work per folder; priority inbox included.
   Profiles give groups of accounts a shared color that marks threads in
@@ -70,10 +74,13 @@ the amber pill in some shots marks demo data.
   `to:`, `label:`, `is:starred`, `larger:5m`, `before:2026-01-01` — and
   negations like `-from:newsletter@` or `-has:attachment`. Accent folding
   means "be don dep" still finds "Bé Dọn Dẹp", and when a plain query
-  finds nothing, a relaxed retry surfaces near-misses
+  finds nothing, a clearly flagged relaxed retry surfaces near-misses
 - **Find and inspect** — `Cmd/Ctrl+F` searches inside the open thread
   with a live match count, and View source shows the untouched RFC 822
   original, read-only with exact copy
+- **Printing** — the reading pane's printer action prints the open
+  message (or the whole thread) through a clean print view and the
+  system print dialog — saving a PDF included
 - **Reply tracking** — nudges resurface threads you haven't answered;
   follow-up reminders resurface threads that weren't answered *to you*
 - **Todos & tasks** — pull any thread into the sidebar task list (or let
@@ -81,22 +88,38 @@ the amber pill in some shots marks demo data.
   a one-click jump back to the thread
 - **Calendar** — a month/week/day view fed by connected Microsoft 365
   calendars; AI event extraction turns an open thread into a prefilled
-  event, and `.ics` attachments get an *Add to calendar* shortcut
+  event, and `.ics` attachments get an *Add to calendar* shortcut.
+  Meeting invitations render an RSVP card: Accept, Tentative or Decline
+  writes back to the calendar and replies to the organizer, while
+  cancellations and join links are handled; an optional per-account
+  reminder nudges you before the meeting starts
 - **Local automation** — rules (built by hand or from a plain-language
   description), junk filter, blocked senders and auto-archive run
   locally on every sync
 - **A composer that gets out of the way** — rich text, snippets,
   attachments, per-account signatures, and an undo-send window
+- **Voice dictation & your writing voice** — the composer's mic turns
+  speech into text entirely on-device (a one-time ~148 MB model
+  download, always cancellable), and an optionally learned writing
+  voice — distilled from your sent mail — lets drafts, proofreads and
+  smart replies sound like you
 - **Optional AI on your terms** — off until you enable it, then
   summaries, smart replies, Ask My Inbox, task/event extraction,
   translation and a catch-me-up folder digest — through the provider
   you configure, including a fully local Ollama. A docked assistant
   panel answers questions about your mailbox with read-only lookups and
-  inline sources. Per-surface model tiers, quick replies that never send
-  by themselves, and a token usage meter kept on this machine
+  inline sources, and an optional local semantic index (a one-time
+  ~128 MB model download) lets it find threads by meaning. Per-surface
+  model tiers, quick replies that never send by themselves, and a token
+  usage meter kept on this machine
 - **CardDAV contacts** — connect a Nextcloud, Radicale or provider
   address book; synced contacts autocomplete just like local ones, and
   the app password is sealed on the device
+- **Backup & restore** — export account metadata and settings, profiles,
+  rules, snippets, quick steps, signatures, saved searches and a
+  snapshot of your mail to one checksummed `.emailer-backup` file —
+  passwords are never in it. Restoring verifies first, then replaces or
+  merges, with a quick sign-in per account afterwards
 - **Encryption** — per-account OpenPGP keys with encrypt/decrypt in both
   the composer and the reader
 - **Attachment security** — optional VirusTotal hash lookup before an

@@ -27,6 +27,7 @@ import { useFolderCountsStore } from "../../stores/folder-counts-store"
 import { refreshThreadList } from "../../stores/thread-list-store"
 import { getTotalUnreadCount } from "../db/accounts"
 import { notifyNewMail } from "../notifications/new-mail-notifier"
+import { checkMeetingReminders } from "../notifications/meeting-reminders"
 import { updateUnreadBadge } from "../notifications/unread-badge"
 
 /**
@@ -380,6 +381,12 @@ function executePass(accountIds: string[]): Promise<SyncAllResult> {
             count: outcome.newMessages,
           })
         }
+        // Meeting-start reminders (task 8.5, design D5): the same
+        // fire-and-forget posture — the check applies its own gates
+        // (per-account lead, default OFF; permission; the once-per-event
+        // reminded_at guard) and never rejects, so it cannot stall or
+        // fail the pass.
+        void checkMeetingReminders(getExecutor(), account.id)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         if (error instanceof AccountSyncAuthError) {

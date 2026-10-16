@@ -40,10 +40,13 @@ import { DEFAULT_THREAD_SORT, threadSortOrderClause } from "../db/thread-sort"
  *    over the serialized arrays covers both names and addresses. `-to:` →
  *    NOT EXISTS.
  * 3. `subject:` → EXISTS matching messages.subject; `-subject:` → NOT
- *    EXISTS. All operator values use LIKE (case-insensitive for ASCII in
- *    SQLite, made explicit with COLLATE NOCASE on the left operand) —
- *    predictable substring semantics; only free text uses the FTS index,
- *    whose trigram tokenizer needs ≥3-char terms anyway.
+ *    EXISTS. Operator VALUES FOLD (task 2.2, design D8): each column is
+ *    matched by the raw COLLATE NOCASE LIKE (case-insensitive for ASCII,
+ *    predictable substring semantics) OR — when the value can bridge — an
+ *    accent GLOB over the same column (see foldedColumnMatch), so a
+ *    base-form value matches accented content and vice versa; only free
+ *    text uses the FTS index, whose trigram tokenizer needs ≥3-char terms
+ *    anyway. `label:` alone keeps exact-text matching.
  * 4. `has:attachment` → `threads.has_attachments = 1`; `-has:attachment`
  *    → `= 0`.
  * 5. `is:unread` → `threads.unread_count > 0`; `-is:unread` → `= 0`.
@@ -69,8 +72,8 @@ import { DEFAULT_THREAD_SORT, threadSortOrderClause } from "../db/thread-sort"
  *    then split by length; folded terms of ≥3 chars go through the
  *    external-content messages_fts trigram index (combined into one quoted
  *    MATCH string, so ONE message must match ALL terms — same semantics as
- *    the original search.ts — or ANY term with `freeTextMatch: "any"`, the
- *    relaxed fallback's OR mode), terms shorter than 3 chars can never
+ *    the original search.ts — or ANY term in the relaxed fallback's OR
+ *    mode (`relaxed: true`), terms shorter than 3 chars can never
  *    produce a trigram token, so each falls back to a LIKE scan over the
  *    same columns the FTS index covers (subject, from_name, from_address,
  *    to_json, body_text, snippet), bridged across accents by accentGlob.
@@ -87,9 +90,11 @@ import { DEFAULT_THREAD_SORT, threadSortOrderClause } from "../db/thread-sort"
  * except the excluded set — callers' empty-query short-circuits key off
  * isEmptyQuery, which counts negations as predicates.
  *
- * Ordering: `(pinned_at IS NOT NULL) DESC` leads every sort, then the
- * requested ThreadSortOption's fixed fragment (task 4.1 — search results
- * are a list scope too), then `threads.id ASC` as the tiebreaker.
+ * Ordering: relaxed mode leads with the matched-term-count score (task
+ * 2.3, design D8 — best matches first); otherwise `(pinned_at IS NOT
+ * NULL) DESC` leads every sort, then the requested ThreadSortOption's
+ * fixed fragment (task 4.1 — search results are a list scope too), then
+ * `threads.id ASC` as the tiebreaker.
  * threadSortOrderClause in db/thread-sort.ts owns the fragments — search
  * uses the non-inbox (plain last_message_at) date term. Muted/Done threads
  * are NOT filtered here: mute/done hide a thread from the inbox and badges
@@ -110,14 +115,19 @@ export interface SearchThreadsOptions {
    */
   countOnly?: boolean
   /**
-   * How the POSITIVE free-text terms combine (task 1.3, design D7):
-   * "all" (default) requires ONE message to carry every term; "any" — the
-   * relaxed fallback's OR mode — puts a thread in the results when ONE
-   * message carries ANY single term. Only the positive terms are loosened:
-   * each negated term keeps its own NOT EXISTS under either mode, so a
-   * mixed-polarity relaxed query still excludes what it excluded strictly.
+   * Relaxed any-term mode (task 2.3, design D8). Default FALSE — the
+   * strict AND semantics every caller has always had. ONLY the search
+   * box's fallback entry (searchThreadsWithRelaxedFallback) turns it on,
+   * and only after the strict query returned zero rows; deterministic
+   * contexts (rules via apply-now, saved searches, split tabs) pass
+   * `relaxed: false` at their call sites so a stored query never widens.
+   * Relaxed mode loosens ONLY the positive free-text terms — they OR
+   * together (a thread matches when one message carries any single term)
+   * — while each negated term keeps its own NOT EXISTS under either mode;
+   * the ORDER BY also gains a matched-term-count lead (best matches
+   * first), and the entry point caps the widened result set.
    */
-  freeTextMatch?: "all" | "any"
+  relaxed?: boolean
 }
 
 export interface BuiltThreadSearchSql {
@@ -161,18 +171,46 @@ export function buildThreadSearchSql(
     "threads.is_spam = 0",
   ]
 
+  /**
+   * The comparisons one column must satisfy for a FOLDED operator value
+   * (task 2.2, design D8): the raw COLLATE NOCASE LIKE the operators
+   * always ran (exact text, ASCII case-folded — unchanged behavior, so a
+   * `from:` value carrying GLOB metacharacters, or one that folds to
+   * empty, keeps working), plus — when the folded value can bridge
+   * accents (fts.ts accentGlob) — a GLOB whose bracket classes carry every
+   * precomposed spelling that folds back to the folded letters. Both
+   * directions of the mail-search "Accent-insensitive matching"
+   * requirement hold for operator values: `from:josé` meets "Jose"
+   * (folded classes hit the raw column) and `subject:resume` meets
+   * "Résumé" (the e-class carries é). The comparison deliberately stays
+   * on the RAW column — the folded blob column spans every indexed field,
+   * so matching it would let a `subject:` value hit a body. Binds one
+   * parameter per comparison, ascending with call order (see
+   * executor.ts); `label:` alone keeps exact-text matching.
+   */
+  const foldedColumnMatch = (column: string, value: string): string => {
+    params.push(`%${escapeLikePattern(value)}%`)
+    const comparisons = [
+      `${column} COLLATE NOCASE LIKE $${params.length} ESCAPE '\\'`,
+    ]
+    const glob = accentGlob(foldText(value))
+    if (glob !== null) {
+      params.push(glob)
+      comparisons.push(`${column} GLOB $${params.length}`)
+    }
+    return `(${comparisons.join(" OR ")})`
+  }
+
   // 1. from: — address OR display name of some message in the thread
   //    (positive: some message matches; negated: no message matches).
+  //    Values fold (task 2.2, design D8 — see foldedColumnMatch).
   const fromCondition = (value: string, negate: boolean): string => {
-    params.push(`%${escapeLikePattern(value)}%`)
-    const addressParam = `$${params.length}`
-    params.push(`%${escapeLikePattern(value)}%`)
-    const nameParam = `$${params.length}`
+    const addressMatch = foldedColumnMatch("m.from_address", value)
+    const nameMatch = foldedColumnMatch("m.from_name", value)
     const exists = `EXISTS (
       SELECT 1 FROM messages m
       WHERE m.thread_id = threads.id
-        AND (m.from_address COLLATE NOCASE LIKE ${addressParam} ESCAPE '\\'
-          OR m.from_name COLLATE NOCASE LIKE ${nameParam} ESCAPE '\\')
+        AND (${addressMatch} OR ${nameMatch})
     )`
     return negate ? `NOT ${exists}` : exists
   }
@@ -181,15 +219,14 @@ export function buildThreadSearchSql(
     conditions.push(fromCondition(value, true))
   }
 
-  // 2. to: — substring over the serialized recipient arrays.
+  // 2. to: — substring over the serialized recipient arrays (folded too).
   const toCondition = (value: string, negate: boolean): string => {
-    const likes = ["m.to_json", "m.cc_json", "m.bcc_json"].map((column) => {
-      params.push(`%${escapeLikePattern(value)}%`)
-      return `${column} COLLATE NOCASE LIKE $${params.length} ESCAPE '\\'`
-    })
+    const matches = ["m.to_json", "m.cc_json", "m.bcc_json"].map((column) =>
+      foldedColumnMatch(column, value)
+    )
     const exists = `EXISTS (
       SELECT 1 FROM messages m
-      WHERE m.thread_id = threads.id AND (${likes.join(" OR ")})
+      WHERE m.thread_id = threads.id AND (${matches.join(" OR ")})
     )`
     return negate ? `NOT ${exists}` : exists
   }
@@ -197,13 +234,11 @@ export function buildThreadSearchSql(
   for (const value of parsed.negatedTo)
     conditions.push(toCondition(value, true))
 
-  // 3. subject:
+  // 3. subject: (folded too)
   const subjectCondition = (value: string, negate: boolean): string => {
-    params.push(`%${escapeLikePattern(value)}%`)
     const exists = `EXISTS (
       SELECT 1 FROM messages m
-      WHERE m.thread_id = threads.id
-        AND m.subject COLLATE NOCASE LIKE $${params.length} ESCAPE '\\'
+      WHERE m.thread_id = threads.id AND ${foldedColumnMatch("m.subject", value)}
     )`
     return negate ? `NOT ${exists}` : exists
   }
@@ -328,23 +363,24 @@ export function buildThreadSearchSql(
   }
 
   // 10. Free text — positive terms in ONE EXISTS (a single message must
-  // match every term, or any single term in the relaxed "any" mode); each
+  // match every term, or any single term in the relaxed mode); each
   // negated term gets its own NOT EXISTS so a mixed-polarity query never
   // forces one message to carry both. Terms are FOLDED first (task 1.3,
-  // design D7) — the FTS index is written by the v13 tokenizer
-  // (`remove_diacritics 1`), which strips the same diacritics from the
-  // indexed text, so folded queries match accented content. Folding runs
-  // BEFORE the length split: a term that only sheds its marks ("dé" →
-  // "de") must fall to the LIKE scan a 2-char term belongs to, never into
-  // a trigram MATCH it can never satisfy. Sub-trigram terms run a GLOB
-  // over the RAW stored columns through accentGlob — one bracket class per
-  // character carrying every precomposed spelling that folds back to it —
-  // because SQLite has no way to fold a stored column in SQL; exact text
-  // always matches. The operator comparisons
-  // (from:/to:/subject:) deliberately keep exact-text LIKE semantics —
-  // they are filters on identifiers, not scored text, and label: MUST
-  // stay exact.
-  const anyMode = options?.freeTextMatch === "any"
+  // design D7) — and, since migration v20, the index also carries the
+  // folded copy of the text in its own column (task 2.1, design D8), so
+  // the unqualified MATCH runs against the RAW columns AND the folded one:
+  // a base-form term meets accented content even where the v13 tokenizer's
+  // remove_diacritics stops (it covers Latin-1/Extended-A only; the folded
+  // column was written with fts.ts foldText — every \p{Diacritic} mark).
+  // Folding runs BEFORE the length split: a term that only sheds its marks
+  // ("dé" → "de") must fall to the LIKE scan a 2-char term belongs to,
+  // never into a trigram MATCH it can never satisfy. Sub-trigram terms run
+  // a GLOB over the RAW stored columns through accentGlob — one bracket
+  // class per character carrying every precomposed spelling that folds
+  // back to it — because SQLite has no way to fold a stored column in SQL;
+  // exact text always matches. Operator values fold too, on their own
+  // columns (see foldedColumnMatch); label: MUST stay exact.
+  const anyMode = options?.relaxed === true
   const foldedFreeText = parsed.freeText.map(foldText)
   const longTerms = foldedFreeText.filter((term) => term.length >= 3)
   const shortTerms = foldedFreeText.filter((term) => term.length < 3)
@@ -431,6 +467,47 @@ export function buildThreadSearchSql(
   }
 
   const counting = options?.countOnly === true
+
+  // Relaxed ranking (task 2.3, design D8): when widening, each positive
+  // term becomes its own thread-level EXISTS and the ORDER BY leads with
+  // how many of them a thread satisfies — best matches first — before the
+  // normal sort's recency. The fragments re-bind their term params (each
+  // occurrence binds exactly once, ascending in text order — the score
+  // rides in ORDER BY, after every WHERE predicate). Dropped for countOnly
+  // (ordering cannot change a COUNT) and pointless for a single term (the
+  // score is constant); the relaxed retry only ever runs with 2+ terms.
+  let scoreLead = ""
+  if (anyMode && !counting && longTerms.length + shortTerms.length > 1) {
+    const scoreTerms: string[] = []
+    for (const term of longTerms) {
+      params.push(toFtsMatch([term]))
+      scoreTerms.push(
+        `EXISTS (
+          SELECT 1 FROM messages m
+          WHERE m.thread_id = threads.id AND m.rowid IN (
+            SELECT rowid FROM messages_fts WHERE messages_fts MATCH $${params.length}
+          )
+        )`
+      )
+    }
+    for (const term of shortTerms) {
+      const glob = accentGlob(term)
+      const matches = SHORT_TERM_LIKE_COLUMNS.map((column) => {
+        params.push(glob ?? `%${escapeLikePattern(term)}%`)
+        return glob !== null
+          ? `${column} GLOB $${params.length}`
+          : `${column} LIKE $${params.length} ESCAPE '\\'`
+      })
+      scoreTerms.push(
+        `EXISTS (
+          SELECT 1 FROM messages m
+          WHERE m.thread_id = threads.id AND (${matches.join(" OR ")})
+        )`
+      )
+    }
+    scoreLead = `(${scoreTerms.join(" + ")}) DESC, `
+  }
+
   const limitClause =
     !counting && options?.limit ? ` LIMIT $${params.length + 1}` : ""
   if (!counting && options?.limit) params.push(options.limit)
@@ -443,7 +520,8 @@ export function buildThreadSearchSql(
           "SELECT COUNT(*) AS count FROM threads"
         : "SELECT threads.* FROM threads",
       `WHERE ${conditions.join(" AND ")}`,
-      // Pinned-first leads every sort (mail-organization spec: pinned
+      // Relaxed mode leads with the matched-term count (above); otherwise
+      // pinned-first leads every sort (mail-organization spec: pinned
       // threads stay on top — search results are a list too); the trailing
       // fragment comes from the closed sort set (task 4.1). Muted/Done
       // mail deliberately stays searchable; only the ordering gains a term.
@@ -452,6 +530,7 @@ export function buildThreadSearchSql(
         ? []
         : [
             "ORDER BY " +
+              scoreLead +
               threadSortOrderClause(options?.sort ?? DEFAULT_THREAD_SORT) +
               limitClause,
           ]),

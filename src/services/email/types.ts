@@ -261,6 +261,24 @@ export interface FetchQuery {
   uidSet?: string
   /** Fetch the n most recent messages instead of an explicit set. */
   last?: number
+  /**
+   * Download-boundary hint (unix epoch seconds) for the history window
+   * (parity-round-3 task 3.2, design D6): messages OLDER than `since` are
+   * out of the requested set. Providers that can push the boundary
+   * server-side honor it there (gmail: an `after:` search term; microsoft:
+   * a `receivedDateTime ge` $filter on the folder list); providers without
+   * a server-side seam ignore it and the caller filters client-side. Only
+   * ever sent on initial-download passes — never on delta sync.
+   */
+  since?: number
+  /**
+   * Exclusive upper edge (unix epoch seconds) for a bounded RANGE fetch —
+   * the widening backfill's "newly covered range" upper bound. Absent on
+   * plain initial passes (open-ended downward). Same provider support
+   * matrix as `since` (gmail: a `before:` search term; elsewhere the
+   * caller filters client-side).
+   */
+  until?: number
 }
 
 /** Snapshot of a folder's state (from SELECT), used as sync cursor input. */

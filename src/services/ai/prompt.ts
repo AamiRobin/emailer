@@ -78,47 +78,46 @@ export function cleanUntrusted(text: string): string {
   return text.replace(INVISIBLE_CHARS, "")
 }
 
-/** The email-thread fence markers ([`fenceThread`]). */
-const FENCE_BEGIN = "=== BEGIN EMAIL THREAD ==="
-const FENCE_END = "=== END EMAIL THREAD ==="
-
 /**
- * Look-alike spellings of the markers — other case or "="-padding (the
- * exact literals are stripped below, so only these can survive) — that a
- * model skimming the body could still read as the fence's edge.
- */
-const FENCE_MARKER_LIKE =
-  /={2,}\s*(?:BEGIN|END)\s+EMAIL\s+THREAD\s*={2,}/i
-
-/**
- * Wrap untrusted email content in explicit fence markers so the prompt
- * delimits where the attacker-controlled data ends:
+ * Wrap UNTRUSTED content in explicit BEGIN/END fence markers under
+ * `label` so the prompt delimits where the attacker-controlled data ends:
  *
  * ```
- * === BEGIN EMAIL THREAD ===
+ * === BEGIN <label> ===
  * …content…
- * === END EMAIL THREAD ===
+ * === END <label> ===
  * ```
  *
  * A hostile body must never be able to close its own fence early, so:
  * (1) every literal occurrence of both markers is stripped from the
- * content BEFORE wrapping (a forged "=== END EMAIL THREAD ===" line in a
- * mail body simply vanishes), and (2) when a look-alike marker spelling
+ * content BEFORE wrapping (a forged "=== END <label> ===" line in the
+ * body simply vanishes), and (2) when a look-alike marker spelling
  * (other case or padding) still survives, the sentinel escalates one "="
  * per side until the chosen markers are verbatim-absent from the content
  * — the real fence edge stays unambiguous.
+ *
+ * `fenceThread` is the EMAIL THREAD instance every mail-content surface
+ * uses; other untrusted-derived blocks (the writing-voice profile built
+ * FROM mail, parity-round-3 task 7.3) fence under their own label.
  */
-export function fenceThread(content: string): string {
+export function fenceBlock(label: string, content: string): string {
+  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const baseBegin = `=== BEGIN ${label} ===`
+  const baseEnd = `=== END ${label} ===`
+  const markerLike = new RegExp(
+    `={2,}\\s*(?:BEGIN|END)\\s+${escapedLabel}\\s*={2,}`,
+    "i"
+  )
   // Defense 1: strip the literal sentinels first.
   const stripped = content
-    .split(FENCE_BEGIN)
+    .split(baseBegin)
     .join("")
-    .split(FENCE_END)
+    .split(baseEnd)
     .join("")
   // Defense 2: pick a sentinel pair the content cannot reproduce.
-  let begin = FENCE_BEGIN
-  let end = FENCE_END
-  if (FENCE_MARKER_LIKE.test(stripped)) {
+  let begin = baseBegin
+  let end = baseEnd
+  if (markerLike.test(stripped)) {
     begin = `=${begin}=`
     end = `=${end}=`
   }
@@ -127,6 +126,15 @@ export function fenceThread(content: string): string {
     end = `=${end}=`
   }
   return `${begin}\n${stripped}\n${end}`
+}
+
+/**
+ * Fence UNTRUSTED EMAIL CONTENT (thread bodies, message blocks) with the
+ * EMAIL THREAD markers — the one every mail-content surface carries (the
+ * system prompts pair it with UNTRUSTED_THREAD_NOTICE).
+ */
+export function fenceThread(content: string): string {
+  return fenceBlock("EMAIL THREAD", content)
 }
 
 /**

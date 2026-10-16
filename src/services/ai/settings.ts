@@ -76,9 +76,9 @@ const KEY_REQUIRED_KINDS: readonly AiProviderKind[] = [
 /**
  * The AI surfaces (spec "AI consent and data boundaries"); ids are the
  * config keys, each individually disableable. `quickReplies` (parity-round-2
- * task 2.4) and `ruleAssist` (task 2.5) are additive members of the same
- * vocabulary — every gate, toggle, tier assignment and usage row treats
- * them like the originals.
+ * task 2.4), `ruleAssist` (task 2.5), and — parity-round-3 task 7.3 —
+ * `voiceProfile` are additive members of the same vocabulary — every gate,
+ * toggle, tier assignment and usage row treats them like the originals.
  */
 export type AiSurfaceId =
   | "summaries"
@@ -93,6 +93,7 @@ export type AiSurfaceId =
   | "translation"
   | "folderDigest"
   | "assistant"
+  | "voiceProfile"
 
 export const AI_SURFACE_IDS: readonly AiSurfaceId[] = [
   "summaries",
@@ -107,6 +108,7 @@ export const AI_SURFACE_IDS: readonly AiSurfaceId[] = [
   "translation",
   "folderDigest",
   "assistant",
+  "voiceProfile",
 ]
 
 export function isAiSurfaceId(value: unknown): value is AiSurfaceId {
@@ -134,6 +136,7 @@ export const DEFAULT_SURFACES: AiSurfacesConfig = {
   translation: true,
   folderDigest: true,
   assistant: true,
+  voiceProfile: true,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +199,10 @@ export type AiSurfaceTiersConfig = Partial<Record<AiSurfaceId, AiTier>>
  * - `assistant` → intelligent (ai-assistant-panel): multi-turn mailbox
  *   synthesis is quality-critical reasoning, like askInbox — a wrong
  *   answer is the failure mode, not a slow one.
+ * - `voiceProfile` → cheap (parity-round-3 task 7.3, design D3): one
+ *   explicit user action distilling ≤30 sent bodies into a JSON style
+ *   descriptor — routine bulk generation on the cost-conscious tier,
+ *   like the summaries/rule-assist bucket.
  *
  * A plain Record over AiSurfaceId: adding a surface later is one entry
  * here (plus one in AI_SURFACE_IDS) and everything else keeps working.
@@ -213,6 +220,7 @@ export const DEFAULT_SURFACE_TIERS: Record<AiSurfaceId, AiTier> = {
   translation: "cheap",
   folderDigest: "cheap",
   assistant: "intelligent",
+  voiceProfile: "cheap",
 }
 
 /** One stored provider. `apiKeySealed` is the credentials envelope of

@@ -23,7 +23,11 @@ import {
   mockEntraTokenSuccess,
   wellKnownFolders,
 } from "../../email/__tests__/microsoft-fixtures"
-import { syncMicrosoftAccount } from "../microsoft-sync"
+import {
+  backfillMicrosoftHistory,
+  syncMicrosoftAccount,
+} from "../microsoft-sync"
+import { historyWindowBoundary, isBoundedFirstSync } from "../history-window"
 
 /**
  * The engine over the REAL provider, driven entirely through the injected
@@ -85,7 +89,12 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
   }
 
   async function storedMessages(): Promise<
-    { id: string; providerId: string | null; folder: string | null; threadId: string }[]
+    {
+      id: string
+      providerId: string | null
+      folder: string | null
+      threadId: string
+    }[]
   > {
     return executor.select(
       "SELECT id, gmail_message_id AS providerId, imap_folder AS folder, thread_id AS threadId FROM messages ORDER BY id ASC"
@@ -109,18 +118,26 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
       ),
     }))
     mock.on("GET", "me/mailFolders/archive/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1",
+      }),
     }))
     mock.on("GET", "AQMAprojects%3D%3D/messages/delta", () => ({
       json: deltaPage([], {
-        delta: "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1",
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1",
       }),
     }))
     mock.on("GET", "/me/messages/AAMk1%3D%3D?$select=", () => ({
       json: graphMessage({ id: "AAMk1==" }),
     }))
     mock.on("GET", "/me/messages/AAMk2%3D%3D?$select=", () => ({
-      json: graphMessage({ id: "AAMk2==", inReplyTo: "<root>", references: "<root>" }),
+      json: graphMessage({
+        id: "AAMk2==",
+        inReplyTo: "<root>",
+        references: "<root>",
+      }),
     }))
 
     const summary = await syncMicrosoftAccount({
@@ -173,10 +190,16 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
       json: graphMessage({ id: "AAMk1==" }),
     }))
     mock.on("GET", "me/mailFolders/archive/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1",
+      }),
     }))
     mock.on("GET", "AQMAprojects%3D%3D/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1",
+      }),
     }))
     const first = await syncMicrosoftAccount({
       executor,
@@ -219,7 +242,9 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
       if (request.url.includes("$deltatoken=v1")) {
         return {
           status: 410,
-          json: { error: { code: "ErrorSyncStateNotFound", message: "expired" } },
+          json: {
+            error: { code: "ErrorSyncStateNotFound", message: "expired" },
+          },
         }
       }
       if (request.url.includes("$deltatoken")) {
@@ -235,10 +260,16 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
       json: graphMessage({ id: "AAMk1==" }),
     }))
     mock.on("GET", "me/mailFolders/archive/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1",
+      }),
     }))
     mock.on("GET", "AQMAprojects%3D%3D/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1",
+      }),
     }))
 
     const summary = await syncMicrosoftAccount({
@@ -262,10 +293,16 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
       json: graphMessage({ id: "AAMk1==" }),
     }))
     mock.on("GET", "me/mailFolders/archive/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1",
+      }),
     }))
     mock.on("GET", "AQMAprojects%3D%3D/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1",
+      }),
     }))
 
     // Seed a local row for AAMk2== (synced on an earlier pass) whose
@@ -304,14 +341,18 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
     }))
     mock.on("GET", "me/mailFolders/archive/messages/delta", () => ({
       json: deltaPage([graphMessage({ id: "AAMka==" })], {
-        delta: "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1",
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1",
       }),
     }))
     mock.on("GET", "/me/messages/AAMka%3D%3D?$select=", () => ({
       json: graphMessage({ id: "AAMka==", parentFolderId: "AQMAarchive==" }),
     }))
     mock.on("GET", "AQMAprojects%3D%3D/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1",
+      }),
     }))
 
     const summary = await syncMicrosoftAccount({
@@ -364,10 +405,16 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
       }),
     }))
     mock.on("GET", "me/mailFolders/archive/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1",
+      }),
     }))
     mock.on("GET", "AQMAprojects%3D%3D/messages/delta", () => ({
-      json: deltaPage([], { delta: "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1" }),
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1",
+      }),
     }))
 
     await syncMicrosoftAccount({
@@ -385,5 +432,257 @@ describe("syncMicrosoftAccount (fixture-driven Graph)", () => {
     expect(attachments).toEqual([
       { filename: "report.pdf", provider_part_id: "att-x1" },
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// History window (parity-round-3 tasks 3.2/3.3, design D6)
+// ---------------------------------------------------------------------------
+
+describe("microsoft sync history window", () => {
+  let executor: TestExecutor
+  let mock: FetchMock
+  let accountId: string
+  /** The 3-month boundary the fixture dates anchor to. */
+  let since: number
+
+  beforeEach(async () => {
+    executor = createTestExecutor()
+    mock = createFetchMock()
+    clearMicrosoftTokenCache()
+    mockEntraTokenSuccess(mock)
+
+    await executor.execute(
+      "INSERT INTO accounts (id, type, email, status, oauth_client_id) VALUES ($1, $2, $3, $4, $5)",
+      ["acc-ms", "microsoft", "me@outlook.com", "active", "ms-client-123"]
+    )
+    accountId = "acc-ms"
+    since = historyWindowBoundary("3m", Math.floor(Date.now() / 1000))!
+
+    mock.on("GET", "/me/mailFolders?$top=100", () => ({
+      json: { value: wellKnownFolders() },
+    }))
+    mock.on("GET", "/me/mailFolders/inbox", () => ({
+      json: graphFolder({ id: "AQMAinbox==", displayName: "Inbox" }),
+    }))
+    mock.on("GET", "/me/mailFolders/archive", () => ({
+      json: graphFolder({ id: "AQMAarchive==", displayName: "Archive" }),
+    }))
+    mock.on("PATCH", "/me/messages/", () => ({ json: {} }))
+  })
+
+  afterEach(() => {
+    executor.close()
+  })
+
+  function buildProvider() {
+    return createMicrosoftGraphProvider(
+      microsoftAccount({ id: accountId }),
+      { password: "" },
+      {
+        fetchImpl: mock.fetch,
+        delayImpl: () => Promise.resolve(),
+        tokenEnvelope: microsoftEnvelope,
+      }
+    )
+  }
+
+  /** ISO at Graph's wire precision (milliseconds stripped), as the filter builds it. */
+  function iso(seconds: number): string {
+    return new Date(seconds * 1000).toISOString().replace(/\.\d{3}Z$/, "Z")
+  }
+
+  /** The encoded `$filter=` term the initial pull must carry for `seconds`. */
+  function sinceFilterTerm(seconds: number): string {
+    return `$filter=${encodeURIComponent(`receivedDateTime ge ${iso(seconds)}`)}`
+  }
+
+  /**
+   * The inbox's initial pull: one in-window message, one just below the
+   * boundary, one far below it. The handler returns ALL of them whatever
+   * filter arrived — the engine's client-side clamp must be the authority
+   * (Graph's documented filter drift).
+   */
+  function mockInboxInitialPull(): void {
+    const dated = (id: string, seconds: number) =>
+      graphMessage({
+        id,
+        receivedDateTime: iso(seconds),
+        hasAttachments: false,
+      })
+    mock.on("GET", "me/mailFolders/inbox/messages/delta", () => ({
+      json: deltaPage(
+        [
+          dated("AAMkin1==", since + 1_000),
+          dated("AAMkmid1==", since - 1_000),
+          dated("AAMkold1==", since - 3_000),
+        ],
+        { delta: INBOX_DELTA_LINK_V1 }
+      ),
+    }))
+    mock.on("GET", "/me/messages/AAMkin1%3D%3D?$select=", () => ({
+      json: dated("AAMkin1==", since + 1_000),
+    }))
+    mock.on("GET", "/me/messages/AAMkmid1%3D%3D?$select=", () => ({
+      json: dated("AAMkmid1==", since - 1_000),
+    }))
+    mock.on("GET", "/me/messages/AAMkold1%3D%3D?$select=", () => ({
+      json: dated("AAMkold1==", since - 3_000),
+    }))
+    mock.on("GET", "me/mailFolders/archive/messages/delta", () => ({
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages/delta?$deltatoken=arch1",
+      }),
+    }))
+    mock.on("GET", "AQMAprojects%3D%3D/messages/delta", () => ({
+      json: deltaPage([], {
+        delta:
+          "https://graph.microsoft.com/v1.0/me/mailFolders/AQMAprojects%3D%3D/messages/delta?$deltatoken=proj1",
+      }),
+    }))
+  }
+
+  function inboxDeltaCalls(): string[] {
+    return mock
+      .callsTo("me/mailFolders/inbox/messages/delta")
+      .map((call) => call.url)
+  }
+
+  async function storedProviderIds(): Promise<string[]> {
+    const rows = await executor.select<{ providerId: string | null }>(
+      "SELECT gmail_message_id AS providerId FROM messages WHERE account_id = $1 ORDER BY providerId ASC",
+      [accountId]
+    )
+    return rows.map((row) => row.providerId ?? "")
+  }
+
+  async function storedCursor(): Promise<Record<string, string>> {
+    const row = await getAccount(executor, accountId)
+    if (!row?.gmail_history_id) return {}
+    return JSON.parse(row.gmail_history_id) as Record<string, string>
+  }
+
+  it("a bounded window sends the receivedDateTime filter on the initial pull and stores only in-range mail", async () => {
+    await executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", accountId]
+    )
+    mockInboxInitialPull()
+
+    const summary = await syncMicrosoftAccount({
+      executor,
+      provider: buildProvider(),
+      accountId,
+    })
+
+    // The seed pull carried the server-side clamp...
+    expect(inboxDeltaCalls()[0]).toContain(sinceFilterTerm(since))
+    // ...but the client-side clamp is what stored exactly the in-window
+    // message (the handler answered with all three regardless).
+    expect(await storedProviderIds()).toEqual(["AAMkin1=="])
+    // A seed pass never announces; the bounded-first-sync marker records.
+    expect(summary.newMessages).toBe(0)
+    expect(await isBoundedFirstSync(executor, accountId)).toBe(true)
+  })
+
+  it("null window pulls unfiltered, stores everything, and records no marker", async () => {
+    mockInboxInitialPull()
+
+    const summary = await syncMicrosoftAccount({
+      executor,
+      provider: buildProvider(),
+      accountId,
+    })
+
+    expect(
+      inboxDeltaCalls().some((url) => url.includes("receivedDateTime"))
+    ).toBe(false)
+    expect(await storedProviderIds()).toEqual([
+      "AAMkin1==",
+      "AAMkmid1==",
+      "AAMkold1==",
+    ])
+    expect(summary.newMessages).toBe(0)
+    expect(await isBoundedFirstSync(executor, accountId)).toBe(false)
+  })
+
+  it("delta arrivals ignore the window (the boundary is download-only)", async () => {
+    await executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", accountId]
+    )
+    mockInboxInitialPull()
+    await syncMicrosoftAccount({
+      executor,
+      provider: buildProvider(),
+      accountId,
+    })
+
+    // An OLD-dated message arrives through the stored deltaLink — a
+    // backdated arrival delta sync must still store.
+    mock.on("GET", "$deltatoken=v1", () => ({
+      json: deltaPage(
+        [
+          graphMessage({
+            id: "AAMklate1==",
+            receivedDateTime: iso(since - 5_000),
+            hasAttachments: false,
+          }),
+        ],
+        { delta: INBOX_DELTA_LINK_V2 }
+      ),
+    }))
+    mock.on("GET", "/me/messages/AAMklate1%3D%3D?$select=", () => ({
+      json: graphMessage({
+        id: "AAMklate1==",
+        receivedDateTime: iso(since - 5_000),
+        hasAttachments: false,
+      }),
+    }))
+    const summary = await syncMicrosoftAccount({
+      executor,
+      provider: buildProvider(),
+      accountId,
+    })
+
+    expect(await storedProviderIds()).toContain("AAMklate1==")
+    expect(summary.newMessages).toBe(1)
+    expect((await storedCursor()).Inbox).toBe(INBOX_DELTA_LINK_V2)
+  })
+
+  it("backfillMicrosoftHistory fetches ONLY the frozen range and leaves the live cursors alone", async () => {
+    await executor.execute(
+      "UPDATE accounts SET history_window = $1 WHERE id = $2",
+      ["3m", accountId]
+    )
+    mockInboxInitialPull()
+    await syncMicrosoftAccount({
+      executor,
+      provider: buildProvider(),
+      accountId,
+    })
+    const cursorBefore = await storedCursor()
+
+    // Widen 3m → ~4 months worth: the newly covered range [since-2000,
+    // since). The sloppy server answers with everything again; only the
+    // mid message is inside the promised range.
+    const summary = await backfillMicrosoftHistory(
+      { executor, provider: buildProvider(), accountId },
+      { since: since - 2_000, until: since }
+    )
+
+    // The range pull filtered at the frozen lower bound...
+    const backfillCall = inboxDeltaCalls().find((url) =>
+      url.includes(sinceFilterTerm(since - 2_000))
+    )
+    expect(backfillCall).toBeDefined()
+    // ...and stored exactly the range (the until side has no server
+    // grammar — the client clamp is its only enforcement).
+    expect(await storedProviderIds()).toEqual(["AAMkin1==", "AAMkmid1=="])
+    expect(summary.storedMessages).toBe(1)
+    expect(summary.newMessages).toBe(0) // a backfill never announces
+    // The filtered round's deltaLink did not displace the live cursor.
+    expect(await storedCursor()).toEqual(cursorBefore)
   })
 })

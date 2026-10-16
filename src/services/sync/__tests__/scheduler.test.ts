@@ -685,6 +685,7 @@ describe("scheduler → new-mail notification and badge wiring", () => {
           status: "active",
           unreadCount: 0,
           lastSyncAt: 1_700_000_000,
+          historyWindow: null,
         },
       ],
       activeAccountId: id,

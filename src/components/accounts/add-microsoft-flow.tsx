@@ -17,6 +17,8 @@ import {
 } from "@/services/account-flows"
 import type { MicrosoftFlowStep } from "@/services/account-flows"
 import { OAUTH_LOOPBACK_PORT } from "@/services/account-flows"
+import type { HistoryWindowSetting } from "@/services/sync/history-window"
+import { HistoryWindowField } from "./history-window-field"
 
 /**
  * Add-Microsoft 365 flow UI (parity-round-2 task 3.5): registration help,
@@ -58,6 +60,8 @@ interface AddMicrosoftFlowProps {
 export function AddMicrosoftFlow({ onBack, onSuccess }: AddMicrosoftFlowProps) {
   const [clientId, setClientId] = useState("")
   const [validationError, setValidationError] = useState<string | null>(null)
+  const [historyWindow, setHistoryWindow] =
+    useState<HistoryWindowSetting>(null)
   const [working, setWorking] = useState(false)
   const [step, setStep] = useState<MicrosoftFlowStep>("consent")
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
@@ -90,6 +94,7 @@ export function AddMicrosoftFlow({ onBack, onSuccess }: AddMicrosoftFlowProps) {
     try {
       await addMicrosoftAccount({
         clientId: trimmed,
+        historyWindow,
         onProgress: setStep,
       })
       onSuccess()
@@ -202,6 +207,12 @@ export function AddMicrosoftFlow({ onBack, onSuccess }: AddMicrosoftFlowProps) {
             </p>
           )}
         </div>
+        <HistoryWindowField
+          id="microsoft-history-window"
+          value={historyWindow}
+          onChange={setHistoryWindow}
+          disabled={working}
+        />
         {errorMessage && (
           <p role="alert" className="text-sm text-destructive">
             {errorMessage}

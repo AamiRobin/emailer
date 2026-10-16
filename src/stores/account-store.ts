@@ -8,6 +8,10 @@ import {
 import { UNREAD_BADGE_THREAD_EXCLUSION } from "@/services/db/accounts"
 import type { SqlExecutor } from "@/services/db/executor"
 import { getExecutor } from "@/services/db/executor"
+import {
+  parseHistoryWindow,
+  type HistoryWindowSetting,
+} from "@/services/sync/history-window"
 import { useUiStore } from "@/stores/ui-store"
 
 /**
@@ -61,6 +65,19 @@ export interface AccountInfo {
   unreadCount: number
   /** Unix epoch seconds of the last completed sync, if ever synced. */
   lastSyncAt?: number | null
+  /**
+   * First-sync download boundary (parity-round-3 task 3.1, design D6):
+   * the stored history-window grammar, null = all history. Surfaced for
+   * the settings Accounts editor; the sync drivers read the row directly.
+   * Optional: accounts predating the setting have no value to surface.
+   */
+  historyWindow?: HistoryWindowSetting
+  /**
+   * Meeting-reminder lead in minutes (parity-round-3 task 8.5, design D5):
+   * null = reminders off. Surfaced for the settings Accounts editor; the
+   * reminder scheduler reads the row directly.
+   */
+  reminderLeadMinutes?: number | null
 }
 
 interface AccountState {
@@ -100,6 +117,8 @@ interface AccountRow {
   display_name: string | null
   status: string
   last_sync_at: number | null
+  history_window: string | null
+  reminder_lead_minutes: number | null
   is_active: number
 }
 
@@ -112,6 +131,8 @@ function toAccountInfo(row: AccountRow, unreadCount: number): AccountInfo {
     status: row.status === "auth-error" ? "auth-error" : "active",
     unreadCount,
     lastSyncAt: row.last_sync_at,
+    historyWindow: parseHistoryWindow(row.history_window),
+    reminderLeadMinutes: row.reminder_lead_minutes,
   }
 }
 
@@ -168,7 +189,8 @@ async function loadAccounts(
   effectiveColors: Record<string, string>
 }> {
   const rows = await executor.select<AccountRow>(
-    `SELECT id, type, email, display_name, status, last_sync_at, is_active
+    `SELECT id, type, email, display_name, status, last_sync_at,
+            history_window, reminder_lead_minutes, is_active
      FROM accounts
      ORDER BY created_at ASC, id ASC`
   )

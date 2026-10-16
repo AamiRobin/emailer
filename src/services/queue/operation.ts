@@ -54,6 +54,7 @@ export type OperationType =
   | "rename_folder"
   | "delete_folder"
   | "unsubscribe_post"
+  | "history_backfill"
 
 /** Shared discriminant field name for the union. */
 interface OperationBase {
@@ -229,6 +230,30 @@ export interface UnsubscribePostOperation extends OperationBase {
   url: string
 }
 
+/**
+ * Widening backfill for the per-account history window (parity-round-3
+ * task 3.3, design D6): queued when the user widens an existing account's
+ * window, and replayed through the account's sync driver to fetch ONLY
+ * the newly covered range [since, until) — unix seconds, frozen at ENQUEUE
+ * time exactly like a send_mime payload, so a restart/retry replays the
+ * exact promised range instead of recomputing a moving boundary.
+ *
+ * Idempotency by classification (like the label entity ops): the engines'
+ * upserts are provider-keyed and server-wins, so a crash-replayed range
+ * converges, and the engines store with countNew false — a backfill never
+ * announces. Ranges from successive widenings are deliberately NOT
+ * coalesced away: two pending ops may overlap or abut, and replaying both
+ * is always safe (deleting a pending earlier op could drop a range the
+ * later one no longer covers).
+ */
+export interface HistoryBackfillOperation extends OperationBase {
+  kind: "history_backfill"
+  /** Range start (unix seconds, inclusive) — the widened window's boundary. */
+  since: number
+  /** Range end (unix seconds, EXCLUSIVE); null = down to all history. */
+  until: number | null
+}
+
 export type QueueOperation =
   | SendOperation
   | SendMimeOperation
@@ -252,6 +277,7 @@ export type QueueOperation =
   | RenameFolderOperation
   | DeleteFolderOperation
   | UnsubscribePostOperation
+  | HistoryBackfillOperation
 
 /** Thrown when payload_json cannot be mapped back to a known operation. */
 export class OperationDeserializeError extends Error {
@@ -302,6 +328,8 @@ export function operationPayload(op: QueueOperation): unknown {
       return { folderName: op.folderName }
     case "unsubscribe_post":
       return { url: op.url }
+    case "history_backfill":
+      return { since: op.since, until: op.until }
     default:
       return { refs: op.refs }
   }
@@ -434,6 +462,25 @@ export function deserializeOperation(
         kind: "unsubscribe_post",
         url: payload.url as string,
       }
+    case "history_backfill": {
+      const since = payload.since as unknown
+      const until = payload.until as unknown
+      if (
+        typeof since !== "number" ||
+        !Number.isFinite(since) ||
+        !(until === null || (typeof until === "number" && Number.isFinite(until)))
+      ) {
+        throw new OperationDeserializeError(
+          "queued operation history_backfill has a corrupt range payload"
+        )
+      }
+      return {
+        accountId,
+        kind: "history_backfill",
+        since,
+        until,
+      }
+    }
     default:
       throw new OperationDeserializeError(
         `unknown queued operation type "${opType}"`
@@ -673,6 +720,19 @@ export function enqueueUnsubscribePost(
   op: Omit<UnsubscribePostOperation, "kind">
 ): Promise<string> {
   return enqueueOperation(executor, { ...op, kind: "unsubscribe_post" })
+}
+
+/**
+ * Queue a widened history window's backfill (task 3.3, D6). The range is
+ * frozen by the caller (the accounts editor) at change time — boundary
+ * values move with `now`, so recomputing them at replay would fetch the
+ * wrong slice.
+ */
+export function enqueueHistoryBackfill(
+  executor: SqlExecutor,
+  op: Omit<HistoryBackfillOperation, "kind">
+): Promise<string> {
+  return enqueueOperation(executor, { ...op, kind: "history_backfill" })
 }
 
 /** Fetch a queued operation by id and deserialize it. */

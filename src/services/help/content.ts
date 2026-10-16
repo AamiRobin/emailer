@@ -53,9 +53,9 @@ export interface HelpCard {
 export const SHORTCUTS_CARD_ID = "keyboard-shortcuts"
 
 /**
- * The whole help center, ordered by category. 37 cards across the six
+ * The whole help center, ordered by category. 42 cards across the six
  * categories, grounded in the shipped feature set (see README.md and the
- * velo-parity-roadmap + parity-round-2 proposals).
+ * velo-parity-roadmap + parity-round-2/3 proposals).
  */
 export const HELP_CARDS: ReadonlyArray<HelpCard> = [
   // ---------------------------------------------------------------------
@@ -115,6 +115,30 @@ export const HELP_CARDS: ReadonlyArray<HelpCard> = [
       "client id",
       "redirect",
       "azure",
+    ],
+  },
+  {
+    id: "history-window",
+    category: "Getting started",
+    title: "Choose how much mail to download",
+    body: [
+      "Big mailbox, small disk? When you add an account you can bound its first sync: last month, last 3 or 6 months, last year, or everything (the default). Messages older than the boundary stay on the server — reachable in your provider's own apps — while new mail always syncs as it arrives.",
+      "The pick lives on each account's row under Settings → Accounts too. Widening a window offers to fetch the newly covered range in the background, and an account that skipped older mail shows a small, dismissible notice at the top of its mailbox, so a partial download is never a surprise.",
+    ],
+    keywords: [
+      "history",
+      "window",
+      "download",
+      "first sync",
+      "initial sync",
+      "backfill",
+      "older mail",
+      "months",
+      "year",
+      "all mail",
+      "boundary",
+      "storage",
+      "mailbox size",
     ],
   },
   {
@@ -259,7 +283,7 @@ export const HELP_CARDS: ReadonlyArray<HelpCard> = [
     body: [
       "The search field speaks operators: from:, to:, label:, is:starred, is:unread, has:attachment, larger:5m, before:2026-01-01 — and negations like -from:newsletter@ or -has:attachment.",
       "Save a query as a saved search in the sidebar, or pin it as a split tab above the inbox. Splits understand rolling date tokens such as after:__TODAY-7D__, so the tab keeps itself current.",
-      "Search forgives accents, too: looking up “be don dep” still finds Bé Dọn Dẹp, because diacritics are folded away on both sides of the match. And when a plain-words query matches nothing, Emailer retries it in relaxed mode — threads matching any single term — and marks the list with a Relaxed search badge; queries with operators are always taken literally.",
+      "Search forgives accents, too: looking up “be don dep” still finds Bé Dọn Dẹp, because diacritics are folded away on both sides of the match. And when a plain-words query matches nothing, Emailer retries it in relaxed mode — threads matching any single term — and flags the list with a Showing broader results notice; queries with operators are always taken literally, and saved searches and rules never widen this way.",
     ],
     keywords: [
       "search",
@@ -440,16 +464,52 @@ export const HELP_CARDS: ReadonlyArray<HelpCard> = [
     category: "Reading & organizing",
     title: "Print a message",
     body: [
-      "With a thread open, press Cmd/Ctrl+P (or pick Print from the ⋯ menu) for a clean, print-ready layout — headers, bodies and the attachment list, without any app chrome. Your system print dialog can save a PDF just as easily as it prints paper.",
+      "With a thread open, the printer button in the reading pane's toolbar offers Print this message (the default) or Print whole thread — a clean, print-ready view opens and your system's print dialog takes it from there, where saving a PDF works just as well as paper. Cmd/Ctrl+P is the shortcut for the whole conversation.",
+      "The print view shows mail exactly as you read it: a blocked sender's remote images stay placeholders, and nothing in it is fetched from the network.",
     ],
     keywords: [
       "print",
       "printing",
+      "printer",
       "pdf",
       "paper",
       "hardcopy",
       "export",
       "shortcut",
+      "thread",
+    ],
+  },
+  {
+    id: "meeting-invites",
+    category: "Reading & organizing",
+    title: "Answer meeting invitations",
+    body: [
+      "When a message carries a calendar invitation, the reading pane renders it as a meeting card — title, time, location, organizer and a join link when there is one (Zoom, Google Meet, Teams, Webex or a dial-in number). Accept, Tentative and Decline sit right on the card, and they work even without a connected calendar.",
+      "An answer does two things: it updates the event on your calendar when the account's calendar source supports write-back, and it sends the organizer a standard iCalendar reply — queued like any other mail, so it still goes out if you answered offline. A cancelled meeting updates its card to say so, and recurring invites let you answer for one occurrence or the whole series.",
+      "Want a heads-up before a meeting starts? In Settings → Accounts, each account has a Reminders pick — 5 to 30 minutes before the start, once per event. It's off by default.",
+    ],
+    keywords: [
+      "meeting",
+      "invite",
+      "invitation",
+      "rsvp",
+      "accept",
+      "decline",
+      "tentative",
+      "calendar",
+      "ics",
+      "organizer",
+      "cancel",
+      "cancelled",
+      "zoom",
+      "teams",
+      "meet",
+      "webex",
+      "join link",
+      "occurrence",
+      "series",
+      "recurring",
+      "reminder",
     ],
   },
 
@@ -551,6 +611,33 @@ export const HELP_CARDS: ReadonlyArray<HelpCard> = [
     ],
   },
   {
+    id: "dictation",
+    category: "Composing",
+    title: "Dictate a message",
+    body: [
+      "The composer's mic button turns speech into text, inserted right at the cursor. The first time you use it, Emailer downloads a speech model (about 148 MB — the size is stated before anything starts, and the download can be cancelled); after that, dictation runs entirely on this machine and your voice is never uploaded. Click the mic again to insert the transcript, or the ✕ beside it to throw the recording away.",
+      "Under Settings → AI you can pin the spoken language (auto-detect is the default), and teach Emailer your writing voice: one click learns, from up to 30 recent sent messages, how you typically sound — tone, formality, your usual openings and sign-offs. Voiced drafts, proofreads and smart replies then follow it. Learning needs a configured AI provider and at least three sent messages, runs only when you click, and can be refreshed or deleted whenever you like.",
+    ],
+    keywords: [
+      "dictation",
+      "dictate",
+      "microphone",
+      "mic",
+      "voice",
+      "speech",
+      "speak",
+      "transcribe",
+      "transcription",
+      "whisper",
+      "writing voice",
+      "tone",
+      "style",
+      "formality",
+      "language",
+      "audio",
+    ],
+  },
+  {
     id: "snippets",
     category: "Composing",
     title: "Snippets and templates",
@@ -648,6 +735,32 @@ export const HELP_CARDS: ReadonlyArray<HelpCard> = [
       "privacy",
     ],
   },
+  {
+    id: "semantic-search",
+    category: "AI assistance",
+    title: "Ask your inbox by meaning",
+    body: [
+      "Turn on Semantic search under Settings → AI and the assistant gains a second way to find things: a language model on this machine builds a searchable index of your threads, so questions match by meaning, not just exact words — “that email about the venue change” lands even when no message says “venue”. Answers cite the threads they drew from, as always.",
+      "The model (about 128 MB) downloads once from Hugging Face — the size is shown before anything starts, and you can cancel or skip it entirely. Once it's in, indexing runs quietly in the background while you work, and your mail is never sent anywhere by it. Without the model nothing breaks: the assistant simply keeps its keyword lookups.",
+    ],
+    keywords: [
+      "semantic",
+      "meaning",
+      "ask my inbox",
+      "embedding",
+      "vector",
+      "rag",
+      "index",
+      "indexing",
+      "model",
+      "download",
+      "assistant",
+      "citations",
+      "hugging face",
+      "local",
+      "bge",
+    ],
+  },
 
   // ---------------------------------------------------------------------
   // Security & privacy
@@ -734,6 +847,32 @@ export const HELP_CARDS: ReadonlyArray<HelpCard> = [
       "portability",
       "formats",
       "transfer",
+    ],
+  },
+  {
+    id: "backup-restore",
+    category: "Security & privacy",
+    title: "Back up and restore everything",
+    body: [
+      "Settings → Backup & restore writes your setup to a single .emailer-backup file: account metadata and settings, profiles, rules, snippets, quick steps, signatures, saved searches, category overrides and a snapshot of your mail database. Every entry is checksummed, and passwords are never included — credentials stay sealed on this machine.",
+      "Restoring verifies the whole archive before touching anything, then asks how: Replace swaps this device's data for the archive's, while Merge adds only what isn't already here — and never message bodies, so merged accounts re-download their mail on their first sync. Because no passwords came along, accounts ask to sign in again afterwards, but restored mail reads offline right away, and a cancelled or failed restore leaves your existing data untouched.",
+    ],
+    keywords: [
+      "backup",
+      "restore",
+      "archive",
+      "emailer-backup",
+      "export",
+      "import",
+      "snapshot",
+      "migrate",
+      "new computer",
+      "checksum",
+      "replace",
+      "merge",
+      "re-auth",
+      "sign in",
+      "disaster recovery",
     ],
   },
   {

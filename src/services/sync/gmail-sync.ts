@@ -5,7 +5,12 @@ import {
 } from "../categorization/ingestion"
 import { syncGmailAliases } from "../aliases/sync"
 import { reconcileProvisionalSent } from "../composer/send"
-import { getAccount, toEmailAccount, updateSyncState } from "../db/accounts"
+import {
+  accountHistoryWindow,
+  getAccount,
+  toEmailAccount,
+  updateSyncState,
+} from "../db/accounts"
 import {
   findLabelByGmailId,
   getLabel,
@@ -36,6 +41,13 @@ import type {
   EmailProvider,
   NormalizedMessage,
 } from "../email/types"
+import {
+  clampToRange,
+  clampToWindow,
+  historyWindowBoundary,
+  markBoundedFirstSync,
+  type HistoryBackfillRange,
+} from "./history-window"
 import { gmailLabelColorImporter } from "../labels/gmail-label-colors"
 import { listEnabledRules } from "../rules/db"
 import {
@@ -295,6 +307,18 @@ async function runFullSync(
   const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
   const countNew = counts?.countNew ?? true
 
+  // History window (task 3.2, D6): the account's first-sync boundary
+  // clamps THIS enumeration only — the delta pass is never re-clamped.
+  // `cursorOverride === null` is the exact first-sync shape (the history-
+  // expiry path arrives with a fresh cursor in hand), so the bounded
+  // marker below records genuine bounded first syncs only.
+  const row = await getAccount(executor, accountId)
+  if (!row) {
+    throw new Error(`gmail sync: account ${accountId} not found`)
+  }
+  const window = accountHistoryWindow(row)
+  const since = historyWindowBoundary(window, nowSeconds())
+
   const labels = await ensureLabelsWithColors(options)
   onProgress({
     phase: "labels",
@@ -312,7 +336,16 @@ async function runFullSync(
       ? cursorOverride
       : (await provider.deltaSync(null)).nextCursor
 
-  const fetched = await collectFullSync(provider, batchSize)
+  const fetched = clampToWindow(
+    await collectFullSync(provider, batchSize, since),
+    since
+  )
+  if (since !== null && cursorOverride === null) {
+    // The bounded-first-sync marker (task 3.4): the account's first sync
+    // completed with a boundary, so the mailbox UI may tell the user that
+    // older mail was skipped. Idempotent; the dismissal is separate.
+    await markBoundedFirstSync(executor, accountId)
+  }
   const stored = await storeMessages(
     executor,
     accountId,
@@ -351,15 +384,78 @@ async function runFullSync(
 
 async function collectFullSync(
   provider: EmailProvider,
-  batchSize: number
+  batchSize: number,
+  /** First-sync boundary (unix seconds, exclusive below) — sent to the
+   * provider as an `after:` search term (the server-side clamp) and
+   * re-applied client-side by the caller. Null = unbounded. */
+  since: number | null
 ): Promise<NormalizedMessage[]> {
   // Single bounded recent window — see the module comment and the
   // DEFAULT_BATCH_SIZE note for why deeper paging is not possible through
   // the current EmailProvider surface.
   const page = await provider.fetchMessages(FULL_SYNC_SCOPE, {
     last: batchSize,
+    ...(since !== null ? { since } : {}),
   })
   return page.messages
+}
+
+// ---------------------------------------------------------------------------
+// Widening backfill (task 3.3, D6 — replayed through the offline queue)
+// ---------------------------------------------------------------------------
+
+export interface HistoryBackfillSummary {
+  /** Messages the range fetch ran upserts for. */
+  storedMessages: number
+  /** Messages that were genuinely new to the local store. */
+  newMessages: number
+}
+
+/**
+ * Fetch ONLY the newly covered range of a widened history window and
+ * store it silently. Called by the queue processor when a
+ * `history_backfill` op replays — the payload froze `since`/`until` at
+ * enqueue time, so a restart/retry replays the exact promised range.
+ *
+ * The pass is a backfill in the engine's established sense: upserts are
+ * idempotent (provider-keyed, server-wins) so a replay after a crash
+ * converges, and `countNew: false` means nothing announces. The delta
+ * cursor is deliberately untouched — the range sits below the live
+ * window, and overwriting the history id here could skip genuinely new
+ * mail. Labels are ensured first so the fetched messages' labelIds
+ * resolve for thread membership.
+ */
+export async function backfillGmailHistory(
+  options: GmailSyncOptions,
+  range: HistoryBackfillRange
+): Promise<HistoryBackfillSummary> {
+  const { executor, provider, accountId } = options
+  const onProgress = options.onProgress ?? ((): void => {})
+
+  const labels = await ensureLabelsWithColors(options)
+  const page = await provider.fetchMessages(FULL_SYNC_SCOPE, {
+    last: DEFAULT_BATCH_SIZE,
+    since: range.since,
+    ...(range.until !== null ? { until: range.until } : {}),
+  })
+  // Belt and braces: the after:/before: query already bounds the server
+  // result; the client-side clamp makes the stored set exact even where a
+  // provider ignored the terms (and applies `until`, which has no
+  // server-side grammar on every provider).
+  const fetched = clampToRange(page.messages, range)
+
+  const stored = await storeMessages(
+    executor,
+    accountId,
+    fetched,
+    labels.rowIdByKey,
+    { onProgress, mode: "full", countNew: false }
+  )
+  await updateSyncState(executor, accountId, { lastSyncAt: nowSeconds() })
+
+  // The honest processed count: every fetched message ran an upsert
+  // (created or server-wins refresh); the announcement count stays 0.
+  return { storedMessages: fetched.length, newMessages: stored.newMessages }
 }
 
 // ---------------------------------------------------------------------------

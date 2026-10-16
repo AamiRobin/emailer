@@ -45,14 +45,14 @@ describe("help catalog integrity", () => {
     }
   })
 
-  it("ships 18–38 cards across every category, including the shortcuts card", () => {
+  it("ships 18–42 cards across every category, including the shortcuts card", () => {
     // The upper bound keeps the catalog from bloating; parity-round-2
-    // (task 5.1) raised it from 30 to 38 when the new surfaces —
-    // find-in-message, source view, storage/reset, sounds, mark-as-read,
-    // AI tiers/usage/quick replies/NL rules, Microsoft 365, profiles,
-    // CardDAV — each earned a card or joined an existing one.
+    // (task 5.1) raised it from 30 to 38, parity-round-3 (task 9.1) from
+    // 38 to 42 when the new surfaces — history window, dictation +
+    // writing voice, semantic search, meeting RSVP, backup/restore —
+    // each earned a card or joined an existing one.
     expect(HELP_CARDS.length).toBeGreaterThanOrEqual(18)
-    expect(HELP_CARDS.length).toBeLessThanOrEqual(38)
+    expect(HELP_CARDS.length).toBeLessThanOrEqual(42)
     const categories = new Set<string>(HELP_CARDS.map((card) => card.category))
     for (const category of HELP_CATEGORIES) {
       expect(categories.has(category)).toBe(true)

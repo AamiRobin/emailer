@@ -367,6 +367,74 @@ export async function deleteMicrosoftEvent(
 }
 
 // ---------------------------------------------------------------------------
+// RSVP write-back (parity-round-3 task 8.3, design D5) — online-write contract
+//
+// The meeting-card accept/decline/tentative path: Graph's dedicated RSVP
+// ACTIONS (`events/{id}/accept|decline|tentativelyAccept`) with
+// `sendResponse: false` — the app sends its own iCalendar REPLY mail
+// through the send pipeline, so the Graph-side notification must stay
+// silent. Occurrence scoping: calendarView caches occurrences as their
+// OWN rows/ids, so the caller addresses the exact row (the occurrence's
+// id) or the series (the master's id, resolved via the event's
+// seriesMasterId below). Same fetch seam, 401-refresh and throttle
+// handling as the verbs above.
+// ---------------------------------------------------------------------------
+
+/** The read subset of GET /me/events/{id} the series resolution needs. */
+export interface MicrosoftEventAddressing {
+  id: string
+  type?: string
+  seriesMasterId?: string
+}
+
+/**
+ * GET one event's addressing fields — used by the RSVP flow to resolve a
+ * cached occurrence row to its SERIES MASTER id when the user answers
+ * the whole series (an occurrence id does not accept series-wide RSVP
+ * actions).
+ */
+export async function getMicrosoftEvent(
+  tokens: MicrosoftCalendarTokens,
+  eventId: string,
+  fetchImpl: FetchImpl = fetch
+): Promise<MicrosoftEventAddressing | null> {
+  return calendarRequest<MicrosoftEventAddressing | null>(
+    "GET",
+    `me/events/${encodeURIComponent(eventId)}?$select=id,type,seriesMasterId`,
+    { ...tokens, fetchImpl }
+  )
+}
+
+/**
+ * POST the RSVP action for one event: accept / tentativelyAccept /
+ * decline with `sendResponse: false` (the local app sends its own REPLY
+ * mail — see the section docs). Occurrence-vs-series: pass the
+ * OCCURRENCE's event id to answer that instance, the MASTER's id (see
+ * {@link getMicrosoftEvent}) to answer the whole series.
+ */
+export async function respondToMicrosoftEvent(
+  tokens: MicrosoftCalendarTokens,
+  eventId: string,
+  response: "yes" | "no" | "maybe",
+  fetchImpl: FetchImpl = fetch
+): Promise<void> {
+  const action =
+    response === "yes"
+      ? "accept"
+      : response === "no"
+        ? "decline"
+        : "tentativelyAccept"
+  await calendarRequest<null>(
+    "POST",
+    `me/events/${encodeURIComponent(eventId)}/${action}`,
+    { ...tokens, fetchImpl },
+    // The user's mail-side answer is the REPLY we queue ourselves; a
+    // second Graph-generated mail would send the organizer two answers.
+    { json: { sendResponse: false } }
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Payload building (form fields → Graph event body)
 // ---------------------------------------------------------------------------
 

@@ -10,6 +10,7 @@ import {
   CalendarClock,
   CircleHelp,
   Database,
+  DatabaseBackup,
   Filter,
   KeyRound,
   Keyboard,
@@ -38,6 +39,7 @@ import { AiSection } from "@/components/settings/ai-section"
 import { AppearanceSection } from "@/components/settings/appearance-section"
 import { AttachmentSecuritySection } from "@/components/settings/attachment-security-section"
 import { AutoArchiveSection } from "@/components/settings/auto-archive-section"
+import { BackupSection } from "@/components/settings/backup-section"
 import { CalendarSection } from "@/components/settings/calendar-section"
 import { BlockedSendersSection } from "@/components/settings/blocked-senders-section"
 import { CategoriesSection } from "@/components/settings/categories-section"
@@ -80,6 +82,7 @@ type SettingsSectionId =
   | "attachment-security"
   | "junk-filter"
   | "data-portability"
+  | "backup"
   | "storage"
   | "updates"
   | "desktop"
@@ -122,6 +125,9 @@ const SECTIONS: {
     label: "Import & export",
     icon: ArrowDownUp,
   },
+  // Portable backup/restore (parity-round-3 tasks 5.1–5.5, design D4):
+  // checksummed .emailer-backup export + replace/merge restore.
+  { id: "backup", label: "Backup & restore", icon: DatabaseBackup },
   // Storage usage + delete-all-local-data (tasks 1.6/1.7, settings spec).
   { id: "storage", label: "Storage", icon: Database },
   { id: "updates", label: "Updates", icon: RefreshCw },
@@ -175,6 +181,8 @@ function ActiveSection({ id }: { id: SettingsSectionId }) {
       return <JunkFilterSection />
     case "data-portability":
       return <DataPortabilitySection />
+    case "backup":
+      return <BackupSection />
     case "storage":
       return <StorageSection />
     case "updates":

@@ -17,6 +17,28 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# Heavy native features (parity-round-3 tasks 1.1, design D1/D3): both are
+# ON by default so release/CI builds ship them, and both compile OUT for
+# fast local iteration with `cargo check --no-default-features` (or
+# `--no-default-features --features local-embeddings` to keep just one).
+# CI legs build the default set so release validation is unaffected.
+[features]
+default = ["local-embeddings", "voice"]
+# Local semantic-search embeddings (design D1): candle runs the
+# BGE-small-en-v1.5 model (384-dim) on CPU for the assistant's
+# semantic_search tool. Frontend owns storage (migration v21
+# thread_vectors); Rust only computes `embed_texts` batches (task 6.1).
+local-embeddings = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+# Local voice dictation (design D3): whisper.cpp bindings behind the same
+# opt-out; the `transcribe` command lands in task 7.1.
+voice = ["dep:whisper-rs"]
+
 [dependencies]
 log = "0.4"
 tauri-plugin-log = "2"
@@ -56,6 +78,36 @@ base64 = "0.22"
 # lowercased address is the cache-file name and the gravatar.com URL key.
 # Already in the dependency tree transitively; only newly declared here.
 sha2 = "0.11"
+# Backup archive writer (parity-round-3 design D4): the `.emailer-backup`
+# format is a tar+gz of the manifest + the stripped DB snapshot. Rust only
+# touches file bytes — every SQL statement stays frontend-side.
+tar = "0.4"
+flate2 = "1"
+# Model downloader (parity-round-3 tasks 1.4, design D1/D3): streams
+# HuggingFace model files to a temp file with progress events and
+# SHA-256 verification before the atomic rename into place. reqwest is
+# already in the tree (tauri-plugin-updater); the `stream` feature powers
+# incremental reads of the response body.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+
+# ---------- Local-AI optional dependencies (see [features] above) ----------
+# Known-good candle 0.9 family, resolved together: candle-transformers 0.9
+# pairs with tokenizers 0.21; hf-hub 0.4 provides the pinned-revision
+# HuggingFace fetch the model download flow builds on.
+candle-core = { version = "0.9", optional = true }
+# candle-nn rides the local-embeddings feature: VarBuilder (the safetensors
+# loader BertModel::load consumes) lives here, and candle-transformers
+# already pulls the same 0.9 version into the tree.
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.21", optional = true }
+hf-hub = { version = "0.4", optional = true, features = ["tokio"] }
+# whisper.cpp bindings for local dictation (design D3); builds whisper.cpp
+# from source via the cc/cmake toolchain.
+whisper-rs = { version = "0.14", optional = true }
 lettre = { version = "0.11", default-features = false, features = [
     "smtp-transport",
     "tokio1-native-tls",

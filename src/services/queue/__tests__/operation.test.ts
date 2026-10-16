@@ -127,6 +127,21 @@ describe("queue operation model", () => {
       kind: "unsubscribe_post",
       url: "https://lists.example.com/u/123?token=abc",
     },
+    // Widening backfill (parity-round-3 task 3.3, design D6): both range
+    // shapes — a bounded previous window (until set) and widening to All
+    // (until null).
+    {
+      accountId: "acc-1",
+      kind: "history_backfill",
+      since: 1_760_000_000,
+      until: 1_768_000_000,
+    },
+    {
+      accountId: "acc-1",
+      kind: "history_backfill",
+      since: 0,
+      until: null,
+    },
   ]
 
   it("round-trips every operation through serialize/deserialize", () => {
@@ -187,6 +202,18 @@ describe("queue operation model", () => {
     expect(() => deserializeOperation("acc-1", "teleport", "{}")).toThrow(
       OperationDeserializeError
     )
+    // The history_backfill range is validated, not blindly cast: a corrupt
+    // since/until is a typed error, never a garbage replay range.
+    expect(() =>
+      deserializeOperation("acc-1", "history_backfill", '{"since":"x"}')
+    ).toThrow(OperationDeserializeError)
+    expect(() =>
+      deserializeOperation(
+        "acc-1",
+        "history_backfill",
+        '{"since":1,"until":"now"}'
+      )
+    ).toThrow(OperationDeserializeError)
   })
 
   it("maps a pending_operations row to the typed operation", () => {

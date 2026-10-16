@@ -14,6 +14,7 @@ import {
   type StyleProfile,
 } from "./style-profile"
 import { getOutputLanguage, isAiConfigured, isSurfaceEnabled } from "./settings"
+import { loadVoiceProfileApplication } from "./voice-profile"
 
 /**
  * Smart replies (task 4.5, ai-assistance spec "Writing-style smart
@@ -162,6 +163,13 @@ export async function generateSmartReply(
     return { ok: false, reason: "not-configured" }
   }
 
+  // Parity-round-3 task 7.4: the GLOBAL writing-voice profile (when
+  // learned) appends its fenced block AFTER the account style profile and
+  // folds its learnedAt into the cache identity — a learned/refreshed
+  // voice invalidates, and with no global profile the identity and prompt
+  // stay byte-identical to the pre-feature shape.
+  const voice = await loadVoiceProfileApplication(executor)
+
   // The context: the thread's last few messages, chronological, the last
   // one marked as the reply target.
   const context = messages.slice(-CONTEXT_MESSAGE_LIMIT)
@@ -179,6 +187,7 @@ export async function generateSmartReply(
       ...messages.map((message) => message.id),
       lastMessage.id,
       String(stored.builtAt),
+      ...(voice.cacheComponent !== null ? [voice.cacheComponent] : []),
     ].join(","),
   }
 
@@ -198,7 +207,9 @@ export async function generateSmartReply(
       // profile — additive to the surface's own instructions, absent when
       // the language is unset.
       system: withOutputLanguage(
-        `${SYSTEM_PROMPT}\n\n${formatProfile(stored.profile)}`,
+        `${SYSTEM_PROMPT}\n\n${formatProfile(stored.profile)}${
+          voice.prompt !== null ? `\n\n${voice.prompt}` : ""
+        }`,
         await getOutputLanguage(executor)
       ),
       messages: [

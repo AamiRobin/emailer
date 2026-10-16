@@ -2,22 +2,38 @@ import { format } from "date-fns"
 
 import { sanitizeEmailHtml } from "@/services/renderer/sanitize"
 import { isSenderAllowed } from "@/services/db/image-allowlist"
-import { getThreadWithMessages } from "@/services/db/threads"
+import {
+  getThreadWithMessages,
+  type ThreadWithMessages,
+} from "@/services/db/threads"
 import type { MessageRow } from "@/services/db/messages"
-import { getExecutor } from "@/services/db/executor"
+import { getExecutor, type SqlExecutor } from "@/services/db/executor"
+import { isTauriRuntime } from "@/services/desktop/popout"
+import {
+  openPrintWindow,
+  type PrintScope,
+} from "@/services/desktop/print-window"
 
 /**
- * Print support (task 1.10, spec mail-reading "Print message or thread").
+ * Print support (parity-round-3 D7, tasks 4.1–4.3; originally task 1.10).
  *
- * The design (D9) bypasses printing the app window: email bodies render
- * in sandboxed iframes and the app is full of chrome, so a print run
- * builds a standalone print document (headers + sanitized bodies, in
- * conversation order), writes it into a hidden iframe via `srcdoc`, and
- * invokes the OS print dialog on that iframe's document. The bodies go
- * through the same `sanitizeEmailHtml` policy as the reading pane — so a
- * blocked sender's remote images are placeholders at print time exactly
- * as on screen, and nothing new is fetched (the print document makes no
- * network requests; image srcs are inline or placeholder data URIs).
+ * Desktop: a print action opens the dedicated hidden-until-ready print
+ * window (services/desktop/print-window.ts, same plumbing as the composer
+ * pop-out) whose print-only route renders the print document — headers +
+ * sanitized bodies in conversation order, print-media CSS — and calls
+ * `window.print()` on load (print-app.tsx). Closing the window hands
+ * focus back to the reading pane.
+ *
+ * Plain-browser mock/dev (no window system): the same document renders in
+ * a hidden sandboxed iframe and the OS print dialog opens on that frame's
+ * document instead — the pre-window path, kept as the fallback.
+ *
+ * Both paths share buildPrintPayload: each body goes through the SAME
+ * `sanitizeEmailHtml` policy the reading pane displays with (the sender's
+ * image-allowlist decision decides `blockRemoteImages`) — so a blocked
+ * sender's remote images are placeholders at print time exactly as on
+ * screen, no script survives into the print document, and nothing new is
+ * fetched at print time (image srcs are inline or placeholder data URIs).
  */
 
 /** One message prepared for the print document. */
@@ -28,8 +44,14 @@ export interface PrintMessage {
   cc: string[]
   /** Unix seconds. */
   date: number
-  /** Already-sanitized body HTML (print-document.ts does not re-trust). */
+  /** Already-sanitized body HTML (neither print path re-trusts it). */
   bodyHtml: string
+}
+
+/** Everything the print document (window or iframe) renders. */
+export interface PrintPayload {
+  subject: string | null
+  messages: PrintMessage[]
 }
 
 /** Escape untrusted TEXT for interpolation into the print document. */
@@ -54,10 +76,33 @@ export function formatPrintAddress(
 }
 
 /**
- * The standalone print document: conversation order, per-message headers,
- * print-friendly styling, zero app chrome.
+ * The print document's CSS, shared verbatim by both print paths (the
+ * print window injects it; the iframe path embeds it in <head>): @page
+ * margins, paper-readable typography, header table, and page-break
+ * handling — a message's header block never strands at a page bottom and
+ * short messages avoid splitting altogether.
  */
-export function buildPrintHtml(
+export const PRINT_DOCUMENT_STYLES = [
+  "@page { margin: 18mm 16mm; }",
+  "body { font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; color: #111; margin: 0; background: #fff; }",
+  "h1 { font-size: 17px; margin: 0 0 16px; break-after: avoid; }",
+  ".message { margin: 0 0 20px; }",
+  ".headers { border-collapse: collapse; margin: 0 0 10px; border: 1px solid #ddd; break-inside: avoid; break-after: avoid; }",
+  ".headers th, .headers td { text-align: left; vertical-align: top; padding: 3px 8px; font-size: 12px; border-bottom: 1px solid #eee; }",
+  ".headers th { color: #666; font-weight: 600; white-space: nowrap; }",
+  ".body { overflow-wrap: break-word; }",
+  ".body img { max-width: 100%; }",
+  ".separator { border: none; border-top: 1px solid #ccc; margin: 20px 0; }",
+  "@media print { .message { break-inside: avoid-page; } }",
+].join("\n")
+
+/**
+ * The print document's <body> content: the subject heading plus one
+ * section per message (header table + sanitized body), separated with
+ * rules. Shared verbatim by both print paths so the window and the
+ * fallback iframe render the exact same markup.
+ */
+export function renderPrintBody(
   subject: string | null,
   messages: PrintMessage[]
 ): string {
@@ -100,7 +145,17 @@ export function buildPrintHtml(
     subject !== null && subject.trim() !== ""
       ? `<h1>${escapeHtml(subject)}</h1>`
       : ""
+  return heading + sections
+}
 
+/**
+ * The standalone print document (iframe fallback path): conversation
+ * order, per-message headers, print-friendly styling, zero app chrome.
+ */
+export function buildPrintHtml(
+  subject: string | null,
+  messages: PrintMessage[]
+): string {
   return [
     "<!doctype html>",
     "<html>",
@@ -110,22 +165,11 @@ export function buildPrintHtml(
     escapeHtml(subject ?? "Emailer print"),
     "</title>",
     "<style>",
-    "@page { margin: 18mm 16mm; }",
-    "body { font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; color: #111; margin: 0; }",
-    "h1 { font-size: 17px; margin: 0 0 16px; }",
-    ".message { margin: 0 0 20px; }",
-    ".headers { border-collapse: collapse; margin: 0 0 10px; border: 1px solid #ddd; }",
-    ".headers th, .headers td { text-align: left; vertical-align: top; padding: 3px 8px; font-size: 12px; border-bottom: 1px solid #eee; }",
-    ".headers th { color: #666; font-weight: 600; white-space: nowrap; }",
-    ".body { overflow-wrap: break-word; }",
-    ".body img { max-width: 100%; }",
-    ".separator { border: none; border-top: 1px solid #ccc; margin: 20px 0; }",
-    "@media print { .message { break-inside: avoid-page; } }",
+    PRINT_DOCUMENT_STYLES,
     "</style>",
     "</head>",
     "<body>",
-    heading,
-    sections,
+    renderPrintBody(subject, messages),
     "</body>",
     "</html>",
   ].join("")
@@ -133,9 +177,10 @@ export function buildPrintHtml(
 
 /**
  * Render the print document in a hidden iframe and open the OS print
- * dialog on it. The iframe is removed after the dialog closes (the
+ * dialog on it (the plain-browser fallback — the desktop path is the
+ * print window). The iframe is removed after the dialog closes (the
  * afterprint event, with a timeout fallback for engines that skip it).
- * The frame is sandboxed with `allow-same-origin` only — see the
+ * The frame is sandboxed with `allow-same-origin allow-modals` — see the
  * attribute below for why scripts are never allowed.
  */
 export function printHtml(html: string): void {
@@ -143,14 +188,16 @@ export function printHtml(html: string): void {
   iframe.setAttribute("aria-hidden", "true")
   // A srcdoc iframe without a sandbox attribute inherits the app's
   // origin, so any script surviving into the print document would run
-  // with full access to the host DOM/storage. `allow-same-origin` ONLY:
-  // it keeps the frame same-origin so contentWindow.print() and the
-  // afterprint listener stay callable (an opaque-origin sandbox would
-  // make the frame cross-origin and block both), while allow-scripts is
-  // deliberately absent — printing never needs scripts, and it must
-  // NEVER be added: allow-same-origin + allow-scripts together would
-  // hand untrusted markup script access to the app document.
-  iframe.setAttribute("sandbox", "allow-same-origin")
+  // with full access to the host DOM/storage. `allow-same-origin` keeps
+  // the frame same-origin so contentWindow.print() and the afterprint
+  // listener stay callable (an opaque-origin sandbox would make the frame
+  // cross-origin and block both); `allow-modals` is required on top —
+  // Chromium ignores print() inside a sandboxed frame without it. Scripts
+  // stay forbidden (allow-scripts is deliberately absent — it must NEVER
+  // be combined with allow-same-origin): printing needs no scripts, and
+  // with scripts out of the frame allow-modals exposes nothing — the only
+  // print() call is the host's own, made through contentWindow below.
+  iframe.setAttribute("sandbox", "allow-same-origin allow-modals")
   iframe.style.position = "fixed"
   iframe.style.right = "0"
   iframe.style.bottom = "0"
@@ -222,24 +269,25 @@ function plainTextBody(text: string): string {
 }
 
 /**
- * Print a thread: either the whole conversation or a single message.
- * Each body is sanitized with the sender's image-allowlist decision —
- * the exact policy the reading pane displays with (blocked images stay
- * placeholders; nothing is fetched at print time).
+ * The print payload for an already-loaded thread (the sanitizer handoff,
+ * task 4.3): each selected body runs through the reading pane's
+ * `sanitizeEmailHtml` with the sender's image-allowlist decision —
+ * blocked remote images become placeholders (original kept in
+ * `data-original-src`, exactly as displayed), scripts/styles/event
+ * handlers are stripped by the allowlist, and html-less messages fall
+ * back to their pre-wrapped plain text. Returns null when the scope
+ * selects no message (unknown id).
  */
-export async function printThread(
-  threadId: string,
-  scope: { kind: "thread" } | { kind: "message"; messageId: string }
-): Promise<void> {
-  const executor = getExecutor()
-  const loaded = await getThreadWithMessages(executor, threadId)
-  if (!loaded) return
-
+export async function buildPrintPayload(
+  executor: SqlExecutor,
+  thread: ThreadWithMessages,
+  scope: PrintScope
+): Promise<PrintPayload | null> {
   const messages: MessageRow[] =
     scope.kind === "thread"
-      ? loaded.messages
-      : loaded.messages.filter((message) => message.id === scope.messageId)
-  if (messages.length === 0) return
+      ? thread.messages
+      : thread.messages.filter((message) => message.id === scope.messageId)
+  if (messages.length === 0) return null
 
   const printMessages: PrintMessage[] = []
   for (const message of messages) {
@@ -266,6 +314,37 @@ export async function printThread(
       bodyHtml,
     })
   }
+  return { subject: thread.thread.subject, messages: printMessages }
+}
 
-  printHtml(buildPrintHtml(loaded.thread.subject, printMessages))
+/** Load a thread and build its print payload (the print window's boot
+ * step). Returns null when the thread is gone or the scope selects
+ * nothing. */
+export async function loadPrintPayload(
+  threadId: string,
+  scope: PrintScope
+): Promise<PrintPayload | null> {
+  const executor = getExecutor()
+  const loaded = await getThreadWithMessages(executor, threadId)
+  if (!loaded) return null
+  return buildPrintPayload(executor, loaded, scope)
+}
+
+/**
+ * Print a thread: either the whole conversation or a single message.
+ * Desktop (D7): opens the dedicated print window — the reading-pane
+ * print menu's two entries and the Cmd/Ctrl+P binding land here. Outside
+ * Tauri: the hidden-iframe fallback renders the same payload.
+ */
+export async function printThread(
+  threadId: string,
+  scope: PrintScope
+): Promise<void> {
+  if (isTauriRuntime()) {
+    await openPrintWindow(threadId, scope)
+    return
+  }
+  const payload = await loadPrintPayload(threadId, scope)
+  if (payload === null) return
+  printHtml(buildPrintHtml(payload.subject, payload.messages))
 }

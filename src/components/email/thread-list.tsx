@@ -89,6 +89,7 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { AccountBadge } from "./account-badge"
+import { BoundedSyncNotice } from "./bounded-sync-notice"
 import { EmptyState } from "./empty-state"
 import { FolderDigestDialog } from "./folder-digest-dialog"
 import { ProfileColorMarker } from "./profile-marker"
@@ -735,6 +736,19 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
   // that picks the across-accounts queries).
   const scope = useThreadListStore((state) => state.scope)
   const crossAccount = scope !== null && scopeSpansAccounts(scope)
+  // The bounded-first-sync notice (task 3.4) targets the ONE account a
+  // single-account scope pins (folder/label/search/account views and
+  // account-pinned splits); cross-account scopes hide it.
+  const scopedAccountId =
+    scope !== null && !crossAccount
+      ? scope.kind === "account" ||
+        scope.kind === "label" ||
+        scope.kind === "search"
+        ? scope.accountId
+        : scope.kind === "split" && scope.accountId !== undefined
+          ? scope.accountId
+          : null
+      : null
   const priority = useUiStore((state) => state.listScope?.kind === "priority")
   const accounts = useAccountStore((state) => state.accounts)
   // Profile color markers (task 4.5): the leading-edge bar per row reads
@@ -1286,22 +1300,24 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* List header (task 4.1): the relaxed-search badge leads (task 1.3),
-          then the group-by-sender toggle + the sort selector, right-aligned
-          like the pane header's controls above it. The pinned-first lead is
-          part of every store query, so the picker only changes the trailing
-          sort. The catch-me-up affordance (task 7.1) leads the right
-          cluster — it acts on the whole view, like the toggles beside it,
-          and self-hides when its gates don't hold. */}
+      {/* List header (task 4.1): the "showing broader results" notice
+          leads when the rows came from the relaxed any-term retry (task
+          2.3, design D8), then the group-by-sender toggle + the sort
+          selector, right-aligned like the pane header's controls above it.
+          The pinned-first lead is part of every store query, so the picker
+          only changes the trailing sort. The catch-me-up affordance (task
+          7.1) leads the right cluster — it acts on the whole view, like
+          the toggles beside it, and self-hides when its gates don't
+          hold. */}
       <div className="flex shrink-0 items-center gap-1 border-b px-2 py-1">
         {searchRelaxed && (
           <Badge
             variant="secondary"
             data-testid="search-relaxed-badge"
-            title='No thread matched every term — showing threads matching any single term of the query. Press Enter to re-run the exact search.'
+            title='No thread matched every term — showing threads matching any single term of the query, best matches first. Press Enter to re-run the exact search.'
             className="shrink-0 font-normal"
           >
-            Relaxed search
+            Showing broader results
           </Badge>
         )}
         <span className="ms-auto flex items-center gap-1">
@@ -1313,6 +1329,10 @@ export function ThreadList({ onStarToggle, onReply }: ThreadListProps) {
           <SortSelector />
         </span>
       </div>
+      {/* Bounded-first-sync notice (parity-round-3 task 3.4): only for a
+          single-account scope — the cross-account views have no one
+          account's window to describe. */}
+      <BoundedSyncNotice accountId={scopedAccountId} />
       {selectionActive && (
         <div
           data-testid="thread-selection-bar"

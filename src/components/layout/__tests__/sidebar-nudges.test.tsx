@@ -208,3 +208,37 @@ describe("sidebar nudges entry (task 14.1)", () => {
     expect(screen.queryByText("Nudges")).toBeNull()
   })
 })
+
+describe("scope entries navigate from full-pane surfaces (regression)", () => {
+  // The scope toggles only retitled the center list — clicked from
+  // Contacts/Attachments/Calendar/Settings they were silent no-ops and
+  // the user stayed stranded on the pane.
+  it("Unified inbox leaves Contacts and lands on the inbox list", async () => {
+    await seedAccounts(2)
+    useUiStore.setState({ view: { kind: "contacts" } })
+    renderSidebar()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Unified inbox" }))
+    expect(useUiStore.getState().view).toEqual(DEFAULT_VIEW)
+    expect(useUiStore.getState().listScope).toEqual({ kind: "unified" })
+  })
+
+  it("Priority leaves Settings and lands on the inbox list", async () => {
+    await seedAccounts(1)
+    useUiStore.setState({ view: { kind: "settings" } })
+    renderSidebar()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Priority" }))
+    expect(useUiStore.getState().view).toEqual(DEFAULT_VIEW)
+    expect(useUiStore.getState().listScope).toEqual({ kind: "priority" })
+  })
+
+  it("Nudges keeps the folder view untouched when already in the list", async () => {
+    await seedAccounts(1)
+    renderSidebar()
+
+    fireEvent.click(await screen.findByRole("button", { name: "Nudges" }))
+    expect(useUiStore.getState().view).toEqual(DEFAULT_VIEW)
+    expect(useUiStore.getState().listScope).toEqual({ kind: "nudges" })
+  })
+})

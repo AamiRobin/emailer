@@ -18,6 +18,42 @@ export function foldText(text: string): string {
   return text.normalize("NFD").replace(/\p{Diacritic}/gu, "")
 }
 
+/** The searchable-text shape the FTS index covers — the messages columns
+ * the external-content index reads (subject, from_name, from_address,
+ * to_json, body_text, snippet). Shared by the message write path (task
+ * 2.1 stamps `folded` at insert/update time) and the bootstrap backfill
+ * (services/search/folded-backfill.ts, pre-v20 rows). */
+export interface FoldedTextSource {
+  subject: string | null
+  from_name: string | null
+  from_address: string | null
+  to_json: string | null
+  body_text: string | null
+  snippet: string | null
+}
+
+/**
+ * The `folded` value for a message: foldText over every FTS-covered
+ * field, newline-joined so no trigram can straddle two fields. NULL/empty
+ * fields contribute nothing; a message with no searchable text at all
+ * folds to the empty string (indexed as no terms — same as today). The
+ * ONE composer both write sides share, so a forward-stamped row and its
+ * backfilled twin carry byte-identical folded text.
+ */
+export function composeFoldedText(row: FoldedTextSource): string {
+  return [
+    row.subject,
+    row.from_name,
+    row.from_address,
+    row.to_json,
+    row.body_text,
+    row.snippet,
+  ]
+    .filter((field): field is string => Boolean(field))
+    .map((field) => foldText(field))
+    .join("\n")
+}
+
 /**
  * Join terms as quoted FTS5 strings. Doubling embedded quotes keeps the
  * term inside one quoted string, so input like `foo"bar` can neither

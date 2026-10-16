@@ -35,32 +35,57 @@ describe("buildThreadSearchSql", () => {
     expect(build("from:a label:b xyz")).toEqual(build("from:a label:b xyz"))
   })
 
-  it("builds a from: EXISTS matching address OR name", () => {
+  it("builds a from: EXISTS matching address OR name, raw LIKE + accent GLOB", () => {
     const { sql, params } = build("from:alice")
+    // each column matches the raw value (COLLATE NOCASE LIKE — unchanged)
+    // OR its accent-bridged GLOB (task 2.2: the folded value's bracket
+    // classes meet "Alice", "Alison"... every spelling that folds back)
     expect(sql).toContain(
-      "m.from_address COLLATE NOCASE LIKE $2 ESCAPE '\\' " +
-        "OR m.from_name COLLATE NOCASE LIKE $3 ESCAPE '\\'"
+      "(m.from_address COLLATE NOCASE LIKE $2 ESCAPE '\\' " +
+        "OR m.from_address GLOB $3) " +
+        "OR (m.from_name COLLATE NOCASE LIKE $4 ESCAPE '\\' " +
+        "OR m.from_name GLOB $5)"
     )
-    expect(params).toEqual(["acc-1", "%alice%", "%alice%"])
+    expect(params).toEqual([
+      "acc-1",
+      "%alice%",
+      accentGlob("alice"),
+      "%alice%",
+      accentGlob("alice"),
+    ])
   })
 
   it("builds a to: EXISTS over to_json, cc_json and bcc_json", () => {
     const { sql, params } = build("to:bob@corp.example")
     expect(sql).toContain("m.to_json COLLATE NOCASE LIKE $2")
-    expect(sql).toContain("m.cc_json COLLATE NOCASE LIKE $3")
-    expect(sql).toContain("m.bcc_json COLLATE NOCASE LIKE $4")
+    expect(sql).toContain("m.cc_json COLLATE NOCASE LIKE $4")
+    expect(sql).toContain("m.bcc_json COLLATE NOCASE LIKE $6")
+    // each column binds the raw LIKE + the accent GLOB (folded operators)
     expect(params).toEqual([
       "acc-1",
       "%bob@corp.example%",
+      accentGlob("bob@corp.example"),
       "%bob@corp.example%",
+      accentGlob("bob@corp.example"),
       "%bob@corp.example%",
+      accentGlob("bob@corp.example"),
     ])
   })
 
   it("builds a subject: EXISTS over messages.subject", () => {
     const { sql, params } = build("subject:report")
     expect(sql).toContain("m.subject COLLATE NOCASE LIKE $2")
-    expect(params).toEqual(["acc-1", "%report%"])
+    expect(sql).toContain("m.subject GLOB $3")
+    expect(params).toEqual(["acc-1", "%report%", accentGlob("report")])
+  })
+
+  it("keeps operator values with GLOB metacharacters on the LIKE path", () => {
+    // accentGlob refuses * ? [ ] ^ — the comparison degrades to the raw
+    // escaped LIKE alone (unchanged pre-folding behavior)
+    const { sql, params } = build('from:"a*b"')
+    expect(sql).toContain("m.from_address COLLATE NOCASE LIKE $2")
+    expect(sql).not.toContain("m.from_address GLOB")
+    expect(params).toEqual(["acc-1", "%a*b%", "%a*b%"])
   })
 
   it("builds flag operators over the thread cache columns", () => {
@@ -85,10 +110,14 @@ describe("buildThreadSearchSql", () => {
   })
 
   it("escapes LIKE wildcards in operator values", () => {
+    // % and _ are not GLOB metacharacters — the bridge still runs; its
+    // pattern treats them literally
     expect(build("from:100%_done").params).toEqual([
       "acc-1",
       "%100\\%\\_done%",
+      accentGlob("100%_done"),
       "%100\\%\\_done%",
+      accentGlob("100%_done"),
     ])
   })
 
@@ -135,22 +164,41 @@ describe("buildThreadSearchSql", () => {
     const { sql, params } = build("from:alice has:attachment is:unread")
     expect(sql).toContain("threads.has_attachments = 1")
     expect(sql).toContain("threads.unread_count > 0")
-    // account, then the two from: LIKE patterns — nothing else
-    expect(params).toEqual(["acc-1", "%alice%", "%alice%"])
+    // account, then the from: LIKE + GLOB pairs per column — nothing else
+    expect(params).toEqual([
+      "acc-1",
+      "%alice%",
+      accentGlob("alice"),
+      "%alice%",
+      accentGlob("alice"),
+    ])
   })
 
-  it("builds negated operators as NOT over the same EXISTS shapes", () => {
+  it("builds negated operators as NOT over the same folded EXISTS shapes", () => {
     const { sql, params } = build("-from:spammer -subject:win")
     expect(sql).toContain(
       "NOT EXISTS ( SELECT 1 FROM messages m WHERE m.thread_id = threads.id " +
-        "AND (m.from_address COLLATE NOCASE LIKE $2 ESCAPE '\\' " +
-        "OR m.from_name COLLATE NOCASE LIKE $3 ESCAPE '\\')"
+        "AND ((m.from_address COLLATE NOCASE LIKE $2 ESCAPE '\\' " +
+        "OR m.from_address GLOB $3) " +
+        "OR (m.from_name COLLATE NOCASE LIKE $4 ESCAPE '\\' " +
+        "OR m.from_name GLOB $5))"
     )
     expect(sql).toContain(
       "NOT EXISTS ( SELECT 1 FROM messages m WHERE m.thread_id = threads.id " +
-        "AND m.subject COLLATE NOCASE LIKE $4 ESCAPE '\\'"
+        "AND (m.subject COLLATE NOCASE LIKE $6 ESCAPE '\\' " +
+        "OR m.subject GLOB $7)"
     )
-    expect(params).toEqual(["acc-1", "%spammer%", "%spammer%", "%win%"])
+    // the negated values fold identically — the exclusion cannot be dodged
+    // by an accented spelling
+    expect(params).toEqual([
+      "acc-1",
+      "%spammer%",
+      accentGlob("spammer"),
+      "%spammer%",
+      accentGlob("spammer"),
+      "%win%",
+      accentGlob("win"),
+    ])
   })
 
   it("builds negated flags as the cache column at 0", () => {
@@ -238,7 +286,9 @@ describe("buildThreadSearchSql", () => {
     expect(params).toEqual([
       "acc-1",
       "%newsletter@x.com%",
+      accentGlob("newsletter@x.com"),
       "%newsletter@x.com%",
+      accentGlob("newsletter@x.com"),
     ])
   })
 
@@ -266,13 +316,19 @@ describe("buildThreadSearchSql", () => {
     expect(params).toEqual([
       "acc-9", // account
       "%a%",
-      "%a%", // from: address, name
+      accentGlob("a"),
+      "%a%",
+      accentGlob("a"), // from: address, name — LIKE + GLOB each
       "%b%",
+      accentGlob("b"),
       "%b%",
-      "%b%", // to: to/cc/bcc json
-      "%c%", // subject:
+      accentGlob("b"),
+      "%b%",
+      accentGlob("b"), // to: to/cc/bcc json
+      "%c%",
+      accentGlob("c"), // subject:
       "d",
-      "%/d", // label: exact, suffix
+      "%/d", // label: exact, suffix (exact match — no folding)
       '"longenough"', // free text ≥3 chars
       // free text <3 chars: the accent-class GLOB of "zq", six columns
       ...Array.from({ length: 6 }, () => accentGlob("zq")),
@@ -373,7 +429,14 @@ describe("buildThreadSearchSql account sets (task 9.1)", () => {
     expect(sql).toContain("threads.account_id IN ($1, $2)")
     expect(sql).not.toContain("threads.account_id = $1")
     // ids bound first, then the operator patterns — unchanged order
-    expect(params).toEqual(["acc-1", "acc-2", "%alice%", "%alice%"])
+    expect(params).toEqual([
+      "acc-1",
+      "acc-2",
+      "%alice%",
+      accentGlob("alice"),
+      "%alice%",
+      accentGlob("alice"),
+    ])
   })
 
   it("keeps trash/spam exclusions and the pinned-first sort for sets", () => {
@@ -402,7 +465,9 @@ describe("buildThreadSearchSql account sets (task 9.1)", () => {
       "acc-1",
       "acc-2", // the account set
       "%a%",
-      "%a%", // from:
+      accentGlob("a"),
+      "%a%",
+      accentGlob("a"), // from:
       "d",
       "%/d", // label:
       '"longenough"', // free text
@@ -415,7 +480,12 @@ describe("buildThreadSearchSql account sets (task 9.1)", () => {
     const { sql, params } = buildFor([], "from:alice")
     expect(sql).toContain("WHERE 1 = 0 AND")
     expect(sql).not.toContain("account_id IN")
-    expect(params).toEqual(["%alice%", "%alice%"])
+    expect(params).toEqual([
+      "%alice%",
+      accentGlob("alice"),
+      "%alice%",
+      accentGlob("alice"),
+    ])
   })
 
   it("is the byte-identical single-account shape for a one-element set", () => {
@@ -447,7 +517,7 @@ describe("buildThreadSearchSql countOnly option (task 11.4)", () => {
     expect(sql).toContain("threads.is_trashed = 0")
     expect(sql).toContain("threads.is_spam = 0")
     expect(sql).toContain("m.from_address COLLATE NOCASE LIKE $2")
-    expect(sql).toContain("messages_fts MATCH $4")
+    expect(sql).toContain("messages_fts MATCH $6")
     // …with the identical parameter list as the plain build.
     expect(params).toEqual(build("from:alice pizzazz").params)
   })
@@ -544,19 +614,25 @@ describe("buildThreadSearchSql folding + OR mode (task 1.3)", () => {
     expect(sql).not.toContain(" OR ")
   })
 
-  it('joins positive term conditions with OR when freeTextMatch is "any"', () => {
+  it("joins positive term conditions with OR when relaxed is true", () => {
     const { sql, params } = buildWithOptions("alpha beta", {
-      freeTextMatch: "any",
+      relaxed: true,
     })
     expect(params).toContain('"alpha" OR "beta"')
-    expect(params).toEqual(["acc-1", '"alpha" OR "beta"'])
+    // the score's per-term rebinds follow the WHERE's combined MATCH
+    expect(params).toEqual([
+      "acc-1",
+      '"alpha" OR "beta"',
+      '"alpha"',
+      '"beta"',
+    ])
     // the OR lives in the bound MATCH string; the SQL shape is unchanged
     expect(sql).toContain("messages_fts MATCH $2")
   })
 
-  it("OR mode mixes long and short terms with OR between their conditions", () => {
+  it("relaxed mode mixes long and short terms with OR between their conditions", () => {
     const { sql, params } = buildWithOptions("alpha zz", {
-      freeTextMatch: "any",
+      relaxed: true,
     })
     // "alpha" → FTS branch; "zz" → accent-GLOB branch; the two branches
     // OR up inside the one EXISTS
@@ -564,16 +640,64 @@ describe("buildThreadSearchSql folding + OR mode (task 1.3)", () => {
     expect(sql).toContain("m.body_text GLOB")
     const existsInner = sql.slice(sql.indexOf("EXISTS"))
     expect(existsInner).toMatch(/\) OR \(/)
-    expect(params.length).toBe(8) // account + FTS + 6 GLOB binds
+    // account + FTS + 6 GLOB binds + the score's per-term rebinds
+    // (the FTS term once more, the GLOB term over six columns)
+    expect(params.length).toBe(8 + 7)
   })
 
-  it("OR mode never loosens negated terms — they keep their own NOT EXISTS", () => {
+  it("relaxed mode never loosens negated terms — they keep their own NOT EXISTS", () => {
     const { sql, params } = buildWithOptions("alpha -beta", {
-      freeTextMatch: "any",
+      relaxed: true,
     })
     expect(params[1]).toBe('"alpha"')
     expect(sql).toContain("NOT EXISTS")
     // the negated term is excluded from the positive MATCH string
     expect(params).not.toContain('"alpha" OR "beta"')
+  })
+
+  it("relaxed mode leads ORDER BY with the matched-term-count score", () => {
+    const { sql, params } = buildWithOptions("alpha beta", { relaxed: true })
+    // one thread-level EXISTS per positive term, summed, leading the
+    // sort; the default sort's recency follows with its pinned/id tail
+    expect(sql).toContain(
+      "ORDER BY (EXISTS ( SELECT 1 FROM messages m " +
+        "WHERE m.thread_id = threads.id AND m.rowid IN ( " +
+        "SELECT rowid FROM messages_fts WHERE messages_fts MATCH $3 ) )"
+    )
+    expect(sql).toContain(
+      ") DESC, (threads.pinned_at IS NOT NULL) DESC, " +
+        "threads.last_message_at DESC, threads.id ASC"
+    )
+    // the score re-binds each term once — params ascend by occurrence
+    expect(params).toEqual([
+      "acc-1",
+      '"alpha" OR "beta"', // the WHERE's combined MATCH
+      '"alpha"', // score term 1
+      '"beta"', // score term 2
+    ])
+  })
+
+  it("relaxed mode with a single term adds no score (constant ranking)", () => {
+    const { sql, params } = buildWithOptions("alpha", { relaxed: true })
+    expect(sql).toContain("ORDER BY (threads.pinned_at IS NOT NULL) DESC")
+    expect(params).toEqual(["acc-1", '"alpha"'])
+  })
+
+  it("strict mode (default) never widens — no OR, no score", () => {
+    const { sql, params } = buildWithOptions("alpha beta")
+    expect(params).toContain('"alpha" "beta"')
+    expect(sql).not.toContain(" OR ")
+    expect(sql).toContain("ORDER BY (threads.pinned_at IS NOT NULL) DESC")
+  })
+
+  it("relaxed mode ignores the score for countOnly (params stay identical)", () => {
+    const counted = buildThreadSearchSql(
+      "acc-1",
+      parseSearchQuery("alpha beta"),
+      { relaxed: true, countOnly: true }
+    )
+    expect(counted.sql).toContain("SELECT COUNT(*) AS count FROM threads")
+    expect(counted.sql).not.toContain("ORDER BY")
+    expect(counted.params).toEqual(["acc-1", '"alpha" OR "beta"'])
   })
 })

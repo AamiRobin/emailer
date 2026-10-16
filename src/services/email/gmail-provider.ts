@@ -470,6 +470,26 @@ export function mapHistoryDelta(
   }
 }
 
+/** Gmail search `after:`/`before:` terms (the messages.list `q` grammar,
+ * YYYY/MM/DD, UTC day of the boundary — the same day-granular boundary the
+ * engines' client-side filter uses). Null boundary → null (no term). */
+export function gmailSinceTerm(since: number | undefined): string | null {
+  if (since === undefined) return null
+  return `after:${gmailSearchDate(since)}`
+}
+
+export function gmailUntilTerm(until: number | undefined): string | null {
+  if (until === undefined) return null
+  return `before:${gmailSearchDate(until)}`
+}
+
+function gmailSearchDate(seconds: number): string {
+  const date = new Date(seconds * 1000)
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0")
+  const day = String(date.getUTCDate()).padStart(2, "0")
+  return `${date.getUTCFullYear()}/${month}/${day}`
+}
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
@@ -596,7 +616,20 @@ export function createGmailProvider(
     let ids: string[]
     let exists = 0
     if (query.last !== undefined) {
-      const page = await client.listMessages({ maxResults: query.last })
+      // The history window's server-side clamp (task 3.2, D6): `since` /
+      // `until` become after:/before: search terms so the recent-window
+      // enumeration covers only the requested date range. The caller
+      // filters client-side as well (the two grammars agree — see
+      // history-window.ts), so a provider that ignored the terms would
+      // only waste bandwidth, never leak old mail.
+      const terms = [
+        gmailSinceTerm(query.since),
+        gmailUntilTerm(query.until),
+      ].filter((term) => term !== null)
+      const page = await client.listMessages({
+        maxResults: query.last,
+        ...(terms.length > 0 ? { q: terms.join(" ") } : {}),
+      })
       ids = (page.messages ?? []).map((message) => message.id)
       exists = page.resultSizeEstimate ?? 0
     } else if (query.uidSet !== undefined) {

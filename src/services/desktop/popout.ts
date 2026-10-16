@@ -66,8 +66,10 @@ export function popoutThreadId(): string | null {
 
 /** Label-safe folding, mirroring the Rust sanitize_label_part: Tauri
  * labels allow alphanumerics plus a small punctuation set. Draft keys are
- * uuid-shaped, so in practice this is the identity. */
-function sanitizeLabelPart(part: string): string {
+ * uuid-shaped, so in practice this is the identity. Exported for the
+ * print window's label (print-window.ts), which rides the same `popout-*`
+ * label rules. */
+export function sanitizeLabelPart(part: string): string {
   return part
     .split("")
     .map((char) =>

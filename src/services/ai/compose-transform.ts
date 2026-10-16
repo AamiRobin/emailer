@@ -3,6 +3,7 @@ import { getExecutor } from "../db/executor"
 import { aiChat } from "./client"
 import { cleanUntrusted, withOutputLanguage } from "./prompt"
 import { getOutputLanguage } from "./settings"
+import { loadVoiceProfileApplication } from "./voice-profile"
 
 /**
  * Compose text transform service (task 4.6, ai-assistance spec "Compose
@@ -105,9 +106,23 @@ export async function transformDraftText({
   } catch {
     // No executor — stay unset.
   }
+  // Parity-round-3 task 7.4: a stored writing-voice profile appends its
+  // fenced block (proofreading in the user's own voice); unavailable db
+  // or no profile appends NOTHING — the prompt is exactly as before.
+  let voicePrompt: string | null = null
+  try {
+    voicePrompt = (await loadVoiceProfileApplication(executor ?? getExecutor()))
+      .prompt
+  } catch {
+    // No executor — no profile.
+  }
+  const basePrompt = TRANSFORM_SYSTEM_PROMPTS[mode]
   const content = await aiChat({
     surface: "composeTransform",
-    system: withOutputLanguage(TRANSFORM_SYSTEM_PROMPTS[mode], language),
+    system: withOutputLanguage(
+      voicePrompt !== null ? `${basePrompt}\n\n${voicePrompt}` : basePrompt,
+      language
+    ),
     // The drafted/selected text can quote other people's mail (a reply
     // draft): strip invisible smuggle-before-prompt characters from the
     // untrusted span before it enters the prompt.

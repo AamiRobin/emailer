@@ -38,6 +38,13 @@ vi.mock("@/services/calendar/events", async (importOriginal) => {
   }
 })
 
+// The join button's click-to-open path (task 8.6): the opener plugin,
+// mocked like every other Tauri boundary in this suite.
+const openUrlMock = vi.hoisted(() => vi.fn())
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: openUrlMock,
+}))
+
 const refreshMock = vi.mocked(refreshCalendars)
 
 let executor: TestExecutor
@@ -73,12 +80,16 @@ async function seedEvent(overrides: {
   startAt: number
   endAt: number
   allDay?: boolean
+  description?: string
+  location?: string
+  partstat?: string
 }): Promise<string> {
   const id = `ce-${uid("e")}`
   await executor.execute(
     `INSERT INTO calendar_events (
-       id, source_id, calendar_id, uid, ical, summary, start_at, end_at, all_day
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+       id, source_id, calendar_id, uid, ical, summary, location, description,
+       start_at, end_at, all_day, partstat
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
     [
       id,
       overrides.sourceId,
@@ -86,9 +97,12 @@ async function seedEvent(overrides: {
       uid("uid"),
       "BEGIN:VEVENT",
       overrides.summary,
+      overrides.location ?? null,
+      overrides.description ?? null,
       overrides.startAt,
       overrides.endAt,
       overrides.allDay ? 1 : 0,
+      overrides.partstat ?? null,
     ]
   )
   return id
@@ -408,5 +422,60 @@ describe("calendar view (task 5.3)", () => {
         "No events in this range"
       )
     )
+  })
+})
+
+describe("event details: join link + RSVP badge (parity-round-3 task 8.6)", () => {
+  it("surfaces the join link (click-to-open) and the RSVP status badge, mirroring the mail-side card", async () => {
+    await seedSource("src-a", "me@gmail.com")
+    const eventId = await seedEvent({
+      sourceId: "src-a",
+      calendarId: "cal-a1",
+      summary: "Design review",
+      startAt: localSeconds(2026, 3, 2, 10),
+      endAt: localSeconds(2026, 3, 2, 11),
+      location: "Room 4",
+      description: "Join: https://zoom.us/j/1234567890",
+      partstat: "ACCEPTED",
+    })
+    render(<CalendarView initialFocusDate={FOCUS} />)
+    await waitFor(() => expect(eventChip(eventId)).toBeDefined())
+
+    fireEvent.click(eventChip(eventId))
+    const details = screen.getByTestId("calendar-event-details")
+    // The badge mirrors the mail-side meeting card's answer badge —
+    // same label, same tint mapping (rsvpAnswer*).
+    const badge = details.querySelector('[data-testid="calendar-event-partstat"]')
+    expect(badge).not.toBeNull()
+    expect(badge!.getAttribute("data-partstat")).toBe("ACCEPTED")
+    expect(badge!.textContent).toBe("Accepted")
+    // The curated join link renders with its provider label.
+    const join = screen.getByTestId("calendar-event-join")
+    expect(join.textContent).toContain("Zoom")
+    openUrlMock.mockClear()
+    fireEvent.click(join)
+    await waitFor(() => {
+      expect(openUrlMock).toHaveBeenCalledWith("https://zoom.us/j/1234567890")
+    })
+  })
+
+  it("renders neither the badge nor the join button when the event carries neither", async () => {
+    await seedSource("src-a", "me@gmail.com")
+    const eventId = await seedEvent({
+      sourceId: "src-a",
+      calendarId: "cal-a1",
+      summary: "Lunch",
+      startAt: localSeconds(2026, 3, 2, 12),
+      endAt: localSeconds(2026, 3, 2, 13),
+    })
+    render(<CalendarView initialFocusDate={FOCUS} />)
+    await waitFor(() => expect(eventChip(eventId)).toBeDefined())
+
+    fireEvent.click(eventChip(eventId))
+    screen.getByTestId("calendar-event-details")
+    expect(
+      screen.queryByTestId("calendar-event-partstat")
+    ).toBeNull()
+    expect(screen.queryByTestId("calendar-event-join")).toBeNull()
   })
 })

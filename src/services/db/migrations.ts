@@ -1336,4 +1336,234 @@ export const MIGRATIONS: Migration[] = [
       `,
     ],
   },
+  {
+    // v20 (parity-round-3 tasks 1.3, design D5/D6/D8): three additive
+    // feature columns plus the FTS rebuild.
+    //
+    // D6 history window: accounts.history_window ("3m"/"6m"/"1y"/…; NULL =
+    // all) is the per-account initial-sync boundary the three drivers
+    // clamp their first pass to — TEXT so the sync layer owns the value
+    // grammar and new windows never need another migration. Existing
+    // accounts read NULL (all) and are untouched.
+    //
+    // D5 RSVP fields on calendar_events: sequence / recurrence_id /
+    // partstat / reminded_at (all NULL — only invites ever carry them).
+    // The table already has `uid` NOT NULL (v11), so the invite identity
+    // needs no new column; reminded_at is the notification scheduler's
+    // once-per-event guard. Purely additive ALTERs, no rebuild.
+    //
+    // D5 meeting-reminder lead (task 8.5): accounts.reminder_lead_minutes
+    // (INTEGER NULL — NULL/absent = OFF, the default; a positive number
+    // = raise a notification that many minutes before a meeting starts,
+    // once per event via reminded_at). Per-account like history_window
+    // (the same "settings live on the account row" pattern — the global
+    // notifications setting keys are app-wide, this one is per identity).
+    //
+    // D5 invite linkage on threads: invite_uid carries the meeting's
+    // iCalendar UID so a thread links to its event rows; partial index
+    // keeps the (rare) invite threads in it (the v17 contacts.book_id
+    // partial-index precedent).
+    //
+    // D8 folded FTS column: the index gains a `folded` column holding the
+    // NFD diacritic-stripped copy of the searchable text (the search
+    // module's foldText — queries fold their terms identically and match
+    // raw OR folded columns; the trigram tokenizer's remove_diacritics
+    // only covers Latin-1/Latin-Extended-A, foldText covers every
+    // \p{Diacritic} mark). An external-content FTS5 table reads every
+    // indexed column from the content table BY NAME on 'rebuild', so the
+    // rebuild requires the matching source column: `messages.folded`
+    // (TEXT NULL) is added and the three upkeep triggers copy it like
+    // every other column. SQLite has no SQL-side Unicode fold, so the
+    // column is populated TS-side: new/updated messages are stamped by
+    // the message write path (task 2.1) and PRE-EXISTING rows are
+    // backfilled by the folded-text backfill hooked into the app
+    // bootstrap (services/search/folded-backfill.ts) — until then the
+    // folded column is empty for old rows, which only means they match
+    // through the raw columns (the v13 behavior) and never breaks.
+    // Rebuild mechanics are the v13 precedent verbatim: drop the virtual
+    // table (the triggers live on `messages` and simply stop matching
+    // rows for the transaction-scoped moment), recreate with the extra
+    // column, re-create the triggers, and run the built-in 'rebuild'
+    // command — messages rows themselves are untouched.
+    version: 20,
+    description:
+      "History window, calendar RSVP fields, thread invite linkage, " +
+      "and the FTS rebuild with a folded column",
+    statements: [
+      "ALTER TABLE accounts ADD COLUMN history_window TEXT",
+      // Meeting-reminder lead minutes (task 8.5): NULL = off (default).
+      "ALTER TABLE accounts ADD COLUMN reminder_lead_minutes INTEGER",
+      "ALTER TABLE calendar_events ADD COLUMN sequence INTEGER",
+      // The iCalendar RECURRENCE-ID of the specific occurrence an invite
+      // addresses (NULL = the whole series).
+      "ALTER TABLE calendar_events ADD COLUMN recurrence_id TEXT",
+      // The signed-in user's answer on this event (NEEDS-ACTION /
+      // ACCEPTED / TENTATIVE / DECLINED / DELEGATED), mirrored from the
+      // provider or stamped by the RSVP write-back.
+      "ALTER TABLE calendar_events ADD COLUMN partstat TEXT",
+      // The meeting-lead reminder's once-per-event guard: NULL = never
+      // reminded.
+      "ALTER TABLE calendar_events ADD COLUMN reminded_at INTEGER",
+      "ALTER TABLE threads ADD COLUMN invite_uid TEXT",
+      `
+        CREATE INDEX IF NOT EXISTS idx_threads_invite_uid
+          ON threads(invite_uid) WHERE invite_uid IS NOT NULL
+      `,
+      // Source column the external-content index reads `folded` from
+      // (BY NAME on 'rebuild'); TS-side written (see above).
+      "ALTER TABLE messages ADD COLUMN folded TEXT",
+      "DROP TABLE IF EXISTS messages_fts",
+      `
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+          subject,
+          from_name,
+          from_address,
+          to_json,
+          body_text,
+          snippet,
+          folded,
+          content='messages',
+          content_rowid='rowid',
+          tokenize='trigram remove_diacritics 1'
+        )
+      `,
+      // The upkeep triggers hang on `messages`, so dropping the FTS table
+      // did NOT drop them — and unlike v13 (whose IF NOT EXISTS was a
+      // harmless no-op: identical bodies), the bodies CHANGE here (the
+      // folded column). They must be dropped explicitly or the old
+      // 6-column trigger would silently keep running and new.folded
+      // would never reach the index.
+      "DROP TRIGGER IF EXISTS messages_fts_ai",
+      "DROP TRIGGER IF EXISTS messages_fts_ad",
+      "DROP TRIGGER IF EXISTS messages_fts_au",
+      `
+        CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+          INSERT INTO messages_fts (
+            rowid, subject, from_name, from_address, to_json, body_text, snippet, folded
+          )
+          VALUES (
+            new.rowid, new.subject, new.from_name, new.from_address,
+            new.to_json, new.body_text, new.snippet, new.folded
+          );
+        END
+      `,
+      `
+        CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+          INSERT INTO messages_fts (
+            messages_fts, rowid, subject, from_name, from_address, to_json,
+            body_text, snippet, folded
+          )
+          VALUES (
+            'delete', old.rowid, old.subject, old.from_name, old.from_address,
+            old.to_json, old.body_text, old.snippet, old.folded
+          );
+        END
+      `,
+      `
+        CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+          INSERT INTO messages_fts (
+            messages_fts, rowid, subject, from_name, from_address, to_json,
+            body_text, snippet, folded
+          )
+          VALUES (
+            'delete', old.rowid, old.subject, old.from_name, old.from_address,
+            old.to_json, old.body_text, old.snippet, old.folded
+          );
+          INSERT INTO messages_fts (
+            rowid, subject, from_name, from_address, to_json, body_text, snippet, folded
+          )
+          VALUES (
+            new.rowid, new.subject, new.from_name, new.from_address,
+            new.to_json, new.body_text, new.snippet, new.folded
+          );
+        END
+      `,
+      // One-statement full reindex from the content table (raw columns
+      // filled; folded stays empty until the TS backfill/ write path
+      // stamps it — see above).
+      `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`,
+    ],
+  },
+  {
+    // v21 (parity-round-3 tasks 1.3, design D1/D3): the local-AI storage
+    // tables. All SQL stays frontend-owned — Rust computes embeddings and
+    // moves model bytes; these rows are written by TS.
+    //
+    // thread_vectors: one embedding per thread document (subject + from +
+    // folded body, D1), keyed (account_id, thread_id) so re-embedding is
+    // an upsert. vector is a BLOB of little-endian f32s (dim of them —
+    // 384 for BGE-small; dim is stored per row so a future model swap can
+    // coexist with stale rows until re-indexed). content_hash keys the
+    // incremental skip (task 6.2): unchanged hash = reuse the stored
+    // vector. Both FKs CASCADE — deleting an account (or its thread)
+    // deletes its vectors with it.
+    //
+    // voice_profiles: the learned writing-voice descriptor (D3, task
+    // 7.3). account_id NULLABLE: NULL = a GLOBAL profile (learned across
+    // accounts); non-NULL CASCADEs away with its account (a profile
+    // learned from an account's sent mail has no meaning without it).
+    // One row per learn action keyed by the app-generated UUID id (the
+    // v1 convention); the service layer replaces by its own keying.
+    //
+    // model_downloads: the pinned-download state the TS layer persists
+    // from the Rust downloader's events (task 1.4 — Rust itself never
+    // touches this table). model_id is the app's stable id ("bge-small",
+    // "ggml-base"); state is an open TEXT owned by the TS download
+    // state machine (constrained enums would turn every new state into a
+    // migration — the ai_usage.surface precedent); total_bytes is NULL
+    // until the server reports Content-Length; error is the typed kind +
+    // message of the last failure, NULL while clean.
+    version: 21,
+    description:
+      "Local AI storage: thread_vectors, voice_profiles, and model " +
+      "download state",
+    statements: [
+      `
+        CREATE TABLE IF NOT EXISTS thread_vectors (
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+          -- Embedding dimensionality (384 for BGE-small-en-v1.5)
+          dim INTEGER NOT NULL,
+          -- Little-endian f32s, length = dim
+          vector BLOB NOT NULL,
+          -- Hash of the thread document the vector encodes; unchanged
+          -- hash = incremental indexing skips the re-embed
+          content_hash TEXT NOT NULL,
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          PRIMARY KEY (account_id, thread_id)
+        )
+      `,
+      `
+        CREATE INDEX IF NOT EXISTS idx_thread_vectors_account
+          ON thread_vectors(account_id)
+      `,
+      `
+        CREATE TABLE IF NOT EXISTS voice_profiles (
+          id TEXT PRIMARY KEY,
+          -- NULL = a global profile; a non-NULL link cascades away with
+          -- its account
+          account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+          -- Strict-JSON style descriptor produced by the voiceProfile
+          -- AI surface (task 7.3)
+          profile_json TEXT NOT NULL,
+          learned_at INTEGER NOT NULL,
+          -- How many sent bodies the descriptor was learned from (the
+          -- ≤30 cap the spec demands)
+          message_count INTEGER NOT NULL
+        )
+      `,
+      `
+        CREATE TABLE IF NOT EXISTS model_downloads (
+          -- The app's stable model id ("bge-small", "ggml-base")
+          model_id TEXT PRIMARY KEY,
+          -- TS download state machine's state (see above: open TEXT)
+          state TEXT NOT NULL,
+          bytes_downloaded INTEGER NOT NULL DEFAULT 0,
+          total_bytes INTEGER,
+          error TEXT,
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        )
+      `,
+    ],
+  },
 ]

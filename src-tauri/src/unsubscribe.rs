@@ -70,7 +70,7 @@ fn validate_unsubscribe_url(url: &str) -> Result<UnsubscribeTarget, String> {
     // Authority ends at the first '/' (path) or '?' (query-only URL —
     // RFC 3986 allows `https://host?x=y`; the query becomes the target
     // with an empty path spelled as '/').
-    let (authority, target) = match rest.find(|c| c == '/' || c == '?') {
+    let (authority, target) = match rest.find(['/', '?']) {
         Some(index) => {
             let target = if rest.as_bytes()[index] == b'?' {
                 format!("/{}", &rest[index..])
