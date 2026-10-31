@@ -55,7 +55,7 @@ base64 = "0.22"
 # Gravatar avatar lookups (task 2.5, design D12): SHA-256 of the trimmed,
 # lowercased address is the cache-file name and the gravatar.com URL key.
 # Already in the dependency tree transitively; only newly declared here.
-sha2 = "0.10"
+sha2 = "0.11"
 lettre = { version = "0.11", default-features = false, features = [
     "smtp-transport",
     "tokio1-native-tls",
